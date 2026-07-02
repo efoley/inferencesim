@@ -7,8 +7,35 @@ from dataclasses import dataclass, field
 
 from .engine import Engine, Phase, RooflineEngine
 from .hardware import System
-from .ops import decode_step_ops, kv_cache_bytes_per_chip, prefill_ops
+from .ops import (
+    decode_step_ops,
+    kv_cache_bytes_per_chip,
+    prefill_ops,
+    validate_deployment,
+)
 from .workload import Deployment, ModelSpec, Scenario
+
+
+def weight_bytes_per_chip(model: ModelSpec, dep: Deployment) -> float:
+    """Per-chip weight footprint under the tp/pp/ep mapping.
+
+    Layers are split across pp stages and tp-sharded; expert weights are
+    additionally spread over the ep groups, while attention/dense/shared
+    weights are replicated across them.  Embedding + LM head live on the
+    edge stages, tp-sharded.
+    """
+    if model.moe is None:
+        layer_replicated = model.attn_params + model.ffn_params_total
+        layer_expert = 0.0
+    else:
+        layer_replicated = model.attn_params + model.shared_expert_params
+        layer_expert = model.moe.n_experts * model.expert_params
+    params = (
+        model.embedding_params / dep.tp
+        + model.n_layers * layer_replicated / (dep.tp * dep.pp)
+        + model.n_layers * layer_expert / (dep.tp * dep.ep * dep.pp)
+    )
+    return params * dep.weight_dtype.bytes
 
 
 @dataclass(frozen=True)
@@ -89,27 +116,42 @@ def simulate(
     engine: Engine | None = None,
 ) -> Report:
     engine = engine or RooflineEngine()
-    tp = deployment.tp
-    if tp < 1:
-        raise ValueError("tp must be >= 1")
-    if tp > system.total_chips:
-        raise ValueError(f"tp={tp} exceeds {system.total_chips} chips in {system.name}")
+    validate_deployment(model, deployment)
+    replica = deployment.replica_chips
+    if replica > system.total_chips:
+        raise ValueError(
+            f"replica needs tp*pp*ep={replica} chips but {system.name} has "
+            f"{system.total_chips}"
+        )
 
-    dp = system.total_chips // tp
-    idle_chips = system.total_chips - dp * tp
+    dp = system.total_chips // replica
+    idle_chips = system.total_chips - dp * replica
     warnings: list[str] = []
     if idle_chips:
-        warnings.append(f"{idle_chips} chip(s) idle: total chips not divisible by tp")
+        warnings.append(
+            f"{idle_chips} chip(s) idle: total chips not divisible by tp*pp*ep={replica}"
+        )
+    if deployment.pp > 1 and model.n_layers % deployment.pp:
+        warnings.append(
+            f"pp={deployment.pp} does not divide {model.n_layers} layers; "
+            f"stages assumed balanced anyway"
+        )
+    microbatch = scenario.batch / (deployment.pp * deployment.ep)
+    if microbatch < 1:
+        warnings.append(
+            f"batch={scenario.batch} < pp*ep={deployment.pp * deployment.ep}: "
+            f"pipeline/expert groups are starved (raise batch)"
+        )
 
     chip = system.node.chip
     B = scenario.batch
 
     # ---- memory feasibility ---------------------------------------------
     memory = MemoryUsage(
-        weights=model.weight_bytes(deployment.weight_dtype) / tp,
+        weights=weight_bytes_per_chip(model, deployment),
         kv_cache=B * kv_cache_bytes_per_chip(model, scenario.max_context, deployment),
         # rough working-set allowance for activations / scratch
-        activations=4 * B * model.d_model * deployment.act_dtype.bytes,
+        activations=4 * microbatch * model.d_model * deployment.act_dtype.bytes,
         capacity=chip.dram.capacity_bytes,
     )
     if not memory.fits:
@@ -121,10 +163,10 @@ def simulate(
 
     # ---- timed phases -----------------------------------------------------
     prefill = engine.run_phase(
-        "prefill", prefill_ops(model, scenario.prompt_len, deployment), system, tp
+        "prefill", prefill_ops(model, scenario.prompt_len, deployment), system, deployment
     )
     decode = engine.run_phase(
-        "decode", decode_step_ops(model, scenario, deployment), system, tp
+        "decode", decode_step_ops(model, scenario, deployment), system, deployment
     )
     ttft = prefill.duration(deployment.overlap_comm)
     tpot = decode.duration(deployment.overlap_comm)
@@ -141,13 +183,13 @@ def simulate(
     decode_only_tokens_per_s = dp * B / tpot if tpot > 0 else 0.0
 
     # ---- power -------------------------------------------------------------
-    tp_link = system.link_for_group(tp)
+    tp_link = system.link_for_group(deployment.tp)
     prefill_frac = ttft / replica_s_per_request if replica_s_per_request > 0 else 0.0
     chip_power = (
         prefill_frac * prefill.chip_avg_power_w(chip, tp_link, ttft)
         + (1 - prefill_frac) * decode.chip_avg_power_w(chip, tp_link, tpot)
     )
-    busy_chips = dp * tp
+    busy_chips = dp * replica
     system_power = (
         system.n_nodes * system.node.overhead_power_w
         + busy_chips * chip_power

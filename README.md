@@ -19,6 +19,12 @@ inferencesim run --hardware gb300-nvl72 --model llama-3.1-70b \
     --tp 8 --batch 64 --prompt 4096 --output 1024 \
     --weight-dtype fp4 --kv-dtype fp8 --overlap-comm
 
+# pipeline + expert parallelism
+inferencesim run --hardware gb300-nvl72 --model gpt-oss-120b \
+    --tp 4 --ep 8 --batch 128 --weight-dtype fp4 --kv-dtype fp8
+inferencesim run --hardware tt-quietbox --model llama-3.1-70b \
+    --tp 2 --pp 2 --batch 32 --weight-dtype fp8 --kv-dtype fp8
+
 # sweep batch sizes
 inferencesim run --hardware tt-quietbox --model gpt-oss-120b \
     --tp 4 --batch 1,8,32 --weight-dtype fp8
@@ -84,6 +90,23 @@ FLOPs, DRAM bytes, collective bytes — for the two phases:
 MoE decode accounts for the *expected number of distinct experts* activated
 by a batch, which is what actually determines DRAM traffic.
 
+### Parallelism
+
+A replica occupies `tp * pp * ep` chips; the remaining chips form
+data-parallel (DP) replicas.
+
+- **TP (tensor parallel)**: every matrix sharded `tp` ways; 2 ring
+  allreduces per layer. Cuts TPOT (each chip streams 1/tp of the weights)
+  at the cost of per-layer collective latency.
+- **PP (pipeline parallel)**: layers split into `pp` balanced stages;
+  decode runs `pp` microbatches round-robin, so TPOT is the pipeline round
+  time plus P2P hops. Per-chip memory drops ~1/pp — PP buys *capacity*
+  (bigger batches, or fitting at all), not faster weight streaming.
+- **EP (expert parallel, MoE only)**: attention runs data-parallel across
+  `ep` groups while expert weights shard over the whole `tp*ep` array;
+  the FFN allreduce is replaced by dispatch/combine all-to-alls, and the
+  full batch (not just one group's share) amortizes expert weight reads.
+
 ### Engines
 
 `RooflineEngine` is the "speed of light" model: each op runs at the peak
@@ -117,8 +140,8 @@ assume perfect overlap (reality is in between).
 - **Discrete-event engine**: consume the same `Op` stream with explicit
   dependencies and contention on each `Chip` stage (DRAM channels, NoC hops,
   SRAM banks, links) — the block-diagram hardware model is designed for this.
-- Pipeline and expert parallelism; multi-rack topologies (rail-optimized
-  Ethernet/IB); prefill/decode disaggregation.
+- Multi-rack topologies (rail-optimized Ethernet/IB); prefill/decode
+  disaggregation; MoE expert load imbalance.
 - Efficiency factors calibrated against measured benchmarks (MLPerf,
   vendor numbers) to bracket roofline optimism.
 - Richer attention variants (MLA, sliding window) and speculative decoding.

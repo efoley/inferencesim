@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 
 from .hardware import Chip, Link, System
 from .ops import Op, OpKind
+from .workload import Deployment
 
 
 def ring_allreduce_time(payload_bytes: float, group_size: int, link: Link) -> float:
@@ -67,7 +68,7 @@ class Phase:
         concurrently with on-chip work: duration = max(comm, everything else)."""
         if not overlap_comm:
             return self.total_time
-        comm = sum(t.time for t in self.timings if t.op.kind is OpKind.ALLREDUCE)
+        comm = sum(t.time for t in self.timings if t.op.is_comm)
         return max(comm, self.total_time - comm)
 
     @property
@@ -113,21 +114,51 @@ class Phase:
         return p
 
 
+@dataclass(frozen=True)
+class CommContext:
+    """The link each kind of communication travels over, given how the
+    replica's chip groups map onto the machine (tp innermost, then ep,
+    then pp)."""
+
+    tp: int
+    tp_link: Link | None  # allreduce: spans the tp group
+    a2a_link: Link | None  # MoE all-to-all: spans the tp*ep array
+    p2p_link: Link | None  # pipeline hop: crosses stage boundaries
+
+    @classmethod
+    def for_deployment(cls, system: System, dep: Deployment) -> "CommContext":
+        return cls(
+            tp=dep.tp,
+            tp_link=system.link_for_group(dep.tp),
+            a2a_link=system.link_for_group(dep.tp * dep.ep),
+            p2p_link=system.link_for_group(dep.replica_chips),
+        )
+
+
 class Engine(ABC):
     @abstractmethod
     def run_phase(
-        self, name: str, ops: list[Op], system: System, tp: int
+        self, name: str, ops: list[Op], system: System, dep: Deployment
     ) -> Phase: ...
 
 
 class RooflineEngine(Engine):
     """Speed-of-light timing: t(op) = max(flops/peak, bytes/eff_bw)."""
 
-    def time_op(self, op: Op, chip: Chip, tp: int, tp_link: Link | None) -> OpTiming:
+    def time_op(self, op: Op, chip: Chip, comm: CommContext) -> OpTiming:
         if op.kind is OpKind.ALLREDUCE:
-            if tp > 1 and tp_link is None:
-                raise ValueError("TP > 1 requires an interconnect for collectives")
-            one = ring_allreduce_time(op.comm_bytes, tp, tp_link) if tp > 1 else 0.0
+            one = (
+                ring_allreduce_time(op.comm_bytes, comm.tp, comm.tp_link)
+                if comm.tp > 1
+                else 0.0
+            )
+            return OpTiming(op, op.count * one, 0.0, 0.0, op.count * one)
+        if op.kind in (OpKind.ALLTOALL, OpKind.P2P):
+            link = comm.a2a_link if op.kind is OpKind.ALLTOALL else comm.p2p_link
+            if link is None:
+                raise ValueError(f"{op.name}: no link available for {op.kind.value}")
+            # speed of light: payload streams at line rate after one latency
+            one = op.comm_bytes / link.bandwidth + link.latency_s
             return OpTiming(op, op.count * one, 0.0, 0.0, op.count * one)
 
         compute_t = op.flops / chip.compute.flops(op.dtype) if op.flops else 0.0
@@ -142,7 +173,9 @@ class RooflineEngine(Engine):
             0.0,
         )
 
-    def run_phase(self, name: str, ops: list[Op], system: System, tp: int) -> Phase:
+    def run_phase(self, name: str, ops: list[Op], system: System, dep: Deployment) -> Phase:
         chip = system.node.chip
-        tp_link = system.link_for_group(tp)
-        return Phase(name, [self.time_op(op, chip, tp, tp_link) for op in ops])
+        comm = CommContext.for_deployment(system, dep)
+        if dep.tp > 1 and comm.tp_link is None:
+            raise ValueError("TP > 1 requires an interconnect for collectives")
+        return Phase(name, [self.time_op(op, chip, comm) for op in ops])

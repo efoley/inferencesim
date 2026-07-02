@@ -44,6 +44,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     model = MODELS[args.model]
     dep = Deployment(
         tp=args.tp,
+        pp=args.pp,
+        ep=args.ep,
         weight_dtype=DType(args.weight_dtype),
         kv_dtype=DType(args.kv_dtype),
         act_dtype=DType(args.act_dtype),
@@ -76,6 +78,9 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--hardware", required=True, help="hardware preset key")
     run.add_argument("--model", required=True, help="model preset key")
     run.add_argument("--tp", type=int, default=1, help="tensor-parallel degree")
+    run.add_argument("--pp", type=int, default=1, help="pipeline-parallel stages")
+    run.add_argument("--ep", type=int, default=1,
+                     help="expert-parallel groups (MoE models only)")
     run.add_argument("--batch", default="32",
                      help="concurrent sequences per replica (comma list sweeps)")
     run.add_argument("--prompt", type=int, default=2048, help="prompt tokens per request")

@@ -131,13 +131,34 @@ class Scenario:
 
 @dataclass(frozen=True)
 class Deployment:
-    """How the model is mapped onto the hardware."""
+    """How the model is mapped onto the hardware.
 
-    tp: int = 1  # tensor parallel degree (pipeline/expert parallel: roadmap)
+    A replica occupies tp * pp * ep chips:
+
+      tp -- tensor parallelism: every weight matrix sharded tp ways; adds
+            2 allreduces per layer (1 for MoE layers when ep > 1).
+      pp -- pipeline parallelism: layers split into pp stages; decode runs
+            pp microbatches of batch/(pp*ep) through the pipeline, so TPOT
+            is the pipeline round time and per-chip memory drops ~1/pp.
+            Wins come from raising `batch` into the freed memory, not from
+            faster weight streaming.
+      ep -- expert parallelism (MoE only): attention runs data-parallel
+            across ep groups (each tp-sharded, handling batch/ep sequences)
+            while expert weights are sharded over the full tp*ep array;
+            the FFN allreduce is replaced by dispatch/combine all-to-alls.
+    """
+
+    tp: int = 1
+    pp: int = 1
+    ep: int = 1
     weight_dtype: DType = DType.FP8
     kv_dtype: DType = DType.BF16
     act_dtype: DType = DType.BF16
-    # If True, assume TP collectives fully overlap with compute/memory work
+    # If True, assume collectives fully overlap with compute/memory work
     # (phase time = max of the two streams instead of their sum).  Real stacks
     # land somewhere between the two settings.
     overlap_comm: bool = False
+
+    @property
+    def replica_chips(self) -> int:
+        return self.tp * self.pp * self.ep

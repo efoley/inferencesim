@@ -38,7 +38,8 @@ def format_report(r: Report) -> str:
     add(f"Model        : {m.name}  ({m.total_params / 1e9:.1f}B params"
         + (f", {m.active_params / 1e9:.1f}B active" if m.moe else "")
         + f"), weights {d.weight_dtype.value}, kv {d.kv_dtype.value}")
-    add(f"Parallelism  : TP={d.tp}  DP={r.dp}"
+    add(f"Parallelism  : TP={d.tp}  PP={d.pp}  EP={d.ep}  DP={r.dp}"
+        f"  ({d.replica_chips} chips/replica)"
         + ("  (comm overlapped)" if d.overlap_comm else "")
         + (f"  ({r.idle_chips} chips idle)" if r.idle_chips else ""))
     add(f"Scenario     : batch/replica={sc.batch}, prompt={sc.prompt_len}, "
