@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inferencesim"
+version = "0.1.0"
+description = "Simulator for throughput / latency / power / cost of LLM inference factories"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+inferencesim = "inferencesim.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["inferencesim*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
