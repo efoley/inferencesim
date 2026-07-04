@@ -14,7 +14,7 @@ from inferencesim.graph import Edge, Graph, Node, NodeKind
 from inferencesim.graphdes import ChipModel
 from inferencesim.hardware import DType
 from inferencesim.ops import Op, OpKind
-from inferencesim.presets_fine import blackhole_p150_fine
+from inferencesim.presets_fine import blackhole_p150_fine, h100_sxm_fine
 
 
 # ---- degenerate chips -------------------------------------------------------
@@ -164,3 +164,40 @@ def test_fine_chip_classifies_groups():
     assert len(m.sram_instances) == 140
     assert all(n.startswith("tensix-fpu[") for n in m.compute_instances)
     assert all(n.startswith("tensix-l1[") for n in m.sram_instances)
+
+
+def test_h100_fine_chip_classifies_groups():
+    """A different topology (5 HBM stacks, an L2 crossbar, 132 SMs) — the
+    5-bank/132-core round-robin is deliberately non-divisible."""
+    m = ChipModel(h100_sxm_fine(), tile_fill=0.5)
+    assert m.dram_base == "hbm"
+    assert len(m.dram_instances) == 5
+    assert len(m.compute_instances) == 132
+    assert len(m.sram_instances) == 132
+    assert m.tile_bytes == pytest.approx(228 * 1024 * 0.5)
+    assert all(n.startswith("sm[") for n in m.compute_instances)
+    assert all(n.startswith("sm-smem[") for n in m.sram_instances)
+
+
+def test_h100_graph_des_refines_lumped_des():
+    """End-to-end on the DGX H100 fine system: the graph-DES runs, TPOT is
+    positive and never faster than the lumped stage-DES on the same
+    aggregated system, staying within a modest tiling/granularity margin.
+    The 5-bank / 132-SM round-robin does not divide evenly — nothing assumes
+    it does."""
+    from inferencesim.bridge import system_from_graph
+    from inferencesim.des import DESEngine
+    from inferencesim.presets import LLAMA_3_1_70B
+    from inferencesim.presets_fine import dgx_h100_fine
+    from inferencesim.simulate import simulate
+    from inferencesim.workload import Deployment, Scenario
+
+    system = system_from_graph(dgx_h100_fine())
+    scen = Scenario(batch=16, prompt_len=2048, output_len=512)
+    dep = Deployment(tp=2, pp=2, weight_dtype=DType.FP8, kv_dtype=DType.FP8)
+    graph = simulate(system, LLAMA_3_1_70B, scen, dep,
+                     engine=DESEngine(chip_graph=h100_sxm_fine()))
+    lumped = simulate(system, LLAMA_3_1_70B, scen, dep, engine=DESEngine())
+    assert graph.tpot_s > 0
+    assert graph.tpot_s >= lumped.tpot_s * (1 - 1e-9)
+    assert graph.tpot_s == pytest.approx(lumped.tpot_s, rel=0.25)

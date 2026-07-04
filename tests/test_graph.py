@@ -122,12 +122,15 @@ def test_flatten_rewires_ports():
 
 
 def test_json_round_trip():
+    from inferencesim.presets_fine import GRAPH_PRESETS
+
     for key, system in HARDWARE.items():
         g = system_to_graph(system)
         g2 = Graph.from_json(g.to_json())
         assert g2.to_dict() == g.to_dict(), key
-    fine = tt_quietbox_fine()
-    assert Graph.from_json(fine.to_json()).to_dict() == fine.to_dict()
+    for key, factory in GRAPH_PRESETS.items():
+        g = factory()
+        assert Graph.from_json(g.to_json()).to_dict() == g.to_dict(), key
 
 
 # ---- bridge round-trips -----------------------------------------------------
@@ -178,6 +181,37 @@ def test_fine_quietbox_simulates_like_lumped_preset():
     scen = Scenario(batch=32, prompt_len=2048, output_len=512)
     dep = Deployment(tp=2, pp=2, weight_dtype=DType.FP8, kv_dtype=DType.FP8)
     a = simulate(TT_QUIETBOX, LLAMA_3_1_70B, scen, dep)
+    b = simulate(fine, LLAMA_3_1_70B, scen, dep)
+    assert b.ttft_s == pytest.approx(a.ttft_s, rel=1e-9)
+    assert b.tpot_s == pytest.approx(a.tpot_s, rel=1e-9)
+    assert b.system_power_w == pytest.approx(a.system_power_w, rel=1e-9)
+
+
+def test_fine_h100_matches_lumped_aggregates():
+    """Per-SM H100 built from lumped scalars aggregates back to the exact
+    lumped chip (a different topology: L2 crossbar, not a NoC)."""
+    from inferencesim.presets import H100_SXM
+    from inferencesim.presets_fine import h100_sxm_fine
+
+    chip = chip_from_graph(h100_sxm_fine(), idle_power_w=H100_SXM.idle_power_w)
+    assert chip.effective_dram_bandwidth == pytest.approx(
+        H100_SXM.effective_dram_bandwidth
+    )
+    assert chip.dram.capacity_bytes == pytest.approx(H100_SXM.dram.capacity_bytes)
+    for d in (DType.FP8, DType.FP16):
+        assert chip.compute.flops(d) == pytest.approx(H100_SXM.compute.flops(d))
+    assert chip.max_power_w == pytest.approx(H100_SXM.max_power_w)
+
+
+def test_fine_dgx_h100_simulates_like_lumped_preset():
+    """Same DGX H100, modelled per-SM vs lumped: identical roofline results."""
+    from inferencesim.presets import DGX_H100
+    from inferencesim.presets_fine import dgx_h100_fine
+
+    fine = system_from_graph(dgx_h100_fine())
+    scen = Scenario(batch=32, prompt_len=2048, output_len=512)
+    dep = Deployment(tp=2, pp=2, weight_dtype=DType.FP8, kv_dtype=DType.FP8)
+    a = simulate(DGX_H100, LLAMA_3_1_70B, scen, dep)
     b = simulate(fine, LLAMA_3_1_70B, scen, dep)
     assert b.ttft_s == pytest.approx(a.ttft_s, rel=1e-9)
     assert b.tpot_s == pytest.approx(a.tpot_s, rel=1e-9)
