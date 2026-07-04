@@ -132,3 +132,80 @@ def test_report_shows_util_block_for_des_not_roofline():
     roof_text = format_report(_run(dep, scen, RooflineEngine()))
     assert "resource util" in des_text
     assert "resource util" not in roof_text
+
+
+# ---- graph mode: walking the expanded chip graph ----------------------------
+
+
+def _fine_quietbox():
+    from inferencesim.bridge import system_from_graph
+    from inferencesim.presets import LLAMA_3_1_70B
+    from inferencesim.presets_fine import tt_quietbox_fine
+
+    return system_from_graph(tt_quietbox_fine()), LLAMA_3_1_70B
+
+
+def _graph_engine():
+    from inferencesim.presets_fine import blackhole_p150_fine
+
+    return DESEngine(chip_graph=blackhole_p150_fine())
+
+
+def test_graph_des_refines_lumped_des_never_optimistic():
+    """The graph-DES on the fine chip is a strict refinement of the lumped
+    stage-DES on the same aggregated system: it runs, TPOT is positive, and
+    it is never faster (the tile schedule adds fill/drain, NoC sharing and
+    per-core granularity on top of the same roofline totals).  The gap stays
+    modest because decode's weight-streaming ops span thousands of tiles, so
+    fill/drain amortises away."""
+    system, model = _fine_quietbox()
+    scen = Scenario(batch=16, prompt_len=2048, output_len=512)
+    dep = Deployment(tp=2, pp=2, weight_dtype=DType.FP8, kv_dtype=DType.FP8)
+    graph = simulate(system, model, scen, dep, engine=_graph_engine())
+    lumped = simulate(system, model, scen, dep, engine=DESEngine())
+    assert graph.tpot_s > 0
+    assert graph.tpot_s >= lumped.tpot_s * (1 - 1e-9)
+    assert graph.tpot_s == pytest.approx(lumped.tpot_s, rel=0.25)
+
+
+def test_graph_des_reports_chip_resource_utilisation():
+    """Graph mode surfaces per-chip resources (DRAM banks, NoC, SRAM, cores)
+    alongside the stage-level u/c/h entries."""
+    system, model = _fine_quietbox()
+    scen = Scenario(batch=16, prompt_len=2048, output_len=512)
+    dep = Deployment(tp=2, pp=2, weight_dtype=DType.FP8, kv_dtype=DType.FP8)
+    r = simulate(system, model, scen, dep, engine=_graph_engine())
+    decode = r.resource_util["decode"]
+    assert any("gddr6-bank" in k for k in decode)   # chip resources present
+    assert any(k in ("u0", "u1") for k in decode)   # stage resources retained
+    assert all(f > 0.0 for f in decode.values())
+
+
+def test_lumped_des_has_no_chip_resources():
+    """Without a chip_graph the DES is byte-for-byte the old engine: no
+    chip-namespaced resources appear."""
+    dep = Deployment(tp=2, pp=2, weight_dtype=DType.FP8)
+    scen = Scenario(batch=32, prompt_len=2048, output_len=512)
+    r = _run(dep, scen, DESEngine())
+    assert not any(k.startswith("chip:") for k in r.resource_util["decode"])
+
+
+def test_graph_des_trace_emits_per_op_tracks():
+    import json
+
+    from inferencesim.sched import chrome_trace
+
+    system, model = _fine_quietbox()
+    scen = Scenario(batch=16, prompt_len=2048, output_len=512)
+    dep = Deployment(tp=2, pp=2, weight_dtype=DType.FP8, kv_dtype=DType.FP8)
+    engine = _graph_engine()
+    simulate(system, model, scen, dep, engine=engine)
+    op_runs = engine.last_op_runs["decode"]
+    assert op_runs  # graph mode recorded per-op chip schedules
+    name, sched = next(iter(op_runs.items()))
+    trace = chrome_trace(sched.tasks, sched.result, prefix=f"decode/op:{name}/")
+    json.loads(json.dumps(trace))  # valid, serialisable JSON
+    procs = [e for e in trace["traceEvents"] if e["ph"] == "M"]
+    assert procs and all(
+        e["args"]["name"].startswith(f"decode/op:{name}/") for e in procs
+    )

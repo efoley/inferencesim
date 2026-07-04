@@ -51,24 +51,33 @@ connection is not wired yet.
 Drive per-chip work against `chip_graph.expand()` resources instead of one
 `u{s}` server.
 
-- [ ] **Resource model from graph**: turn each expanded node (DRAM bank,
-      NoC switch/port, per-core SRAM, matrix engine) into a FIFO (or
-      k-server) resource, and each edge into a link resource with its
-      bandwidth/latency. Reuse the `_Task`/`schedule()` core.
-- [ ] **Lower an `Op` to a sub-task chain over the path**: a GEMM tile
-      becomes read-from-DRAM-bank(s) → traverse NoC port(s) → land in
-      SRAM → matrix-engine compute → write-back, each hop a task on the
-      corresponding resource. Tile size becomes a knob (SRAM capacity is
-      the real constraint — currently stored but never enforced).
-- [ ] **Bank/port assignment**: use the edge `pattern` (interleave/all)
-      and selectors to decide which bank a tile's address maps to, so bank
-      conflicts are modelled, not averaged. Address→bank hashing knob.
-- [ ] **Compute/DRAM overlap becomes emergent**: with reads and math on
-      separate resources, double-buffering overlap falls out of the
-      schedule instead of `max(compute_t, mem_t)`.
-- [ ] **Validation**: with a single bank, single port and infinite SRAM,
-      the expanded DES must collapse to today's `max(flops/peak, bytes/bw)`
-      per op (regression test, analogous to the pp=1 == roofline test).
+- [x] **Resource model from graph**: `graphdes.ChipModel` expands the chip
+      graph and turns MEMORY/COMPUTE instances into FIFO resources, SWITCH
+      nodes into shared (processor-sharing) resources, and concrete edges
+      into FIFO link resources, driven by the same `sched.schedule()` core.
+- [x] **Lower an `Op` to a sub-task chain over the path**: `op_wall` lowers a
+      COMPUTE op to per-tile read → NoC hop(s) → SRAM → compute → write-back
+      task chains (store-and-forward, one task per constrained element). Tile
+      size is the `--tile-fill` knob against per-core SRAM capacity (now
+      enforced: it sets the tile count). Byte count sizes *memory* tiles only;
+      a compute-bearing op makes at least one tile per core so FLOPs spread
+      over the whole pool (roofline-consistent). Modelling an op that is
+      genuinely too serial to fill the chip (e.g. decode attention with few
+      heads) is future work: it needs op-structure metadata in `ops.py`
+      (heads, query blocks), not derivable from byte counts.
+- [x] **Bank/port assignment**: tiles round-robin over banks and cores using
+      the interleave convention `expand()` already wires (tile `i` → bank
+      `i % n_banks`, core `i % n_cores`), so bank conflicts are modelled, not
+      averaged. (Explicit address→bank *hashing* knob still open — only
+      round-robin is implemented.)
+- [x] **Compute/DRAM overlap becomes emergent**: reads and math sit on
+      separate resources with double buffering (`1/tile_fill` buffers), so
+      overlap falls out of the schedule; tested `wall < mem_t + compute_t`.
+- [x] **Validation**: degenerate tests in `tests/test_graphdes.py` — single
+      bank → `bytes/bw`, single core → `flops/rate`, two banks halve the
+      wall, shared NoC caps throughput, mixed ops overlap — reproduce the
+      closed forms exactly, and the engine-level graph-DES is a never-optimistic
+      refinement of the lumped DES (`tests/test_des.py`).
 
 ### 2. Contention & queueing fidelity
 
