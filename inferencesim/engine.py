@@ -54,18 +54,29 @@ class OpTiming:
 
 @dataclass
 class Phase:
-    """A timed group of ops (one prefill, or one decode step)."""
+    """A timed group of ops (one prefill, or one decode step).
+
+    wall_time, when set, is a measured wall-clock duration (e.g. from the
+    discrete-event engine, where overlap is emergent); otherwise the phase
+    is the analytic sum of its op timings."""
 
     name: str
     timings: list[OpTiming] = field(default_factory=list)
+    wall_time: float | None = None
 
     @property
     def total_time(self) -> float:
+        if self.wall_time is not None:
+            return self.wall_time
         return sum(t.time for t in self.timings)
 
     def duration(self, overlap_comm: bool = False) -> float:
         """Wall-clock time for the phase.  With overlap_comm, collectives run
-        concurrently with on-chip work: duration = max(comm, everything else)."""
+        concurrently with on-chip work: duration = max(comm, everything else).
+        A measured wall_time already includes whatever overlap the schedule
+        achieved, so the flag is ignored."""
+        if self.wall_time is not None:
+            return self.wall_time
         if not overlap_comm:
             return self.total_time
         comm = sum(t.time for t in self.timings if t.op.is_comm)

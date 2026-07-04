@@ -69,16 +69,16 @@ def blackhole_p150_fine() -> Graph:
         ),
     ]
     edges = [
-        # per-bank memory controllers into the NoC
+        # per-bank memory controllers into the NoC (default INTERLEAVE
+        # pattern: one link per bank instance)
         Edge(src="gddr6-bank", dst="noc", bandwidth=512 * 1e9 / _N_DRAM_BANKS,
-             count=_N_DRAM_BANKS, name="dram controller"),
-        # Tensix<->Tensix / Tensix<->DRAM traffic all rides the NoC; each
-        # core's injection port:
+             name="dram controller"),
+        # Tensix<->Tensix / Tensix<->DRAM traffic all rides the NoC; the
+        # pattern gives each core its own injection port
         Edge(src="noc", dst="tensix-l1", bandwidth=12 * TB / _N_CORES,
-             count=_N_CORES, name="noc injection port"),
-        # matrix engine reads operands from its local L1
-        Edge(src="tensix-l1", dst="tensix-fpu", count=_N_CORES,
-             name="l1 to fpu"),
+             name="noc injection port"),
+        # each matrix engine reads operands from its local L1 (one-to-one)
+        Edge(src="tensix-l1", dst="tensix-fpu", name="l1 to fpu"),
     ]
     return Graph(
         name="blackhole-p150-fine",

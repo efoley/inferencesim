@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import heapq
 import json
+import re
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Iterator
@@ -88,23 +89,74 @@ class Node:
         return {d: f * self.count for d, f in self.peak_flops.items()}
 
 
+class EdgePattern(str, Enum):
+    """How a grouped edge wires the instances of its endpoints.
+
+    INTERLEAVE (default): src[i % n_src] -- dst[i % n_dst] for
+        i in range(max(n_src, n_dst)); covers one-to-one (equal counts) and
+        star / per-instance ports (one side has count 1).
+    ALL: every src instance connects to every dst instance.
+    """
+
+    INTERLEAVE = "interleave"
+    ALL = "all"
+
+
+_SELECTOR_RE = re.compile(r"^(?P<base>[^\[\]]+?)(?:\[(?P<sel>\*|\d+|\d+:\d+)\])?$")
+
+
+def split_endpoint(endpoint: str) -> tuple[str, str | None]:
+    """'sram[0:8]' -> ('sram', '0:8'); 'sram' / 'sram[*]' -> ('sram', None)."""
+    m = _SELECTOR_RE.match(endpoint)
+    if not m:
+        raise ValueError(f"malformed endpoint '{endpoint}'")
+    sel = m.group("sel")
+    return m.group("base"), (None if sel in (None, "*") else sel)
+
+
+def _selector_indices(sel: str | None, count: int) -> list[int]:
+    if sel is None:
+        return list(range(count))
+    if ":" in sel:
+        lo, hi = (int(x) for x in sel.split(":"))
+        if not (0 <= lo < hi <= count):
+            raise ValueError(f"selector [{sel}] out of range for count {count}")
+        return list(range(lo, hi))
+    i = int(sel)
+    if not 0 <= i < count:
+        raise ValueError(f"selector [{sel}] out of range for count {count}")
+    return [i]
+
+
 @dataclass
 class Edge:
-    """An interconnect between two sibling nodes (bidirectional).
+    """An interconnect between two sibling groups (bidirectional).
 
-    bandwidth is bytes/s per direction per link; None = unconstrained."""
+    bandwidth is bytes/s per direction per concrete link; `count` is
+    parallel links per connected pair.  Endpoints may select instances of a
+    counted group: 'sram', 'sram[*]', 'sram[3]', 'sram[0:8]'.  `pattern`
+    says how selected src instances wire to selected dst instances; the
+    total capacity of the grouped edge is
+    bandwidth * count * n_links(pattern)."""
 
     src: str
     dst: str
     bandwidth: float | None = None
     latency_s: float = 0.0
     power_w: float = 0.0
-    count: int = 1  # parallel links
+    count: int = 1  # parallel links per connected pair
+    pattern: EdgePattern = EdgePattern.INTERLEAVE
     name: str = ""
 
     @property
     def agg_bandwidth(self) -> float | None:
+        """Capacity per connected pair (bandwidth x parallel links)."""
         return None if self.bandwidth is None else self.bandwidth * self.count
+
+    def n_links(self, n_src: int, n_dst: int) -> int:
+        if self.pattern is EdgePattern.ALL:
+            return n_src * n_dst
+        return max(n_src, n_dst)
 
 
 @dataclass(frozen=True)
@@ -182,9 +234,19 @@ class Graph:
                     )
         for e in self.edges:
             for end in (e.src, e.dst):
-                if not self.has_node(end):
+                if self.has_node(end):  # literal name (may contain [i])
+                    continue
+                base, sel = split_endpoint(end)
+                if not self.has_node(base):
                     raise ValueError(f"{self.name}: edge endpoint '{end}' does not exist")
-            if e.src == e.dst:
+                n = self.node(base)
+                if sel is not None and n.kind is NodeKind.COMPOSITE:
+                    raise ValueError(
+                        f"{self.name}: instance selector on composite '{end}' "
+                        f"is not supported"
+                    )
+                _selector_indices(sel, n.count)  # range check
+            if self._endpoint_base(e.src) == self._endpoint_base(e.dst):
                 raise ValueError(f"{self.name}: self-edge on '{e.src}'")
             if e.count < 1:
                 raise ValueError(f"{self.name}: edge {e.src}--{e.dst} count must be >= 1")
@@ -229,7 +291,170 @@ class Graph:
             edges.append(replace(e, src=src, dst=dst))
         return Graph(self.name, nodes, edges, dict(self.meta)), port_map
 
+    # ---- expansion ----------------------------------------------------------
+
+    def _endpoint_base(self, endpoint: str) -> str:
+        """The node an endpoint refers to: a literal name wins over selector
+        interpretation (expanded instance names contain brackets)."""
+        if self.has_node(endpoint):
+            return endpoint
+        return split_endpoint(endpoint)[0]
+
+    def _endpoint_width(self, endpoint: str) -> int:
+        if self.has_node(endpoint):
+            return self.node(endpoint).count
+        base, sel = split_endpoint(endpoint)
+        return len(_selector_indices(sel, self.node(base).count))
+
+    def edge_capacity(self, e: Edge) -> float | None:
+        """Total bandwidth of a grouped edge: per-link bandwidth x parallel
+        links per pair x number of wired pairs (per its pattern)."""
+        if e.bandwidth is None:
+            return None
+        n = e.n_links(self._endpoint_width(e.src), self._endpoint_width(e.dst))
+        return e.bandwidth * e.count * n
+
+    def expand(self, deep: bool = True) -> "Graph":
+        """Materialise counted groups into individual instances.
+
+        'sram' x35 becomes nodes sram[0]..sram[34]; grouped edges become the
+        concrete links their pattern implies.  Aggregate queries (max_flow)
+        give the same answers before and after expansion; the expanded form
+        is what a discrete-event engine walks and what a UI shows when a
+        group is unfolded.  With deep=True, inner graphs expand too
+        (composite counts themselves also expand: chip x4 -> chip[0..3])."""
+        expanded, _ = self._expand(deep)
+        return expanded
+
+    def _expand(self, deep: bool) -> tuple["Graph", dict[str, list[str]]]:
+        instances: dict[str, list[str]] = {}
+        nodes: list[Node] = []
+        for n in self.nodes:
+            inner = n.inner
+            ports = n.ports
+            if deep and inner is not None:
+                inner, inner_instances = inner._expand(deep)
+                ports = tuple(
+                    inner_instances.get(p, [p])[0] for p in n.ports
+                )
+            base = replace(n, inner=inner, ports=ports)
+            if n.count == 1:
+                instances[n.name] = [n.name]
+                nodes.append(base)
+            else:
+                names = [f"{n.name}[{i}]" for i in range(n.count)]
+                instances[n.name] = names
+                nodes.extend(replace(base, name=nm, count=1) for nm in names)
+        edges: list[Edge] = []
+
+        def concrete(endpoint: str) -> list[str]:
+            if self.has_node(endpoint):  # literal name wins
+                return instances[endpoint]
+            base, sel = split_endpoint(endpoint)
+            return [instances[base][i]
+                    for i in _selector_indices(sel, self.node(base).count)]
+
+        for e in self.edges:
+            srcs = concrete(e.src)
+            dsts = concrete(e.dst)
+            if e.pattern is EdgePattern.ALL:
+                pairs = [(s, d) for s in srcs for d in dsts]
+            else:
+                pairs = [
+                    (srcs[i % len(srcs)], dsts[i % len(dsts)])
+                    for i in range(max(len(srcs), len(dsts)))
+                ]
+            edges.extend(
+                replace(e, src=s, dst=d, pattern=EdgePattern.INTERLEAVE)
+                for s, d in pairs
+            )
+        return Graph(self.name, nodes, edges, dict(self.meta)), instances
+
     # ---- queries ------------------------------------------------------------
+
+    def _group(self, spec: str | list[str]) -> list[str]:
+        """Resolve 'sram', 'sram[0:8]', or an explicit list to node names
+        present in this graph (grouped or expanded form)."""
+        if isinstance(spec, list):
+            return spec
+        if self.has_node(spec):  # literal name (possibly an instance)
+            return [spec]
+        base, sel = split_endpoint(spec)
+        if self.has_node(base):
+            if sel is not None:
+                raise ValueError(
+                    f"{self.name}: '{spec}' selects instances of an unexpanded "
+                    f"group; call expand() first"
+                )
+            return [base]
+        members = [n.name for n in self.nodes
+                   if split_endpoint(n.name)[0] == base]
+        if not members:
+            raise KeyError(f"{self.name}: no node or group named '{base}'")
+        if sel is None:
+            return members
+        return [f"{base}[{i}]" for i in _selector_indices(sel, len(members))]
+
+    def max_flow(self, src: str | list[str], dst: str | list[str]) -> float:
+        """Aggregate bandwidth between two groups: max flow with node
+        capacities (count-aggregated) and edge capacities.  Unlike
+        widest_path this credits parallel routes, and it gives the same
+        answer on grouped and expanded forms of a uniform graph."""
+        srcs, dsts = self._group(src), self._group(dst)
+        INF = float("inf")
+        cap: dict[tuple[str, str], float] = {}
+
+        def add(u: str, v: str, c: float) -> None:
+            cap[(u, v)] = cap.get((u, v), 0.0) + c
+
+        for n in self.nodes:
+            c = n.agg_bandwidth if n.agg_bandwidth is not None else INF
+            add(f"i:{n.name}", f"o:{n.name}", c)
+        for e in self.edges:
+            c = self.edge_capacity(e)
+            c = INF if c is None else c
+            s, d = self._endpoint_base(e.src), self._endpoint_base(e.dst)
+            add(f"o:{s}", f"i:{d}", c)
+            add(f"o:{d}", f"i:{s}", c)
+        SRC, DST = "src!", "dst!"
+        for s in srcs:
+            add(SRC, f"i:{s}", INF)
+        for d in dsts:
+            add(f"o:{d}", DST, INF)
+
+        adj: dict[str, list[str]] = {}
+        for (u, v) in list(cap.keys()):
+            adj.setdefault(u, []).append(v)
+            adj.setdefault(v, []).append(u)
+            cap.setdefault((v, u), 0.0)
+
+        flow = 0.0
+        while True:
+            # BFS for an augmenting path
+            parent: dict[str, str] = {SRC: SRC}
+            queue = [SRC]
+            while queue and DST not in parent:
+                u = queue.pop(0)
+                for v in adj.get(u, []):
+                    if v not in parent and cap[(u, v)] > 1e-9:
+                        parent[v] = u
+                        queue.append(v)
+            if DST not in parent:
+                return flow
+            bottleneck, v = INF, DST
+            while v != SRC:
+                u = parent[v]
+                bottleneck = min(bottleneck, cap[(u, v)])
+                v = u
+            if bottleneck == INF:
+                return INF  # unconstrained route exists
+            v = DST
+            while v != SRC:
+                u = parent[v]
+                cap[(u, v)] -= bottleneck
+                cap[(v, u)] += bottleneck
+                v = u
+            flow += bottleneck
 
     def widest_path(self, src: str, dst: str) -> PathResult:
         """Maximise the bottleneck bandwidth between two nodes (composites
@@ -242,8 +467,9 @@ class Graph:
         lat = {n.name: n.latency_s for n in self.nodes}
         adj: dict[str, list[tuple[str, Edge]]] = {n.name: [] for n in self.nodes}
         for e in self.edges:
-            adj[e.src].append((e.dst, e))
-            adj[e.dst].append((e.src, e))
+            s, d = self._endpoint_base(e.src), self._endpoint_base(e.dst)
+            adj[s].append((d, e))
+            adj[d].append((s, e))
         if src not in caps or dst not in caps:
             missing = src if src not in caps else dst
             raise KeyError(f"{self.name}: no node named '{missing}'")
@@ -265,7 +491,8 @@ class Graph:
             for v, e in adj[u]:
                 if v in done:
                     continue
-                ecap = e.agg_bandwidth if e.agg_bandwidth is not None else float("inf")
+                ec = self.edge_capacity(e)
+                ecap = ec if ec is not None else float("inf")
                 nw = min(w, ecap, caps[v])
                 if nw > best.get(v, 0.0):
                     best[v] = nw
@@ -401,6 +628,8 @@ def _edge_to_dict(e: Edge) -> dict[str, Any]:
             d[attr] = getattr(e, attr)
     if e.count != 1:
         d["count"] = e.count
+    if e.pattern is not EdgePattern.INTERLEAVE:
+        d["pattern"] = e.pattern.value
     return d
 
 
@@ -412,5 +641,6 @@ def _edge_from_dict(d: dict[str, Any]) -> Edge:
         latency_s=d.get("latency_s", 0.0),
         power_w=d.get("power_w", 0.0),
         count=d.get("count", 1),
+        pattern=EdgePattern(d.get("pattern", EdgePattern.INTERLEAVE.value)),
         name=d.get("name", ""),
     )
