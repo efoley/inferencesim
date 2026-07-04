@@ -88,6 +88,7 @@ chips or per-core:
 ```
 inferencesim graph --hardware tt-quietbox        # GDDR6 -> NoC -> SRAM -> compute (lumped)
 inferencesim graph --hardware tt-quietbox-fine   # 8 GDDR6 banks, 140 Tensix cores
+inferencesim graph --hardware dgx-h100-fine      # 5 HBM stacks, L2 crossbar, 132 SMs
 inferencesim graph --hardware tt-quietbox --json > machine.json   # edit it...
 inferencesim run --graph machine.json --model llama-3.1-8b        # ...and simulate it
 ```
