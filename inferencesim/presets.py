@@ -85,7 +85,7 @@ _BH_SRAM = Memory(
     power_w=20.0,
 )
 BLACKHOLE_P150 = Chip(
-    name="Blackhole p150",
+    name="Blackhole p150c",
     compute=Compute(
         name="Tensix matrix engines (140 cores)",
         peak_flops={  # approx from Tenstorrent material
@@ -159,7 +159,11 @@ DGX_SPARK_X2 = System(
     description="Two DGX Sparks back-to-back over ConnectX-7 200 GbE.",
 )
 
-_QB_ETH = Link("QSFP-DD 800GbE (card-to-card)", bandwidth=100 * GIGA, latency_s=2 * US)
+# Gen-1 Blackhole QuietBox, $12,000: 4x p150c, EPYC 8124P (125 W) host with
+# 512 GB DDR5, 1650 W PSU.  Ships with 8x QSFP-DD 800GbE cables = a ring of
+# 4 cards with 2 cables per edge -> ~200 GB/s per direction per neighbour.
+_QB_ETH = Link("QSFP-DD 800GbE x2 (card-to-card)", bandwidth=200 * GIGA,
+               latency_s=2 * US)
 
 TT_QUIETBOX = System(
     name="TT-QuietBox (Blackhole)",
@@ -168,19 +172,22 @@ TT_QUIETBOX = System(
         chip=BLACKHOLE_P150,
         n_chips=4,
         interconnect=_QB_ETH,
-        topology=Topology.MESH_2D,
-        overhead_power_w=250.0,  # host CPU, fans, PSU losses (approx)
-        cost_usd=15_000.0,  # approx list price
+        topology=Topology.RING,
+        overhead_power_w=350.0,  # EPYC host, 512 GB DDR5, fans, PSU losses (approx)
+        cost_usd=12_000.0,  # list price
     ),
-    description="Tenstorrent QuietBox: 4x Blackhole p150 over 800GbE.",
+    description="Tenstorrent QuietBox: 4x Blackhole p150c on an 800GbE ring, "
+                "EPYC 8124P host.",
 )
 
-# TT-QuietBox 2, part TW-04003 (ships Q2 2026, $9,999).  Official sheet:
-# 4x Blackhole ASICs (480 Tensix cores, 2,654 TFLOPS BlockFP8), 128 GB
-# GDDR6 pool, 720 MB SRAM total (180 MB/ASIC = 120 cores x 1.5 MB),
-# 1600 W PSU on a standard residential outlet, AMD Ryzen 7 9700X host with
-# 256 GB DDR5 + 4 TB NVMe.  Per-ASIC figures divide the box totals by 4;
-# power split and the card-to-card link (not on the sheet) are estimates.
+# TT-QuietBox 2, part TW-04003 ($9,999, ships Q2 2026).  Official specs:
+# 2 liquid-cooled PCIe cards, each with 2 Blackhole processors -- 480
+# Tensix cores, 720 MB SRAM (180 MB/ASIC = 120 cores x 1.5 MB) and 128 GB
+# of GDDR6 @ 16 GT/s totalling 1024 GB/s across the box, i.e. 256 GB/s
+# per ASIC (HALF a p150c's per-chip bandwidth -- narrower per-die bus on
+# the dual-chip cards).  2,654 TFLOPS BlockFP8 total.  Ryzen 7 9700X
+# (65 W) host, 256 GB DDR5, 1600 W PSU on a standard outlet.  The on-card
+# die-to-die and card-to-card links are not published; both are estimates.
 BLACKHOLE_QB2 = Chip(
     name="Blackhole (QB2, 120-core)",
     compute=Compute(
@@ -192,7 +199,7 @@ BLACKHOLE_QB2 = Chip(
         },
         power_w=150.0,
     ),
-    dram=Memory("GDDR6", capacity_bytes=32 * GB, bandwidth=512 * GIGA, power_w=50.0),
+    dram=Memory("GDDR6", capacity_bytes=32 * GB, bandwidth=256 * GIGA, power_w=40.0),
     on_chip_path=(
         Link(name="Blackhole NoC (aggregate DRAM->cores)", bandwidth=3.2 * TB,
              latency_s=0.2 * US),
@@ -202,27 +209,32 @@ BLACKHOLE_QB2 = Chip(
     idle_power_w=55.0,
 )
 
-_QB2_ETH = Link(
-    # 4x QSFP-DD 800G per card (3.2 Tb/s aggregate); assume ~2 ports face
-    # each mesh neighbour -> 200 GB/s per direction (approx, editable)
-    name="QSFP-DD 800GbE x2 (card-to-card)",
+_QB2_DIE_LINK = Link(
+    name="on-card die-to-die (estimate)",
     bandwidth=200 * GIGA,
+    latency_s=0.5 * US,
+)
+_QB2_CARD_LINK = Link(
+    name="card-to-card (estimate)",
+    bandwidth=100 * GIGA,
     latency_s=2 * US,
 )
 
 TT_QUIETBOX_2 = System(
     name="TT-QuietBox 2",
     node=Node(
-        name="QuietBox 2",
+        name="QB2 dual-Blackhole card",
         chip=BLACKHOLE_QB2,
-        n_chips=4,
-        interconnect=_QB2_ETH,
-        topology=Topology.MESH_2D,
-        overhead_power_w=280.0,  # Ryzen host, 256 GB DDR5, pumps/fans (approx)
-        cost_usd=9_999.0,  # announced starting price
+        n_chips=2,
+        interconnect=_QB2_DIE_LINK,
+        overhead_power_w=100.0,  # half the Ryzen host / pump / PSU share
+        cost_usd=0.0,  # priced at the system level
     ),
-    description="Tenstorrent TT-QuietBox 2 (TW-04003): 4x Blackhole (120-core), "
-                "128 GB GDDR6 / 720 MB SRAM total.",
+    n_nodes=2,
+    network=_QB2_CARD_LINK,
+    extra_cost_usd=9_999.0,  # box list price
+    description="Tenstorrent TT-QuietBox 2 (TW-04003): 2 cards x 2 Blackhole "
+                "(120-core), 128 GB GDDR6 @ 1024 GB/s total, 720 MB SRAM.",
 )
 
 HARDWARE: dict[str, System] = {
