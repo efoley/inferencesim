@@ -4,6 +4,7 @@ inference factories, built from chip-level hardware blocks."""
 from .hardware import Chip, Compute, DType, Link, Memory, Node, System, Topology
 from .workload import Deployment, ModelSpec, MoEConfig, Scenario
 from .engine import Engine, RooflineEngine, ring_allreduce_time
+from .sched import Resource, ScheduleResult, Task, chrome_trace, schedule
 from .des import DESEngine
 from .simulate import CostModel, MemoryUsage, Report, simulate, weight_bytes_per_chip
 from .report import format_report
@@ -23,6 +24,7 @@ __all__ = [
     "Chip", "Compute", "DType", "Link", "Memory", "Node", "System", "Topology",
     "Deployment", "ModelSpec", "MoEConfig", "Scenario",
     "Engine", "RooflineEngine", "DESEngine", "ring_allreduce_time",
+    "Task", "Resource", "ScheduleResult", "schedule", "chrome_trace",
     "CostModel", "MemoryUsage", "Report", "simulate", "weight_bytes_per_chip",
     "format_report",
     "Graph", "GraphNode", "GraphEdge", "NodeKind",

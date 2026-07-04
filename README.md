@@ -151,9 +151,14 @@ scheduling/contention. What's emergent rather than assumed: pipeline
 microbatch overlap (TPOT is the *measured* steady-state round period),
 the real cost of unbalanced stages (`n_layers % pp != 0` — the analytic
 engine only warns), LM-head/hop overlap with other stages' work, and
-serial fill/drain for single-request prefill. Current granularity is
-pipeline stages and links; walking the expanded chip graph (DRAM banks,
-NoC hops, per-core SRAM) with the same scheduler is the next level.
+serial fill/drain for single-request prefill. The report adds a
+per-resource utilisation line per phase (which stage unit / collective
+fabric / hop was the bottleneck), and `--trace out.json` writes a
+Chrome/Perfetto timeline of the run. Current granularity is pipeline
+stages and links; walking the expanded chip graph (DRAM banks, NoC hops,
+per-core SRAM) with the same scheduler is the next level. The scheduler
+core (`sched.py`) already supports k-server pools and bandwidth-shared
+links, ready for that step.
 
 ### Outputs
 

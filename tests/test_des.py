@@ -2,38 +2,17 @@
 
 import pytest
 
-from inferencesim.des import DESEngine, _Task, schedule
+from inferencesim.des import DESEngine
 from inferencesim.engine import RooflineEngine
 from inferencesim.hardware import DType
 from inferencesim.presets import DGX_H100, GB300_NVL72, LLAMA_3_1_70B
+from inferencesim.report import format_report
 from inferencesim.simulate import simulate
 from inferencesim.workload import Deployment, Scenario
 
 
 def _run(dep, scen, engine, system=DGX_H100, model=LLAMA_3_1_70B):
     return simulate(system, model, scen, dep, engine=engine)
-
-
-# ---- scheduler core ---------------------------------------------------------
-
-
-def test_scheduler_serialises_on_resources_and_respects_deps():
-    tasks = [
-        _Task(0, "u", 2.0, []),
-        _Task(1, "u", 3.0, []),        # same resource: queues behind 0
-        _Task(2, "link", 1.0, [0]),    # different resource: overlaps with 1
-        _Task(3, "u", 1.0, [2]),
-    ]
-    finish = schedule(tasks)
-    assert finish[0] == 2.0
-    assert finish[1] == 5.0
-    assert finish[2] == 3.0   # started at 2 on the free link
-    assert finish[3] == 6.0   # waited for the unit (busy till 5)
-
-
-def test_scheduler_detects_cycles():
-    with pytest.raises(ValueError, match="cycle"):
-        schedule([_Task(0, "u", 1.0, [1]), _Task(1, "u", 1.0, [0])])
 
 
 # ---- DES vs analytic --------------------------------------------------------
@@ -124,3 +103,32 @@ def test_des_with_moe_and_ep():
     # serial chain again (pp=1): must agree
     assert d.tpot_s == pytest.approx(a.tpot_s, rel=1e-9)
     assert d.output_tokens_per_s > 0
+
+
+# ---- observability: per-resource utilisation --------------------------------
+
+
+def test_des_populates_resource_utilisation():
+    """A tp>1, pp>1 run exercises the unit (u), collective (c) and hop (h)
+    resources; the DES surfaces per-resource utilisation in (0, 1]."""
+    dep = Deployment(tp=2, pp=2, weight_dtype=DType.FP8)
+    scen = Scenario(batch=32, prompt_len=2048, output_len=512)
+    engine = DESEngine()
+    r = _run(dep, scen, engine)
+    assert r.resource_util is not None
+    decode_util = r.resource_util["decode"]
+    # the busy dict Phase carried has the expected resource families
+    busy = engine.last_runs["decode"][1].busy
+    assert any(k.startswith("u") for k in busy)   # stage execution units
+    assert any(k.startswith("c") for k in busy)   # tp collective fabric
+    assert any(k.startswith("h") for k in busy)   # pipeline hops
+    assert all(0.0 < f <= 1.0 for f in decode_util.values())
+
+
+def test_report_shows_util_block_for_des_not_roofline():
+    dep = Deployment(tp=8, weight_dtype=DType.FP8)
+    scen = Scenario(batch=32, prompt_len=2048, output_len=512)
+    des_text = format_report(_run(dep, scen, DESEngine()))
+    roof_text = format_report(_run(dep, scen, RooflineEngine()))
+    assert "resource util" in des_text
+    assert "resource util" not in roof_text

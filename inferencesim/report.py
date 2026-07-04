@@ -54,6 +54,13 @@ def format_report(r: Report) -> str:
     add(f"TPOT         : {fmt_time(r.tpot_s)} @ mean ctx {sc.mean_context:.0f}  "
         f"-> {1.0 / r.tpot_s:.1f} tok/s per request" if r.tpot_s > 0 else "TPOT         : n/a")
     add(f"  breakdown  : {_phase_breakdown(r.decode)}")
+    if r.resource_util:
+        for pname in ("prefill", "decode"):
+            util = r.resource_util.get(pname)
+            if util:
+                ranked = sorted(util.items(), key=lambda kv: -kv[1])
+                body = "  ".join(f"{res} {100 * frac:.0f}%" for res, frac in ranked)
+                add(f"  {pname} resource util: {body}")
     add("-" * 72)
     add(f"Throughput   : {fmt_si(r.output_tokens_per_s, 'tok/s')} output "
         f"({fmt_si(r.input_tokens_per_s, 'tok/s')} input, "

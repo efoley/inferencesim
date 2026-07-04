@@ -72,13 +72,15 @@ Drive per-chip work against `chip_graph.expand()` resources instead of one
 
 ### 2. Contention & queueing fidelity
 
-- [ ] **k-server resources**: a node with `count=k` (e.g. 8 DRAM banks)
-      should serve k tasks concurrently, not serialise — extend
-      `schedule()` from one `free[resource]` timestamp to a k-slot pool.
-- [ ] **Link duplexing & sharing**: model a Warp400/NVLink edge as a
-      bandwidth-shared resource (N concurrent flows each get bw/N) rather
-      than a single-flow FIFO; needed before collective/hop contention is
-      meaningful.
+- [x] **k-server resources**: `Resource(servers=k)` in `sched.py` serves k
+      tasks concurrently from a k-slot pool (k=1 reproduces the old single
+      `free[resource]` behaviour exactly). The stage-level engine still
+      declares only 1-server FIFO resources until the expanded-graph PR
+      consumes the new mode.
+- [x] **Link duplexing & sharing**: `Resource(shared=True)` in `sched.py`
+      models processor sharing (N concurrent flows each get bw/N; a single
+      flow is identical to FIFO). Not yet wired into stage links — the
+      expanded-graph PR will map bandwidth-shared edges onto it.
 - [ ] **Collective internals**: expand ring/all-to-all into their actual
       per-step link transfers over the topology (`Topology.RING` /
       `MESH_2D` / `ALL_TO_ALL`) instead of the closed-form
@@ -114,15 +116,17 @@ Drive per-chip work against `chip_graph.expand()` resources instead of one
 - [ ] **Convergence control**: auto-grow `decode_rounds` until the measured
       round period stabilises within a tolerance, instead of fixed
       `decode_rounds/warmup`.
-- [ ] **Event-driven core**: `schedule()` is O(tasks) list scheduling; for
-      the much larger expanded task graphs, move to a proper event heap
-      with lazy resource-ready events (the interface can stay the same).
-- [ ] **Timeline export**: emit per-resource task timelines (start/end)
-      for a Chrome-trace / Perfetto view — invaluable for debugging
-      contention and for the planned graph-editor UI to visualise a run.
-- [ ] **`Report` surface**: expose per-resource utilisation (which bank /
-      port / engine was the bottleneck) alongside the existing
-      category breakdown.
+- [x] **Event-driven core**: moved to `sched.py`, a proper event loop with
+      a ready heap plus lazy-invalidated (epoch-tagged) departure events for
+      shared resources. All-FIFO graphs still schedule identically to the
+      old list scheduler (the interface is unchanged for the stage engine).
+- [x] **Timeline export**: `chrome_trace()` emits per-resource task
+      timelines (one process per resource, tasks packed into non-overlapping
+      tid lanes); `inferencesim run --engine des --trace out.json` writes
+      both phases to a Perfetto-loadable file.
+- [x] **`Report` surface**: `Phase.resource_busy`/`resource_span` and
+      `Report.resource_util` carry per-resource utilisation, rendered as a
+      per-phase line in the report (roofline output is unchanged).
 
 ## Validation philosophy
 
