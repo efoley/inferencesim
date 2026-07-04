@@ -67,17 +67,23 @@ def test_widest_path_prefers_wider_route():
     assert g.widest_path("a", "b").bandwidth == 200e9
 
 
-def test_count_multiplies_bandwidth():
+def test_grouped_edge_capacity_from_pattern():
     g = Graph(
         name="banked",
         nodes=[
             Node("bank", NodeKind.MEMORY, count=8, capacity_bytes=4e9, bandwidth=64e9),
             Node("fpu", NodeKind.COMPUTE, peak_flops={DType.FP16: 1.0}),
         ],
-        edges=[Edge("bank", "fpu", bandwidth=64e9, count=8)],
+        # INTERLEAVE default: one 64 GB/s link per bank instance
+        edges=[Edge("bank", "fpu", bandwidth=64e9)],
     )
     p = g.widest_path("bank", "fpu")
     assert p.bandwidth == 8 * 64e9
+    # edge count still means parallel links per pair
+    g.edges[0].count = 2
+    assert g.widest_path("bank", "fpu").bandwidth == pytest.approx(
+        min(2 * 8 * 64e9, 8 * 64e9)
+    )  # node cap now binds
 
 
 def test_validation_catches_mistakes():

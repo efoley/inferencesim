@@ -71,6 +71,16 @@ bandwidth + latency — a NoC hop, NVLink, or the ConnectX-7 between two DGX
 Sparks are all just edges at different levels. A node's `count` means "this
 many identical instances" (140 Tensix cores) without materialising them.
 
+Groups scale without clutter: `count` on a node means N identical
+instances, and edges between counted groups declare a wiring `pattern`
+(`interleave` — one link per instance, covering one-to-one and star — or
+`all`). `Graph.expand()` materialises the instances (`sram[0]`…`sram[34]`)
+and the concrete links the pattern implies; selectors (`sram[3]`,
+`sram[0:8]`) let you hand-wire irregular topologies or mark harvested
+units. Aggregate bandwidth queries use max-flow (`Graph.max_flow`), which
+credits parallel routes and gives identical answers on grouped and
+expanded forms (tested).
+
 Nesting sets the abstraction level: a **composite** node contains an inner
 graph and exposes ports. The same QuietBox can be modelled with lumped
 chips or per-core:
@@ -132,6 +142,19 @@ overheads. Results are optimistic bounds — real systems achieve some fraction
 of them. TP collectives are serialized by default; pass `--overlap-comm` to
 assume perfect overlap (reality is in between).
 
+`DESEngine` (`--engine des`) is a discrete-event simulation: one task per
+(round, microbatch, pipeline stage, layer) with explicit dependencies,
+scheduled against FIFO resources (each stage's execution unit, its
+collective fabric, its outbound p2p link). Per-task service times reuse
+the roofline math, so differences between the engines are pure
+scheduling/contention. What's emergent rather than assumed: pipeline
+microbatch overlap (TPOT is the *measured* steady-state round period),
+the real cost of unbalanced stages (`n_layers % pp != 0` — the analytic
+engine only warns), LM-head/hop overlap with other stages' work, and
+serial fill/drain for single-request prefill. Current granularity is
+pipeline stages and links; walking the expanded chip graph (DRAM banks,
+NoC hops, per-core SRAM) with the same scheduler is the next level.
+
 ### Outputs
 
 - **Latency**: TTFT (prefill) and TPOT (decode at mean context), with a
@@ -153,9 +176,9 @@ assume perfect overlap (reality is in between).
 
 ## Roadmap
 
-- **Discrete-event engine**: consume the same `Op` stream with explicit
-  dependencies and contention on the hardware graph's real nodes and edges
-  (DRAM banks, NoC hops, per-core SRAM, links); heterogeneous chips.
+- **DES on the expanded chip graph**: contention on DRAM banks, NoC hops
+  and per-core SRAM (the `expand()`ed graph is built for this);
+  heterogeneous chips; prefill/decode interference in one simulation.
 - **Graph editor UI** over the JSON graph format (nodes with constraints,
   edges with latencies, nesting for abstraction levels).
 - Multi-rack topologies (rail-optimized Ethernet/IB); prefill/decode

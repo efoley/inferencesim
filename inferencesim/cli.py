@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 
 from .bridge import system_from_graph, system_to_graph
+from .des import DESEngine
+from .engine import RooflineEngine
 from .graph import Graph
 from .hardware import DType, System
 from .presets import HARDWARE, MODELS
@@ -103,10 +105,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         pue=args.pue,
     )
 
+    engine = DESEngine() if args.engine == "des" else RooflineEngine()
     batches = [int(b) for b in args.batch.split(",")]
     for i, batch in enumerate(batches):
         scen = Scenario(batch=batch, prompt_len=args.prompt, output_len=args.output)
-        report = simulate(system, model, scen, dep, cost)
+        report = simulate(system, model, scen, dep, cost, engine=engine)
         if i:
             print()
         print(format_report(report))
@@ -143,6 +146,10 @@ def main(argv: list[str] | None = None) -> int:
                      choices=[d.value for d in DType])
     run.add_argument("--kv-dtype", default="bf16", choices=[d.value for d in DType])
     run.add_argument("--act-dtype", default="bf16", choices=[d.value for d in DType])
+    run.add_argument("--engine", choices=["roofline", "des"], default="roofline",
+                     help="roofline: analytic speed-of-light sums; des: "
+                          "discrete-event simulation with resource queues "
+                          "(overlap is emergent; --overlap-comm is ignored)")
     run.add_argument("--overlap-comm", action="store_true",
                      help="assume TP collectives fully overlap with compute")
     run.add_argument("--amortization-years", type=float, default=4.0)

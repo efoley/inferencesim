@@ -39,7 +39,7 @@ from __future__ import annotations
 from dataclasses import replace as dc_replace
 from typing import Any
 
-from .graph import Edge, Graph, Node, NodeKind
+from .graph import Edge, Graph, Node, NodeKind, split_endpoint
 from .hardware import Chip, Compute, DType, Link, Memory, System, Topology
 from .hardware import Node as HwNode
 
@@ -220,17 +220,29 @@ def chip_from_graph(g: Graph, idle_power_w: float = 0.0, name: str | None = None
             flops[d] = flops.get(d, 0.0) + f
     compute_power = sum(c.dynamic_power_w * c.count for c in computes)
 
-    memories = [m for m in flat.find(kind=NodeKind.MEMORY) if m.capacity_bytes]
-    if not memories:
+    # DRAM = the group of memory instances (sharing a base name, e.g.
+    # "gddr6-bank" / "gddr6-bank[3]") with the largest total capacity
+    groups: dict[str, list[Node]] = {}
+    for m in flat.find(kind=NodeKind.MEMORY):
+        if m.capacity_bytes:
+            groups.setdefault(split_endpoint(m.name)[0], []).append(m)
+    if not groups:
         raise ValueError(f"{g.name}: chip graph has no memory with a capacity")
-    dram = max(memories, key=lambda m: m.agg_capacity or 0.0)
+    dram_base, dram_members = max(
+        groups.items(), key=lambda kv: sum(m.agg_capacity or 0.0 for m in kv[1])
+    )
+    dram_capacity = sum(m.agg_capacity or 0.0 for m in dram_members)
+    dram_latency = max(m.latency_s for m in dram_members)
 
-    main_compute = max(computes, key=lambda c: max(c.agg_flops.values()))
-    path = flat.widest_path(dram.name, main_compute.name)
-    if path.bandwidth == float("inf"):
+    # effective streaming bandwidth: max flow credits parallel routes and
+    # is invariant under expand()
+    eff_bw = flat.max_flow(
+        [m.name for m in dram_members], [c.name for c in computes]
+    )
+    if eff_bw == float("inf"):
         raise ValueError(
-            f"{g.name}: no bandwidth constraint anywhere on the "
-            f"{dram.name} -> {main_compute.name} path"
+            f"{g.name}: no bandwidth constraint anywhere between "
+            f"{dram_base} and the compute nodes"
         )
 
     mem_side_power = sum(
@@ -245,11 +257,11 @@ def chip_from_graph(g: Graph, idle_power_w: float = 0.0, name: str | None = None
         compute=Compute(name="aggregated compute", peak_flops=flops,
                         power_w=compute_power),
         dram=Memory(
-            name=f"{dram.name} (via {' -> '.join(path.nodes[1:-1]) or 'direct'})",
-            capacity_bytes=dram.agg_capacity or 0.0,
-            bandwidth=path.bandwidth,
+            name=dram_base,
+            capacity_bytes=dram_capacity,
+            bandwidth=eff_bw,
             power_w=mem_side_power,
-            latency_s=path.latency_s,
+            latency_s=dram_latency,
         ),
         on_chip_path=(),
         idle_power_w=idle,
