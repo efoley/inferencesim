@@ -175,11 +175,12 @@ TT_QUIETBOX = System(
     description="Tenstorrent QuietBox: 4x Blackhole p150 over 800GbE.",
 )
 
-# TT-QuietBox 2 (announced 2026, ships Q2 2026, $9,999): 4x Blackhole
-# processors binned to 120 Tensix cores each (480 total), 128 GB GDDR6
-# total, 2,654 TFLOPS BlockFP8 across the box, ~1.4 kW on a standard 120 V
-# outlet, AMD Ryzen host with 256 GB DDR5.  Per-ASIC figures derived from
-# the box totals; power split is approximate.
+# TT-QuietBox 2, part TW-04003 (ships Q2 2026, $9,999).  Official sheet:
+# 4x Blackhole ASICs (480 Tensix cores, 2,654 TFLOPS BlockFP8), 128 GB
+# GDDR6 pool, 720 MB SRAM total (180 MB/ASIC = 120 cores x 1.5 MB),
+# 1600 W PSU on a standard residential outlet, AMD Ryzen 7 9700X host with
+# 256 GB DDR5 + 4 TB NVMe.  Per-ASIC figures divide the box totals by 4;
+# power split and the card-to-card link (not on the sheet) are estimates.
 BLACKHOLE_QB2 = Chip(
     name="Blackhole (QB2, 120-core)",
     compute=Compute(
@@ -220,8 +221,8 @@ TT_QUIETBOX_2 = System(
         overhead_power_w=280.0,  # Ryzen host, 256 GB DDR5, pumps/fans (approx)
         cost_usd=9_999.0,  # announced starting price
     ),
-    description="Tenstorrent TT-QuietBox 2: 4x Blackhole (120-core) over 800GbE, "
-                "128 GB GDDR6 total.",
+    description="Tenstorrent TT-QuietBox 2 (TW-04003): 4x Blackhole (120-core), "
+                "128 GB GDDR6 / 720 MB SRAM total.",
 )
 
 HARDWARE: dict[str, System] = {
@@ -250,6 +251,12 @@ LLAMA_3_1_70B = ModelSpec(
     d_ff=28672, vocab_size=128256,
 )
 
+QWEN3_32B = ModelSpec(
+    name="qwen3-32b",
+    n_layers=64, d_model=5120, n_heads=64, n_kv_heads=8, d_head=128,
+    d_ff=25600, vocab_size=151936,
+)
+
 GPT_OSS_120B = ModelSpec(
     name="gpt-oss-120b",
     n_layers=36, d_model=2880, n_heads=64, n_kv_heads=8, d_head=64,
@@ -260,5 +267,6 @@ GPT_OSS_120B = ModelSpec(
 MODELS: dict[str, ModelSpec] = {
     "llama-3.1-8b": LLAMA_3_1_8B,
     "llama-3.1-70b": LLAMA_3_1_70B,
+    "qwen3-32b": QWEN3_32B,
     "gpt-oss-120b": GPT_OSS_120B,
 }
