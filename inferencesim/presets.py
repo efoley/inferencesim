@@ -175,20 +175,53 @@ TT_QUIETBOX = System(
     description="Tenstorrent QuietBox: 4x Blackhole p150 over 800GbE.",
 )
 
-# Not a shipping product: a hypothetical half-size QuietBox for studying how
-# results scale with card count (2x 32 GB, 2x 512 GB/s aggregate).
-TT_QUIETBOX_2 = System(
-    name="TT-QuietBox-2 (2x Blackhole)",
-    node=Node(
-        name="QuietBox-2",
-        chip=BLACKHOLE_P150,
-        n_chips=2,
-        interconnect=_QB_ETH,
-        topology=Topology.RING,  # two cards: a single 800GbE pair
-        overhead_power_w=180.0,  # smaller host share (approx)
-        cost_usd=8_500.0,  # rough: 2 cards + host
+# TT-QuietBox 2 (announced 2026, ships Q2 2026, $9,999): 4x Blackhole
+# processors binned to 120 Tensix cores each (480 total), 128 GB GDDR6
+# total, 2,654 TFLOPS BlockFP8 across the box, ~1.4 kW on a standard 120 V
+# outlet, AMD Ryzen host with 256 GB DDR5.  Per-ASIC figures derived from
+# the box totals; power split is approximate.
+BLACKHOLE_QB2 = Chip(
+    name="Blackhole (QB2, 120-core)",
+    compute=Compute(
+        name="Tensix matrix engines (120 cores)",
+        peak_flops={
+            DType.FP8: 663.5 * TERA,  # 2654 TFLOPS BlockFP8 / 4 ASICs
+            DType.BF16: 331.7 * TERA,
+            DType.FP16: 331.7 * TERA,
+        },
+        power_w=150.0,
     ),
-    description="Hypothetical 2-card QuietBox: 2x Blackhole p150 over 800GbE.",
+    dram=Memory("GDDR6", capacity_bytes=32 * GB, bandwidth=512 * GIGA, power_w=50.0),
+    on_chip_path=(
+        Link(name="Blackhole NoC (aggregate DRAM->cores)", bandwidth=3.2 * TB,
+             latency_s=0.2 * US),
+        Memory(name="Tensix L1 SRAM (120 cores x 1.5 MB)", capacity_bytes=180 * MB,
+               bandwidth=10.4 * TB, power_w=18.0),
+    ),
+    idle_power_w=55.0,
+)
+
+_QB2_ETH = Link(
+    # 4x QSFP-DD 800G per card (3.2 Tb/s aggregate); assume ~2 ports face
+    # each mesh neighbour -> 200 GB/s per direction (approx, editable)
+    name="QSFP-DD 800GbE x2 (card-to-card)",
+    bandwidth=200 * GIGA,
+    latency_s=2 * US,
+)
+
+TT_QUIETBOX_2 = System(
+    name="TT-QuietBox 2",
+    node=Node(
+        name="QuietBox 2",
+        chip=BLACKHOLE_QB2,
+        n_chips=4,
+        interconnect=_QB2_ETH,
+        topology=Topology.MESH_2D,
+        overhead_power_w=280.0,  # Ryzen host, 256 GB DDR5, pumps/fans (approx)
+        cost_usd=9_999.0,  # announced starting price
+    ),
+    description="Tenstorrent TT-QuietBox 2: 4x Blackhole (120-core) over 800GbE, "
+                "128 GB GDDR6 total.",
 )
 
 HARDWARE: dict[str, System] = {
