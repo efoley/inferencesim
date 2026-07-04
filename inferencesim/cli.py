@@ -151,7 +151,12 @@ def main(argv: list[str] | None = None) -> int:
     run.set_defaults(fn=_cmd_run)
 
     args = p.parse_args(argv)
-    return args.fn(args)
+    try:
+        return args.fn(args)
+    except BrokenPipeError:
+        # output piped into head/less which closed early; not an error
+        sys.stderr.close()
+        return 0
 
 
 if __name__ == "__main__":
