@@ -175,6 +175,22 @@ TT_QUIETBOX = System(
     description="Tenstorrent QuietBox: 4x Blackhole p150 over 800GbE.",
 )
 
+# Not a shipping product: a hypothetical half-size QuietBox for studying how
+# results scale with card count (2x 32 GB, 2x 512 GB/s aggregate).
+TT_QUIETBOX_2 = System(
+    name="TT-QuietBox-2 (2x Blackhole)",
+    node=Node(
+        name="QuietBox-2",
+        chip=BLACKHOLE_P150,
+        n_chips=2,
+        interconnect=_QB_ETH,
+        topology=Topology.RING,  # two cards: a single 800GbE pair
+        overhead_power_w=180.0,  # smaller host share (approx)
+        cost_usd=8_500.0,  # rough: 2 cards + host
+    ),
+    description="Hypothetical 2-card QuietBox: 2x Blackhole p150 over 800GbE.",
+)
+
 HARDWARE: dict[str, System] = {
     "gb300-nvl72": GB300_NVL72,
     "dgx-h100": DGX_H100,
@@ -182,6 +198,7 @@ HARDWARE: dict[str, System] = {
     "dgx-spark": DGX_SPARK,
     "dgx-spark-x2": DGX_SPARK_X2,
     "tt-quietbox": TT_QUIETBOX,
+    "tt-quietbox-2": TT_QUIETBOX_2,
 }
 
 # =============================================================================
