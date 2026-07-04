@@ -63,6 +63,10 @@ class Phase:
     name: str
     timings: list[OpTiming] = field(default_factory=list)
     wall_time: float | None = None
+    # per-resource busy time and the schedule span they are measured over
+    # (populated by the discrete-event engine; None for the roofline engine).
+    resource_busy: dict[str, float] | None = None
+    resource_span: float | None = None
 
     @property
     def total_time(self) -> float:

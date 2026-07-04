@@ -104,6 +104,10 @@ class Report:
     usd_per_m_total_tokens: float = 0.0
     capex_share: float = 0.0  # fraction of $/token that is capex
 
+    # per-phase per-resource utilisation ({phase: {resource: fraction}}),
+    # only populated when the engine measures it (discrete-event engine).
+    resource_util: dict[str, dict[str, float]] | None = None
+
     warnings: list[str] = field(default_factory=list)
 
 
@@ -209,6 +213,14 @@ def simulate(
     total_tok_per_s = output_tokens_per_s + input_tokens_per_s
     usd_per_m_total = usd_per_s / total_tok_per_s * 1e6 if total_tok_per_s > 0 else float("inf")
 
+    # ---- per-resource utilisation (discrete-event engine only) -------------
+    resource_util: dict[str, dict[str, float]] = {}
+    for phase in (prefill, decode):
+        if phase.resource_busy and phase.resource_span:
+            resource_util[phase.name] = {
+                r: b / phase.resource_span for r, b in phase.resource_busy.items()
+            }
+
     return Report(
         system=system,
         model=model,
@@ -231,5 +243,6 @@ def simulate(
         usd_per_m_output_tokens=usd_per_m_out,
         usd_per_m_total_tokens=usd_per_m_total,
         capex_share=capex_per_s / usd_per_s if usd_per_s > 0 else 0.0,
+        resource_util=resource_util or None,
         warnings=warnings,
     )

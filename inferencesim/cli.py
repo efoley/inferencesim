@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from .hardware import DType, System
 from .presets import HARDWARE, MODELS
 from .presets_fine import GRAPH_PRESETS
 from .report import format_report
+from .sched import chrome_trace
 from .simulate import CostModel, simulate
 from .units import fmt_bytes, fmt_si
 from .workload import Deployment, Scenario
@@ -84,6 +86,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if not args.graph and not args.hardware:
         print("pass --hardware KEY or --graph FILE", file=sys.stderr)
         return 2
+    if args.trace and args.engine != "des":
+        print("--trace requires --engine des", file=sys.stderr)
+        return 2
     system = _resolve_system(args)
     if system is None:
         print(f"unknown hardware '{args.hardware}' (try: inferencesim list)",
@@ -113,6 +118,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if i:
             print()
         print(format_report(report))
+    if args.trace:
+        events: list[dict] = []
+        for i, (pname, (tasks, result)) in enumerate(engine.last_runs.items()):
+            events += chrome_trace(tasks, result, pid_base=1000 * i,
+                                   prefix=f"{pname}/")["traceEvents"]
+        Path(args.trace).write_text(
+            json.dumps({"traceEvents": events, "displayTimeUnit": "ms"}))
+        print(f"wrote Chrome trace ({len(events)} events) to {args.trace}",
+              file=sys.stderr)
     return 0
 
 
@@ -152,6 +166,9 @@ def main(argv: list[str] | None = None) -> int:
                           "(overlap is emergent; --overlap-comm is ignored)")
     run.add_argument("--overlap-comm", action="store_true",
                      help="assume TP collectives fully overlap with compute")
+    run.add_argument("--trace", metavar="FILE",
+                     help="write a Chrome/Perfetto trace JSON of the run "
+                          "(requires --engine des)")
     run.add_argument("--amortization-years", type=float, default=4.0)
     run.add_argument("--kwh-price", type=float, default=0.12, help="USD per kWh")
     run.add_argument("--pue", type=float, default=1.25)

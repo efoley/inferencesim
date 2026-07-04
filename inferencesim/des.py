@@ -35,58 +35,13 @@ scheduler is the planned next level.
 
 from __future__ import annotations
 
-import heapq
 from dataclasses import dataclass, replace
 
 from .engine import CommContext, Engine, Phase, RooflineEngine
 from .hardware import System
 from .ops import Op, OpKind
+from .sched import ScheduleResult, Task, schedule
 from .workload import Deployment
-
-
-@dataclass
-class _Task:
-    key: int
-    resource: str
-    duration: float
-    deps: list[int]
-    label: str = ""
-
-
-def schedule(tasks: list[_Task]) -> list[float]:
-    """Deterministic list scheduling: each task starts when its deps are done
-    and its resource is free (FIFO by ready time).  Returns finish times."""
-    n = len(tasks)
-    children: list[list[int]] = [[] for _ in range(n)]
-    missing = [0] * n
-    for t in tasks:
-        missing[t.key] = len(t.deps)
-        for d in t.deps:
-            children[d].append(t.key)
-
-    ready_at = [0.0] * n
-    finish = [0.0] * n
-    free: dict[str, float] = {}
-    heap: list[tuple[float, int]] = [
-        (0.0, t.key) for t in tasks if missing[t.key] == 0
-    ]
-    heapq.heapify(heap)
-    scheduled = 0
-    while heap:
-        ready, k = heapq.heappop(heap)
-        t = tasks[k]
-        start = max(ready, free.get(t.resource, 0.0))
-        finish[k] = start + t.duration
-        free[t.resource] = finish[k]
-        scheduled += 1
-        for c in children[k]:
-            ready_at[c] = max(ready_at[c], finish[k])
-            missing[c] -= 1
-            if missing[c] == 0:
-                heapq.heappush(heap, (ready_at[c], c))
-    if scheduled != n:
-        raise ValueError("task graph has a dependency cycle")
-    return finish
 
 
 def _split_layers(n_layers: int, pp: int) -> list[int]:
@@ -128,6 +83,9 @@ class DESEngine(Engine):
         self.decode_rounds = decode_rounds
         self.warmup = warmup
         self._roofline = RooflineEngine()
+        # (tasks, result) from the last run of each phase, for observability
+        # (per-resource utilisation, Chrome-trace export).
+        self.last_runs: dict[str, tuple[list[Task], ScheduleResult]] = {}
 
     # ---- costs from the lowered ops -----------------------------------------
 
@@ -168,7 +126,7 @@ class DESEngine(Engine):
 
     # ---- task-graph construction ---------------------------------------------
 
-    def _stage_tasks(self, tasks: list[_Task], c: _LayerCosts, s: int,
+    def _stage_tasks(self, tasks: list[Task], c: _LayerCosts, s: int,
                      n_layers_here: int, prev: int | None, tag: str,
                      is_first: bool, is_last: bool) -> int:
         """Append the serial task chain for one (microbatch, round) passing
@@ -177,7 +135,7 @@ class DESEngine(Engine):
         def add(resource: str, duration: float, label: str) -> int:
             key = len(tasks)
             deps = [prev_key] if prev_key is not None else []
-            tasks.append(_Task(key, resource, duration, deps, label))
+            tasks.append(Task(key, resource, duration, deps, label))
             return key
 
         prev_key = prev
@@ -199,12 +157,14 @@ class DESEngine(Engine):
         assert prev_key is not None
         return prev_key
 
-    def _decode_wall(self, c: _LayerCosts, dep: Deployment) -> float:
+    def _decode_wall(
+        self, c: _LayerCosts, dep: Deployment
+    ) -> tuple[float, list[Task], ScheduleResult]:
         """Steady-state pipeline round period: every microbatch advances one
         token per round."""
         pp = dep.pp
         layers = _split_layers(c.n_layers, pp)
-        tasks: list[_Task] = []
+        tasks: list[Task] = []
         token_done: list[list[int]] = [[] for _ in range(self.decode_rounds)]
         tail: dict[int, int] = {}  # microbatch -> last task key of prev round
         for r in range(self.decode_rounds):
@@ -220,32 +180,35 @@ class DESEngine(Engine):
                         # hop to the next stage (wrap-around feeds the next
                         # round's first stage)
                         key = len(tasks)
-                        tasks.append(_Task(key, f"h{s}", c.hop, [last],
-                                           f"r{r}m{m}h{s}"))
+                        tasks.append(Task(key, f"h{s}", c.hop, [last],
+                                          f"r{r}m{m}h{s}"))
                         last = key
                     prev = last
                 tail[m] = prev
-        finish = schedule(tasks)
-        round_end = [max(finish[k] for k in keys) for keys in token_done]
+        result = schedule(tasks)
+        round_end = [max(result.finish[k] for k in keys) for keys in token_done]
         w = self.warmup
-        return (round_end[-1] - round_end[w - 1]) / (self.decode_rounds - w)
+        wall = (round_end[-1] - round_end[w - 1]) / (self.decode_rounds - w)
+        return wall, tasks, result
 
-    def _prefill_wall(self, c: _LayerCosts, dep: Deployment) -> float:
+    def _prefill_wall(
+        self, c: _LayerCosts, dep: Deployment
+    ) -> tuple[float, list[Task], ScheduleResult]:
         """A single request walks the stages sequentially (no other work in
         flight during TTFT measurement)."""
         pp = dep.pp
         layers = _split_layers(c.n_layers, pp)
-        tasks: list[_Task] = []
+        tasks: list[Task] = []
         prev: int | None = None
         for s in range(pp):
             prev = self._stage_tasks(tasks, c, s, layers[s], prev, f"s{s}",
                                      is_first=(s == 0), is_last=(s == pp - 1))
             if c.hop and s < pp - 1:
                 key = len(tasks)
-                tasks.append(_Task(key, f"h{s}", c.hop, [prev], f"h{s}"))
+                tasks.append(Task(key, f"h{s}", c.hop, [prev], f"h{s}"))
                 prev = key
-        finish = schedule(tasks)
-        return max(finish)
+        result = schedule(tasks)
+        return result.makespan, tasks, result
 
     # ---- Engine interface -----------------------------------------------------
 
@@ -258,7 +221,9 @@ class DESEngine(Engine):
         timings = [self._roofline.time_op(op, chip, comm) for op in ops]
         costs = self._costs(ops, system, dep, comm)
         if name == "decode":
-            wall = self._decode_wall(costs, dep)
+            wall, tasks, result = self._decode_wall(costs, dep)
         else:
-            wall = self._prefill_wall(costs, dep)
-        return Phase(name, timings, wall_time=wall)
+            wall, tasks, result = self._prefill_wall(costs, dep)
+        self.last_runs[name] = (tasks, result)
+        return Phase(name, timings, wall_time=wall,
+                     resource_busy=result.busy, resource_span=result.makespan)
