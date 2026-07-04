@@ -552,27 +552,42 @@ class Graph:
         for n in self.nodes:
             mult = f" x{n.count}" if n.count > 1 else ""
             attrs = _node_attr_summary(n)
+            if n.count > 1 and attrs:
+                agg = _node_attr_summary(n, aggregate=True)
+                attrs = f"{attrs} each  (total {agg})"
             role = f" <{n.role}>" if n.role else ""
             lines.append(f"{pad}  [{n.kind.value}]{role} {n.name}{mult}  {attrs}")
             if n.inner is not None:
                 n.inner._describe(lines, depth + 2)
         for e in self.edges:
-            mult = f" x{e.count}" if e.count > 1 else ""
-            bw = "unconstrained" if e.bandwidth is None else fmt_si(e.bandwidth, "B/s")
+            try:
+                n_links = e.count * e.n_links(
+                    self._endpoint_width(e.src), self._endpoint_width(e.dst)
+                )
+            except (KeyError, ValueError):
+                n_links = e.count
+            mult = f" x{n_links} links" if n_links > 1 else ""
+            if e.bandwidth is None:
+                bw = "unconstrained"
+            else:
+                bw = fmt_si(e.bandwidth, "B/s")
+                if n_links > 1:
+                    bw += f" each, {fmt_si(e.bandwidth * n_links, 'B/s')} total"
             lat = f", {fmt_time(e.latency_s)}" if e.latency_s else ""
             lines.append(f"{pad}  {e.src} <--> {e.dst}{mult}  ({bw}{lat})")
 
 
-def _node_attr_summary(n: Node) -> str:
+def _node_attr_summary(n: Node, aggregate: bool = False) -> str:
+    k = n.count if aggregate else 1
     parts: list[str] = []
     if n.peak_flops:
         top = min(n.peak_flops, key=lambda d: d.bytes)
-        parts.append(f"{fmt_si(n.peak_flops[top], 'FLOP/s')} @{top.value}")
+        parts.append(f"{fmt_si(k * n.peak_flops[top], 'FLOP/s')} @{top.value}")
     if n.capacity_bytes is not None:
-        parts.append(fmt_bytes(n.capacity_bytes))
+        parts.append(fmt_bytes(k * n.capacity_bytes))
     if n.bandwidth is not None:
-        parts.append(fmt_si(n.bandwidth, "B/s"))
-    if n.latency_s:
+        parts.append(fmt_si(k * n.bandwidth, "B/s"))
+    if n.latency_s and not aggregate:
         parts.append(fmt_time(n.latency_s))
     return ", ".join(parts)
 
