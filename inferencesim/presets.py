@@ -181,13 +181,18 @@ TT_QUIETBOX = System(
 )
 
 # TT-QuietBox 2, part TW-04003 ($9,999, ships Q2 2026).  Official specs:
-# 2 liquid-cooled PCIe cards, each with 2 Blackhole processors -- 480
-# Tensix cores, 720 MB SRAM (180 MB/ASIC = 120 cores x 1.5 MB) and 128 GB
-# of GDDR6 @ 16 GT/s totalling 1024 GB/s across the box, i.e. 256 GB/s
-# per ASIC (HALF a p150c's per-chip bandwidth -- narrower per-die bus on
-# the dual-chip cards).  2,654 TFLOPS BlockFP8 total.  Ryzen 7 9700X
-# (65 W) host, 256 GB DDR5, 1600 W PSU on a standard outlet.  The on-card
-# die-to-die and card-to-card links are not published; both are estimates.
+# 2 liquid-cooled p300c PCIe cards, each with 2 Blackhole ASICs -- 480
+# Tensix cores, 720 MB SRAM (180 MB/ASIC = 120 cores x 1.5 MB) total,
+# 2,654 TFLOPS BlockFP8, 128 GB GDDR6 @ 16 GT/s.  Ryzen 7 9700X (65 W)
+# host, 256 GB DDR5, 1600 W PSU on a standard outlet.
+#
+# MEMORY BANDWIDTH IS UNRESOLVED.  The spec sheet reads "(1024 GB/sec)",
+# but that is likely per-card: the ASICs are the same Blackhole silicon at
+# the same 16 GT/s and 32 GB/ASIC as the p150c (512 GB/s), so the per-die
+# bus is probably unchanged -> 512 GB/s/ASIC, 1024/card, 2048/box.  Set
+# _QB2_DRAM_BW below to flip the whole model between the two hypotheses.
+_QB2_DRAM_BW = 512 * GIGA  # per ASIC; use 256*GIGA for the "1024 GB/s box" reading
+
 BLACKHOLE_QB2 = Chip(
     name="Blackhole (QB2, 120-core)",
     compute=Compute(
@@ -199,7 +204,7 @@ BLACKHOLE_QB2 = Chip(
         },
         power_w=150.0,
     ),
-    dram=Memory("GDDR6", capacity_bytes=32 * GB, bandwidth=256 * GIGA, power_w=40.0),
+    dram=Memory("GDDR6", capacity_bytes=32 * GB, bandwidth=_QB2_DRAM_BW, power_w=50.0),
     on_chip_path=(
         Link(name="Blackhole NoC (aggregate DRAM->cores)", bandwidth=3.2 * TB,
              latency_s=0.2 * US),
@@ -209,32 +214,30 @@ BLACKHOLE_QB2 = Chip(
     idle_power_w=55.0,
 )
 
-_QB2_DIE_LINK = Link(
-    name="on-card die-to-die (estimate)",
-    bandwidth=200 * GIGA,
-    latency_s=0.5 * US,
-)
-_QB2_CARD_LINK = Link(
-    name="card-to-card (estimate)",
-    bandwidth=100 * GIGA,
-    latency_s=2 * US,
-)
+# The 4 ASICs form a ring of homogeneous Warp400 links (Samtec ARP6 copper,
+# direct -- no PCIe/switch/QSFP).  Each Warp400 is 400 Gbit/s per direction
+# = 50 GB/s.  On-card (die-to-die) and card-to-card edges are the same link
+# type, so the ring is uniform at 50 GB/s per direction.
+_QB2_WARP400 = Link(name="Warp400 (400G/dir)", bandwidth=50 * GIGA, latency_s=0.5 * US)
+_QB2_CARD_LINK = Link(name="Warp400 card-to-card (400G/dir)", bandwidth=50 * GIGA,
+                      latency_s=1 * US)
 
 TT_QUIETBOX_2 = System(
     name="TT-QuietBox 2",
     node=Node(
-        name="QB2 dual-Blackhole card",
+        name="p300c dual-Blackhole card",
         chip=BLACKHOLE_QB2,
         n_chips=2,
-        interconnect=_QB2_DIE_LINK,
+        interconnect=_QB2_WARP400,
+        topology=Topology.RING,
         overhead_power_w=100.0,  # half the Ryzen host / pump / PSU share
         cost_usd=0.0,  # priced at the system level
     ),
     n_nodes=2,
     network=_QB2_CARD_LINK,
     extra_cost_usd=9_999.0,  # box list price
-    description="Tenstorrent TT-QuietBox 2 (TW-04003): 2 cards x 2 Blackhole "
-                "(120-core), 128 GB GDDR6 @ 1024 GB/s total, 720 MB SRAM.",
+    description="Tenstorrent TT-QuietBox 2 (TW-04003): 2 p300c cards x 2 Blackhole "
+                "(120-core), ring of Warp400 links, 720 MB SRAM total.",
 )
 
 HARDWARE: dict[str, System] = {
