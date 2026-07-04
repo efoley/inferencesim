@@ -186,12 +186,11 @@ TT_QUIETBOX = System(
 # 2,654 TFLOPS BlockFP8, 128 GB GDDR6 @ 16 GT/s.  Ryzen 7 9700X (65 W)
 # host, 256 GB DDR5, 1600 W PSU on a standard outlet.
 #
-# MEMORY BANDWIDTH IS UNRESOLVED.  The spec sheet reads "(1024 GB/sec)",
-# but that is likely per-card: the ASICs are the same Blackhole silicon at
-# the same 16 GT/s and 32 GB/ASIC as the p150c (512 GB/s), so the per-die
-# bus is probably unchanged -> 512 GB/s/ASIC, 1024/card, 2048/box.  Set
-# _QB2_DRAM_BW below to flip the whole model between the two hypotheses.
-_QB2_DRAM_BW = 512 * GIGA  # per ASIC; use 256*GIGA for the "1024 GB/s box" reading
+# Memory bandwidth: each p300c card has 64 GB GDDR6 @ 16 GT/s = 1024 GB/s
+# aggregate (the sheet's "1024 GB/s" is per-card), i.e. 32 GB and 512 GB/s
+# per ASIC -- same per-die bus as the p150c.  The box's two cards give
+# 128 GB and 2048 GB/s of local bandwidth when both are used in parallel.
+_QB2_DRAM_BW = 512 * GIGA  # per ASIC
 
 BLACKHOLE_QB2 = Chip(
     name="Blackhole (QB2, 120-core)",
