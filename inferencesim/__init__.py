@@ -6,9 +6,17 @@ from .workload import Deployment, ModelSpec, MoEConfig, Scenario
 from .engine import Engine, RooflineEngine, ring_allreduce_time
 from .simulate import CostModel, MemoryUsage, Report, simulate, weight_bytes_per_chip
 from .report import format_report
-from . import presets
+from .graph import Edge as GraphEdge, Graph, Node as GraphNode, NodeKind
+from .bridge import (
+    chip_from_graph,
+    chip_to_graph,
+    swap_chip_model,
+    system_from_graph,
+    system_to_graph,
+)
+from . import presets, presets_fine
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Chip", "Compute", "DType", "Link", "Memory", "Node", "System", "Topology",
@@ -16,5 +24,8 @@ __all__ = [
     "Engine", "RooflineEngine", "ring_allreduce_time",
     "CostModel", "MemoryUsage", "Report", "simulate", "weight_bytes_per_chip",
     "format_report",
-    "presets",
+    "Graph", "GraphNode", "GraphEdge", "NodeKind",
+    "chip_to_graph", "chip_from_graph", "system_to_graph", "system_from_graph",
+    "swap_chip_model",
+    "presets", "presets_fine",
 ]

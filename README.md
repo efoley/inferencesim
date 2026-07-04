@@ -49,33 +49,49 @@ print(format_report(report))
 ## Architecture
 
 ```
-hardware.py   Compute / Memory / Link / Chip / Node / System
-workload.py   ModelSpec (dense + MoE, GQA), Scenario, Deployment
-ops.py        lowering: (model, scenario, deployment) -> per-chip Op list
-engine.py     Engine interface + RooflineEngine ("speed of light")
-simulate.py   orchestration, memory feasibility, power & cost models
-presets.py    built-in chips/systems/models (editable spec sheets)
+graph.py        hierarchical hardware graph: nodes (constraints) + edges
+                (interconnects), arbitrary nesting, JSON in/out
+bridge.py       spec-sheet <-> graph conversion; aggregates any graph into
+                the view the analytic engine consumes
+hardware.py     Compute / Memory / Link / Chip / Node / System (spec-sheet layer)
+workload.py     ModelSpec (dense + MoE, GQA), Scenario, Deployment
+ops.py          lowering: (model, scenario, deployment) -> per-chip Op list
+engine.py       Engine interface + RooflineEngine ("speed of light")
+simulate.py     orchestration, memory feasibility, power & cost models
+presets.py      built-in chips/systems/models (editable spec sheets)
+presets_fine.py hand-built fine-grained graphs (per-core Blackhole, ...)
 ```
 
-### Hardware: fine-grained building blocks
+### Hardware: a hierarchical graph
 
-A `Chip` is a `Compute` pool fed from a DRAM through an ordered **on-chip
-data path**. For Tenstorrent's Blackhole this mirrors the Metalium block
-diagram:
+The structural source of truth is a **graph**: nodes carry constraints
+(a memory node: capacity + bandwidth; a compute node: which dtypes at what
+FLOP/s; a switch: aggregate bandwidth), edges are interconnects with
+bandwidth + latency — a NoC hop, NVLink, or the ConnectX-7 between two DGX
+Sparks are all just edges at different levels. A node's `count` means "this
+many identical instances" (140 Tensix cores) without materialising them.
+
+Nesting sets the abstraction level: a **composite** node contains an inner
+graph and exposes ports. The same QuietBox can be modelled with lumped
+chips or per-core:
 
 ```
-GDDR6 --> NoC --> Tensix L1 SRAM --> matrix engine
+inferencesim graph --hardware tt-quietbox        # GDDR6 -> NoC -> SRAM -> compute (lumped)
+inferencesim graph --hardware tt-quietbox-fine   # 8 GDDR6 banks, 140 Tensix cores
+inferencesim graph --hardware tt-quietbox --json > machine.json   # edit it...
+inferencesim run --graph machine.json --model llama-3.1-8b        # ...and simulate it
 ```
 
-Each stage is an explicit component with its own bandwidth, capacity, and
-power. At speed of light, the effective DRAM streaming bandwidth is the
-minimum over the path; a discrete-event engine can later attach queues and
-contention to the very same stages. GPUs are currently modeled with an empty
-path (HBM feeds the SMs directly) — add L2 or SMEM stages if you want them.
+Both levels aggregate to identical roofline results (tested); the fine level
+exists so a discrete-event engine can put queues and contention on the real
+structure, and so an external editor (the planned UI) has real blocks to
+draw. Graphs serialise to versioned JSON — that file is the UI's document
+format.
 
-Chips compose upward: a `Node` is N chips on an intra-node interconnect
-(NVLink, 800GbE); a `System` is M nodes on a network. Collectives pick the
-slowest link their group crosses.
+The spec-sheet layer (`Chip`/`Node`/`System`) remains as a convenient way to
+write presets; `bridge.py` converts it to graphs and aggregates arbitrary
+(convention-following) graphs back into the homogeneous view the analytic
+engine needs. Collectives pick the slowest link their group crosses.
 
 ### Workload and lowering
 
@@ -138,8 +154,10 @@ assume perfect overlap (reality is in between).
 ## Roadmap
 
 - **Discrete-event engine**: consume the same `Op` stream with explicit
-  dependencies and contention on each `Chip` stage (DRAM channels, NoC hops,
-  SRAM banks, links) — the block-diagram hardware model is designed for this.
+  dependencies and contention on the hardware graph's real nodes and edges
+  (DRAM banks, NoC hops, per-core SRAM, links); heterogeneous chips.
+- **Graph editor UI** over the JSON graph format (nodes with constraints,
+  edges with latencies, nesting for abstraction levels).
 - Multi-rack topologies (rail-optimized Ethernet/IB); prefill/decode
   disaggregation; MoE expert load imbalance.
 - Efficiency factors calibrated against measured benchmarks (MLPerf,
