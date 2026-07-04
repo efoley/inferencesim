@@ -36,14 +36,33 @@ def _resolve_graph(key: str) -> Graph | None:
     return None
 
 
-def _resolve_system(args: argparse.Namespace) -> System | None:
+def _resolve_hw_graph(args: argparse.Namespace) -> Graph | None:
+    """The hardware graph iff the source is graph-based (--graph FILE or a
+    GRAPH_PRESETS key); None for lumped HARDWARE presets, which the DES treats
+    exactly as before."""
     if getattr(args, "graph", None):
-        g = Graph.from_json(Path(args.graph).read_text())
-        return system_from_graph(g)
+        return Graph.from_json(Path(args.graph).read_text())
+    if args.hardware in GRAPH_PRESETS:
+        return GRAPH_PRESETS[args.hardware]()
+    return None
+
+
+def _chip_graph_of(g: Graph) -> Graph:
+    """The chip-level model to walk in graph mode: the first role='chip'
+    composite's inner graph, or the whole graph if there is no such composite
+    (a bare chip graph)."""
+    for _path, node in g.walk():
+        if node.role == "chip" and node.inner is not None:
+            return node.inner
+    return g
+
+
+def _resolve_system(args: argparse.Namespace) -> System | None:
+    hw_graph = _resolve_hw_graph(args)
+    if hw_graph is not None:
+        return system_from_graph(hw_graph)
     if args.hardware in HARDWARE:
         return HARDWARE[args.hardware]
-    if args.hardware in GRAPH_PRESETS:
-        return system_from_graph(GRAPH_PRESETS[args.hardware]())
     return None
 
 
@@ -110,7 +129,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
         pue=args.pue,
     )
 
-    engine = DESEngine() if args.engine == "des" else RooflineEngine()
+    if args.engine == "des":
+        hw_graph = _resolve_hw_graph(args)
+        chip_graph = _chip_graph_of(hw_graph) if hw_graph is not None else None
+        if chip_graph is not None:
+            print(f"graph mode: costing chip ops on the expanded "
+                  f"'{chip_graph.name}' graph (tile-fill {args.tile_fill})",
+                  file=sys.stderr)
+        engine = DESEngine(chip_graph=chip_graph, tile_fill=args.tile_fill)
+    else:
+        engine = RooflineEngine()
     batches = [int(b) for b in args.batch.split(",")]
     for i, batch in enumerate(batches):
         scen = Scenario(batch=batch, prompt_len=args.prompt, output_len=args.output)
@@ -120,9 +148,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(format_report(report))
     if args.trace:
         events: list[dict] = []
-        for i, (pname, (tasks, result)) in enumerate(engine.last_runs.items()):
-            events += chrome_trace(tasks, result, pid_base=1000 * i,
+        pid = 0
+        for pname, (tasks, result) in engine.last_runs.items():
+            events += chrome_trace(tasks, result, pid_base=pid,
                                    prefix=f"{pname}/")["traceEvents"]
+            pid += 1000
+        # graph mode: one extra track group per distinct chip-lowered op
+        for pname, op_runs in engine.last_op_runs.items():
+            for opname, sched in op_runs.items():
+                events += chrome_trace(sched.tasks, sched.result, pid_base=pid,
+                                       prefix=f"{pname}/op:{opname}/")["traceEvents"]
+                pid += 1000
         Path(args.trace).write_text(
             json.dumps({"traceEvents": events, "displayTimeUnit": "ms"}))
         print(f"wrote Chrome trace ({len(events)} events) to {args.trace}",
@@ -169,6 +205,9 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--trace", metavar="FILE",
                      help="write a Chrome/Perfetto trace JSON of the run "
                           "(requires --engine des)")
+    run.add_argument("--tile-fill", type=float, default=0.5,
+                     help="graph mode: fraction of per-core SRAM a tile may "
+                          "use; a core double-buffers 1/tile-fill tiles")
     run.add_argument("--amortization-years", type=float, default=4.0)
     run.add_argument("--kwh-price", type=float, default=0.12, help="USD per kWh")
     run.add_argument("--pue", type=float, default=1.25)

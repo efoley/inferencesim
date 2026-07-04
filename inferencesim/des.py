@@ -28,9 +28,13 @@ Per-task service times reuse the same speed-of-light math as the roofline
 engine (max(flops/peak, bytes/bw), ring collectives), so any difference
 between the two engines is pure scheduling/contention, never unit costs.
 
-Current granularity: pipeline stages and their links.  Walking the
-expanded chip graph (DRAM banks, NoC hops, per-core SRAM) with the same
-scheduler is the planned next level.
+Current granularity: pipeline stages and their links.  Passing a
+`chip_graph` refines just the per-op unit cost: instead of the roofline
+`max(flops/peak, bytes/bw)`, a COMPUTE op is lowered to a tile task graph
+over the expanded chip's DRAM banks, NoC and per-core SRAM/matrix engines
+(graphdes.ChipModel) and its wall time measured.  Comm ops stay closed-form
+(collective internals are a later roadmap item).  Behaviour is byte-for-byte
+unchanged without a chip_graph.
 """
 
 from __future__ import annotations
@@ -38,6 +42,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from .engine import CommContext, Engine, Phase, RooflineEngine
+from .graph import Graph
+from .graphdes import ChipModel, OpSchedule
 from .hardware import System
 from .ops import Op, OpKind
 from .sched import ScheduleResult, Task, schedule
@@ -75,35 +81,60 @@ class DESEngine(Engine):
 
     decode_rounds/warmup control the steady-state measurement: the pipeline
     is simulated for `decode_rounds` full rounds and TPOT is the mean round
-    period after discarding `warmup` rounds (fill transient)."""
+    period after discarding `warmup` rounds (fill transient).
 
-    def __init__(self, decode_rounds: int = 16, warmup: int = 8):
+    chip_graph (optional) switches per-op COMPUTE unit costs from the roofline
+    formula to a tile schedule over the expanded chip graph; tile_fill is
+    forwarded to the ChipModel (fraction of per-core SRAM a tile uses)."""
+
+    def __init__(self, decode_rounds: int = 16, warmup: int = 8,
+                 chip_graph: Graph | None = None, tile_fill: float = 0.5):
         if decode_rounds <= warmup:
             raise ValueError("decode_rounds must exceed warmup")
         self.decode_rounds = decode_rounds
         self.warmup = warmup
         self._roofline = RooflineEngine()
+        self._chip_model = (
+            ChipModel(chip_graph, tile_fill) if chip_graph is not None else None
+        )
         # (tasks, result) from the last run of each phase, for observability
         # (per-resource utilisation, Chrome-trace export).
         self.last_runs: dict[str, tuple[list[Task], ScheduleResult]] = {}
+        # per distinct COMPUTE op, its chip-level tile schedule (graph mode
+        # only), keyed by phase then op name -- for chip utilisation and trace.
+        self.last_op_runs: dict[str, dict[str, OpSchedule]] = {}
 
     # ---- costs from the lowered ops -----------------------------------------
 
-    def _costs(self, ops: list[Op], system: System, dep: Deployment,
-               comm: CommContext) -> _LayerCosts:
+    def _costs(
+        self, ops: list[Op], system: System, dep: Deployment, comm: CommContext
+    ) -> tuple[_LayerCosts, dict[str, OpSchedule], dict[str, str]]:
+        """Recover the repeating per-layer service times.  In graph mode a
+        COMPUTE op's unit time is the measured wall of its chip-graph tile
+        schedule (recorded in `op_runs`); comm ops stay closed-form.  `buckets`
+        maps each COMPUTE op onto the stage-task family it feeds (attn / ffn /
+        head), for the per-chip utilisation weighting."""
         chip = system.node.chip
+        op_runs: dict[str, OpSchedule] = {}
+        buckets: dict[str, str] = {}
 
         def one(op: Op) -> float:
+            if self._chip_model is not None and op.kind is OpKind.COMPUTE:
+                sched = self._chip_model.op_wall(replace(op, count=1))
+                op_runs[op.name] = sched
+                return sched.wall
             return self._roofline.time_op(replace(op, count=1), chip, comm).time
 
         c = _LayerCosts()
         for op in ops:
             if op.name in _ATTN_OPS:
                 c.attn += one(op)
+                buckets[op.name] = "attn"
                 if op.name == "qkv_proj":
                     c.n_layers = op.count
             elif op.name in _FFN_OPS:
                 c.ffn += one(op)
+                buckets[op.name] = "ffn"
             elif op.name == "allreduce":
                 c.allreduce = one(op)
                 c.n_allreduce = op.count // max(c.n_layers, 1)
@@ -115,14 +146,16 @@ class DESEngine(Engine):
                 c.hop = one(op)
             elif op.name in _EDGE_OPS:
                 c.edge += one(op)
+                buckets[op.name] = "head"
             elif op.kind is OpKind.COMPUTE:
                 c.ffn += one(op)  # anything unrecognised runs on the unit
+                buckets[op.name] = "ffn"
         # allreduce count may not divide evenly if it was recovered from a
         # differently-shaped op list; recompute defensively
         for op in ops:
             if op.name == "allreduce" and c.n_layers:
                 c.n_allreduce = max(1, round(op.count / c.n_layers))
-        return c
+        return c, op_runs, buckets
 
     # ---- task-graph construction ---------------------------------------------
 
@@ -210,6 +243,33 @@ class DESEngine(Engine):
         result = schedule(tasks)
         return result.makespan, tasks, result
 
+    def _chip_resource_busy(
+        self, tasks: list[Task], op_runs: dict[str, OpSchedule],
+        buckets: dict[str, str], pp: int,
+    ) -> dict[str, float]:
+        """Per-chip resource busy over the phase, keyed `chip:<resource>`.
+
+        Each COMPUTE op's tile schedule reports how long each chip resource
+        (bank, NoC, SRAM, core) is busy for one execution; weight that by how
+        many stage-level tasks the op feeds (one per bucket task it maps to)
+        and divide by pp, since the pp pipeline stages are distinct chips and
+        we want a per-chip figure.  simulate.py turns busy/span into a
+        fraction, so `chip:gddr6-bank[3]` reads as that bank's utilisation
+        over the phase."""
+        counts = {"attn": 0, "ffn": 0, "head": 0}
+        for t in tasks:
+            tok = t.label.rsplit(" ", 1)[-1] if t.label else ""
+            if tok in counts:
+                counts[tok] += 1
+        busy: dict[str, float] = {}
+        for op_name, sched in op_runs.items():
+            n = counts.get(buckets.get(op_name, ""), 0)
+            if not n:
+                continue
+            for res, b in sched.result.busy.items():
+                busy[f"chip:{res}"] = busy.get(f"chip:{res}", 0.0) + n * b / pp
+        return busy
+
     # ---- Engine interface -----------------------------------------------------
 
     def run_phase(self, name: str, ops: list[Op], system: System,
@@ -219,11 +279,18 @@ class DESEngine(Engine):
             raise ValueError("TP > 1 requires an interconnect for collectives")
         chip = system.node.chip
         timings = [self._roofline.time_op(op, chip, comm) for op in ops]
-        costs = self._costs(ops, system, dep, comm)
+        costs, op_runs, buckets = self._costs(ops, system, dep, comm)
         if name == "decode":
             wall, tasks, result = self._decode_wall(costs, dep)
         else:
             wall, tasks, result = self._prefill_wall(costs, dep)
         self.last_runs[name] = (tasks, result)
+        self.last_op_runs[name] = op_runs
+        resource_busy = result.busy
+        if op_runs:  # graph mode: merge in per-chip resource utilisation
+            resource_busy = {
+                **result.busy,
+                **self._chip_resource_busy(tasks, op_runs, buckets, dep.pp),
+            }
         return Phase(name, timings, wall_time=wall,
-                     resource_busy=result.busy, resource_span=result.makespan)
+                     resource_busy=resource_busy, resource_span=result.makespan)

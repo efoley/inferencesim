@@ -2,9 +2,25 @@
 
 from __future__ import annotations
 
+import re
+
 from .engine import Phase
 from .simulate import Report
 from .units import fmt_bytes, fmt_si, fmt_time
+
+_INSTANCE_RE = re.compile(r"\[\d+\]")
+
+
+def _util_summary(util: dict[str, float]) -> str:
+    """One line of per-resource utilisation, collapsing expanded chip
+    instances (`chip:gddr6-bank[3]`) into their group and showing the hottest
+    instance's fraction -- the graph-mode util dict has hundreds of them."""
+    groups: dict[str, float] = {}
+    for res, frac in util.items():
+        base = _INSTANCE_RE.sub("", res)
+        groups[base] = max(groups.get(base, 0.0), frac)
+    ranked = sorted(groups.items(), key=lambda kv: -kv[1])
+    return "  ".join(f"{res} {100 * frac:.0f}%" for res, frac in ranked)
 
 
 def _phase_breakdown(phase: Phase) -> str:
@@ -58,9 +74,7 @@ def format_report(r: Report) -> str:
         for pname in ("prefill", "decode"):
             util = r.resource_util.get(pname)
             if util:
-                ranked = sorted(util.items(), key=lambda kv: -kv[1])
-                body = "  ".join(f"{res} {100 * frac:.0f}%" for res, frac in ranked)
-                add(f"  {pname} resource util: {body}")
+                add(f"  {pname} resource util: {_util_summary(util)}")
     add("-" * 72)
     add(f"Throughput   : {fmt_si(r.output_tokens_per_s, 'tok/s')} output "
         f"({fmt_si(r.input_tokens_per_s, 'tok/s')} input, "
