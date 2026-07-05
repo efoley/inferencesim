@@ -9,6 +9,15 @@ from .graphdes import ChipModel, OpSchedule
 from .des import DESEngine
 from .simulate import CostModel, MemoryUsage, Report, simulate, weight_bytes_per_chip
 from .report import format_report
+from .serve import (
+    RequestRecord,
+    ServeConfig,
+    ServeReport,
+    decode_iteration_time,
+    format_serve_report,
+    prefill_iteration_time,
+    serve,
+)
 from .graph import Edge as GraphEdge, Graph, Node as GraphNode, NodeKind
 from .bridge import (
     chip_from_graph,
@@ -29,6 +38,8 @@ __all__ = [
     "ChipModel", "OpSchedule",
     "CostModel", "MemoryUsage", "Report", "simulate", "weight_bytes_per_chip",
     "format_report",
+    "ServeConfig", "ServeReport", "RequestRecord", "serve", "format_serve_report",
+    "decode_iteration_time", "prefill_iteration_time",
     "Graph", "GraphNode", "GraphEdge", "NodeKind",
     "chip_to_graph", "chip_from_graph", "system_to_graph", "system_from_graph",
     "swap_chip_model",

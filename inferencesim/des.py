@@ -174,6 +174,23 @@ class DESEngine(Engine):
 
     # ---- costs from the lowered ops -----------------------------------------
 
+    def op_time(self, op: Op, system: System, dep: Deployment) -> float:
+        """Unit cost of one `Op` (all `count` instances) under this engine.
+
+        Public hook for callers that cost ops outside a phase -- notably the
+        request-level serving simulator (serve.py), which needs a single op's
+        time at an arbitrary batch/context.  It makes the same per-op choice
+        `run_phase` makes internally: in graph mode a COMPUTE op is refined to
+        its expanded-chip tile schedule (op_wall), otherwise (and always for
+        comm ops) it stays the roofline closed form.  This lets graph-refined
+        chip costs flow into serving numbers without duplicating the lowering.
+        """
+        comm = CommContext.for_deployment(system, dep)
+        chip = system.node.chip
+        if self._chip_model is not None and op.kind is OpKind.COMPUTE:
+            return op.count * self._chip_model.op_wall(replace(op, count=1)).wall
+        return self._roofline.time_op(op, chip, comm).time
+
     def _costs(
         self, ops: list[Op], system: System, dep: Deployment, comm: CommContext
     ) -> tuple[_LayerCosts, dict[str, OpSchedule], dict[str, str]]:

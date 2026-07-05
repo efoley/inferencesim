@@ -131,16 +131,32 @@ Drive per-chip work against `chip_graph.expand()` resources instead of one
 
 ### 4. Whole-system dynamics (beyond one phase in isolation)
 
-- [ ] **Continuous batching**: simulate prefill and decode *interleaved* on
-      the same resources (today they're timed as separate phases and
-      combined analytically in `simulate.py`). Captures prefill/decode
-      interference, chunked prefill, and admission effects.
-- [ ] **Request-level arrival process**: Poisson/trace-driven arrivals →
-      real queueing latency (p50/p99 TTFT & TPOT), not just steady-state
-      averages. The scheduler already produces per-task timelines to
-      histogram.
-- [ ] **KV-cache growth over a request**: attention cost currently uses
-      mean context; step it per token so long-sequence tails show up.
+`inferencesim/serve.py` — `serve()` is an iteration-level continuous-batching
+simulator for ONE replica (dp = arrival-rate / dp, per `simulate.py`).
+
+- [x] **Continuous batching**: prefill and decode iterations are interleaved
+      on a single event clock (`serve.py`), so prefill/decode interference
+      falls out (a prefill stalls the decoding batch → the inter-token-gap
+      p99 spikes ~10x the mean). Granularity: iteration-level on one replica,
+      pp=1, *exclusive* whole-prompt prefill; the per-iteration cost is the
+      serial op sum (exact at pp=1) with a per-batch table + per-step
+      attention recost (`_DecodeCost`).
+- [x] **Request-level arrival process**: Poisson (seeded) or trace-driven
+      (`arrivals=`) arrivals → real queueing percentiles (TTFT p50/p95/p99 +
+      mean, per-request TPOT, inter-token gaps), not steady-state averages.
+      TTFT includes admission/queue waiting; p99 TTFT blows up past the
+      achieved-throughput ceiling.
+- [x] **KV-cache growth over a request**: decode attention is recost each
+      iteration at the batch's actual Σ per-request context (context steps +1
+      per token), so long-sequence tails show up; admission reserves the
+      conservative prompt+output KV footprint against the per-chip budget.
+- [ ] **Chunked prefill**: prefill is exclusive/whole-prompt today; splitting a
+      long prompt into decode-sized chunks (to cap the interference stall)
+      remains future work.
+- [ ] **Task-level pp>1 serving**: `serve()` restricts to pp=1 (at pp=1 an
+      iteration is a serial chain, so its cost is a closed-form sum and needs
+      no scheduler). pp>1 needs pipeline fill/drain across stages per
+      iteration — wire the loop onto `sched.py` / the stage-DES.
 
 ### 5. Engine plumbing & ergonomics
 

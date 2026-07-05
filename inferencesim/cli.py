@@ -23,6 +23,7 @@ from .presets import HARDWARE, MODELS
 from .presets_fine import GRAPH_PRESETS
 from .report import format_report
 from .sched import chrome_trace
+from .serve import ServeConfig, format_serve_report, serve
 from .simulate import CostModel, simulate
 from .units import fmt_bytes, fmt_si
 from .workload import Deployment, Scenario
@@ -167,6 +168,42 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_serve(args: argparse.Namespace) -> int:
+    if args.model not in MODELS:
+        print(f"unknown model '{args.model}' (try: inferencesim list)", file=sys.stderr)
+        return 2
+    if not args.graph and not args.hardware:
+        print("pass --hardware KEY or --graph FILE", file=sys.stderr)
+        return 2
+    system = _resolve_system(args)
+    if system is None:
+        print(f"unknown hardware '{args.hardware}' (try: inferencesim list)",
+              file=sys.stderr)
+        return 2
+    model = MODELS[args.model]
+    dep = Deployment(
+        tp=args.tp, pp=args.pp, ep=args.ep,
+        weight_dtype=DType(args.weight_dtype),
+        kv_dtype=DType(args.kv_dtype),
+        act_dtype=DType(args.act_dtype),
+    )
+    scen = Scenario(batch=args.max_batch, prompt_len=args.prompt, output_len=args.output)
+    if args.arrivals:
+        arrivals = [float(x) for x in Path(args.arrivals).read_text().split()]
+        cfg = ServeConfig(
+            arrivals=arrivals, n_requests=len(arrivals), max_batch=args.max_batch,
+            seed=args.seed, prefill_first=not args.decode_first,
+        )
+    else:
+        cfg = ServeConfig(
+            arrival_rate=args.rate, n_requests=args.requests, max_batch=args.max_batch,
+            seed=args.seed, prefill_first=not args.decode_first,
+        )
+    report = serve(system, model, scen, dep, cfg)
+    print(format_serve_report(report))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="inferencesim",
                                 description="LLM inference factory simulator")
@@ -217,6 +254,36 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--kwh-price", type=float, default=0.12, help="USD per kWh")
     run.add_argument("--pue", type=float, default=1.25)
     run.set_defaults(fn=_cmd_run)
+
+    srv = sub.add_parser("serve", help="request-level continuous-batching serving "
+                                       "simulation (one replica, pp=1)")
+    srv.add_argument("--hardware", help="hardware preset or graph preset key")
+    srv.add_argument("--graph", help="path to a hardware graph JSON file")
+    srv.add_argument("--model", required=True, help="model preset key")
+    srv.add_argument("--tp", type=int, default=1, help="tensor-parallel degree")
+    srv.add_argument("--pp", type=int, default=1, help="pipeline stages (serve requires 1)")
+    srv.add_argument("--ep", type=int, default=1,
+                     help="expert-parallel groups (MoE models only)")
+    srv.add_argument("--rate", type=float, default=5.0,
+                     help="whole-system arrival rate (requests/s, Poisson); "
+                          "divided by DP for one replica")
+    srv.add_argument("--requests", type=int, default=200,
+                     help="simulate until this many requests complete")
+    srv.add_argument("--max-batch", type=int, default=64,
+                     help="continuous-batching slots per replica")
+    srv.add_argument("--prompt", type=int, default=2048, help="prompt tokens per request")
+    srv.add_argument("--output", type=int, default=512, help="output tokens per request")
+    srv.add_argument("--seed", type=int, default=0, help="RNG seed for arrivals")
+    srv.add_argument("--decode-first", action="store_true",
+                     help="decode has priority over waiting prefills "
+                          "(default: prefill-first, vLLM-like)")
+    srv.add_argument("--arrivals", metavar="FILE",
+                     help="read explicit per-replica arrival times (one float per "
+                          "line) instead of a Poisson --rate")
+    srv.add_argument("--weight-dtype", default="fp8", choices=[d.value for d in DType])
+    srv.add_argument("--kv-dtype", default="bf16", choices=[d.value for d in DType])
+    srv.add_argument("--act-dtype", default="bf16", choices=[d.value for d in DType])
+    srv.set_defaults(fn=_cmd_serve)
 
     args = p.parse_args(argv)
     try:
