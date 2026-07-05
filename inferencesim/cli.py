@@ -136,7 +136,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
             print(f"graph mode: costing chip ops on the expanded "
                   f"'{chip_graph.name}' graph (tile-fill {args.tile_fill})",
                   file=sys.stderr)
-        engine = DESEngine(chip_graph=chip_graph, tile_fill=args.tile_fill)
+        engine = DESEngine(decode_rounds=args.decode_rounds,
+                           chip_graph=chip_graph, tile_fill=args.tile_fill)
     else:
         engine = RooflineEngine()
     batches = [int(b) for b in args.batch.split(",")]
@@ -205,6 +206,10 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--trace", metavar="FILE",
                      help="write a Chrome/Perfetto trace JSON of the run "
                           "(requires --engine des)")
+    run.add_argument("--decode-rounds", type=int, default=None,
+                     help="pin the DES decode measurement to a fixed round "
+                          "count (default: auto-grow until the period "
+                          "converges; deep pipelines can take a while)")
     run.add_argument("--tile-fill", type=float, default=0.5,
                      help="graph mode: fraction of per-core SRAM a tile may "
                           "use; a core double-buffers 1/tile-fill tiles")
