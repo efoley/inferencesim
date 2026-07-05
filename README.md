@@ -81,6 +81,15 @@ units. Aggregate bandwidth queries use max-flow (`Graph.max_flow`), which
 credits parallel routes and gives identical answers on grouped and
 expanded forms (tested).
 
+Per-instance heterogeneity rides the same selectors: a `derate` on a node
+(or `Graph.derate_instances('tensix-fpu[132:140]', 0.0)` on a group) scales
+that instance's rate-like figures — effective FLOP/s and bandwidth — with
+`0.0` meaning a disabled instance that exists physically but does no work.
+So a harvested 132-of-140-core die, a throttled core, or a dead DRAM bank is
+one line: the aggregates and the discrete-event engine both see the live
+fraction (a disabled unit leaves every aggregate including capacity; a
+derated-but-live one keeps its capacity).
+
 Nesting sets the abstraction level: a **composite** node contains an inner
 graph and exposes ports. The same QuietBox can be modelled with lumped
 chips or per-core:

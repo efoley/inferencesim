@@ -98,16 +98,31 @@ class ChipModel:
         computes = [n for n in g.nodes if n.kind is NodeKind.COMPUTE]
         if not computes:
             raise ValueError(f"{graph.name}: chip graph has no compute node")
-        self.compute_instances = [n.name for n in computes]
+        # A disabled instance (derate 0) exists physically but does no work:
+        # drop it from the schedulable pool entirely.  Derated instances stay,
+        # with their per-instance rates scaled by `derate` -- so a harvested
+        # 132-of-140 die schedules on 132 cores and a throttled core paces its
+        # own tiles.  (expand() has already baked instance_derates into each
+        # instance's plain `derate`.)
+        enabled = [n for n in computes if n.derate > 0.0]
+        if not enabled:
+            raise ValueError(f"{graph.name}: every compute instance is disabled")
+        self.compute_instances = [n.name for n in enabled]
         self.n_cores = len(self.compute_instances)
-        # per-instance peak rates are uniform across the pool
-        self._peak_flops = dict(computes[0].peak_flops or {})
+        # per-instance effective peak rates (peak_flops * derate); non-uniform
+        # once any core is throttled/harvested.
+        self._core_flops: dict[str, dict[DType, float]] = {
+            n.name: {d: f * n.derate for d, f in (n.peak_flops or {}).items()}
+            for n in enabled
+        }
 
         # DRAM = the memory group (instances sharing a base name) with the
         # largest total capacity (same convention as bridge.chip_from_graph).
+        # Disabled banks (derate 0) leave the pool -- excluded from capacity
+        # and from the round-robin alike.
         groups: dict[str, list[Node]] = {}
         for m in g.nodes:
-            if m.kind is NodeKind.MEMORY and m.capacity_bytes:
+            if m.kind is NodeKind.MEMORY and m.capacity_bytes and m.derate > 0.0:
                 groups.setdefault(split_endpoint(m.name)[0], []).append(m)
         if not groups:
             raise ValueError(f"{graph.name}: chip graph has no memory with a capacity")
@@ -181,8 +196,14 @@ class ChipModel:
         for i, name in enumerate(nodes[:-1]):  # skip the terminal compute core
             nd = self._node[name]
             if nd.bandwidth is not None:
+                # the node figure is authoritative for derating: a derated bank
+                # serves at bandwidth * derate.  Its incoming/outgoing EDGE is
+                # deliberately NOT derated (the fine presets doubly-encode the
+                # per-bank bandwidth on the edge too; leaving it at full rate is
+                # harmless because the derated node element is the binding stage
+                # of the store-and-forward chain).
                 elements.append(
-                    _Element(name, nd.bandwidth, nd.kind is NodeKind.SWITCH)
+                    _Element(name, nd.bandwidth * nd.derate, nd.kind is NodeKind.SWITCH)
                 )
             e = edges[i]
             if e.bandwidth is not None:
@@ -219,7 +240,14 @@ class ChipModel:
         read_per = op.dram_read / n_tiles
         write_per = op.dram_write / n_tiles
         flops_per = op.flops / n_tiles
-        rate = Compute("cores", self._peak_flops).flops(op.dtype) if self._peak_flops else 0.0
+        # per-core rate for this dtype (already scaled by each core's derate).
+        # With non-uniform rates the round-robin assignment is static work
+        # distribution: the slowest core assigned a tile paces the op's tail.
+        # That is the intended physical behaviour; work-stealing is future work.
+        rates = {
+            c: (Compute("core", pf).flops(op.dtype) if pf else 0.0)
+            for c, pf in self._core_flops.items()
+        }
 
         tasks: list[Task] = []
         resources: dict[str, Resource] = {}
@@ -263,6 +291,7 @@ class ChipModel:
                     link(el.resource, read_per / el.bandwidth,
                          f"{op.name} t{i} rd {el.resource}", el.shared)
             comp: int | None = None
+            rate = rates[core]
             if flops_per > 0 and rate > 0:
                 comp = link(core, flops_per / rate, f"{op.name} t{i} cp {core}", False)
             if write_per > 0:

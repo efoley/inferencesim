@@ -65,6 +65,16 @@ class Node:
     capacity_bytes: float | None = None  # MEMORY
     bandwidth: float | None = None  # MEMORY/SWITCH throughput cap; None = unconstrained
     latency_s: float = 0.0
+    # Per-instance heterogeneity: `derate` scales this instance's *rate-like*
+    # figures -- effective peak_flops = peak_flops * derate, effective
+    # bandwidth = bandwidth * derate.  Capacity is NOT scaled; a *disabled*
+    # instance (derate == 0) exists physically but does no work and is
+    # excluded from every aggregate (including capacity).  `instance_derates`
+    # overrides the node-level `derate` for individual instances of a counted
+    # group (index -> derate); expand() bakes it into each instance's plain
+    # `derate` (a harvested 132-of-140 die, a throttled core, a dead bank).
+    derate: float = 1.0
+    instance_derates: dict[int, float] = field(default_factory=dict)
     dynamic_power_w: float = 0.0  # at full utilisation
     idle_power_w: float = 0.0
     # semantics for extraction / UI grouping: "chip", "node", ...
@@ -74,19 +84,42 @@ class Node:
     ports: tuple[str, ...] = ()  # inner node names outer edges attach to
     meta: dict[str, Any] = field(default_factory=dict)
 
+    def _derates(self) -> list[float]:
+        """This node's per-instance derates (length == count)."""
+        return [self.instance_derates.get(i, self.derate) for i in range(self.count)]
+
+    @property
+    def effective_count(self) -> float:
+        """Count-equivalent for *rate-like* aggregates (peak_flops,
+        bandwidth): the sum of per-instance derates.  A disabled instance
+        (derate 0) contributes 0; a half-derated one contributes 0.5.  Equals
+        `count` when nothing is derated."""
+        return sum(self._derates())
+
+    @property
+    def enabled_count(self) -> int:
+        """Count-equivalent for *capacity* (which derate does not scale): the
+        number of instances that do any work at all (derate > 0).  A disabled
+        instance is excluded entirely; a derated-but-live one keeps full
+        capacity."""
+        return sum(1 for d in self._derates() if d > 0.0)
+
     @property
     def agg_bandwidth(self) -> float | None:
-        return None if self.bandwidth is None else self.bandwidth * self.count
+        return None if self.bandwidth is None else self.bandwidth * self.effective_count
 
     @property
     def agg_capacity(self) -> float | None:
-        return None if self.capacity_bytes is None else self.capacity_bytes * self.count
+        return (
+            None if self.capacity_bytes is None
+            else self.capacity_bytes * self.enabled_count
+        )
 
     @property
     def agg_flops(self) -> dict[DType, float]:
         if not self.peak_flops:
             return {}
-        return {d: f * self.count for d, f in self.peak_flops.items()}
+        return {d: f * self.effective_count for d, f in self.peak_flops.items()}
 
 
 class EdgePattern(str, Enum):
@@ -212,6 +245,20 @@ class Graph:
         for n in self.nodes:
             if n.count < 1:
                 raise ValueError(f"{self.name}/{n.name}: count must be >= 1")
+            if not 0.0 <= n.derate <= 1.0:
+                raise ValueError(
+                    f"{self.name}/{n.name}: derate {n.derate} not in [0, 1]"
+                )
+            for i, d in n.instance_derates.items():
+                if not 0 <= i < n.count:
+                    raise ValueError(
+                        f"{self.name}/{n.name}: instance_derate index {i} out of "
+                        f"range for count {n.count}"
+                    )
+                if not 0.0 <= d <= 1.0:
+                    raise ValueError(
+                        f"{self.name}/{n.name}: instance_derate {d} not in [0, 1]"
+                    )
             if n.kind is NodeKind.COMPOSITE:
                 if n.inner is None:
                     raise ValueError(f"{self.name}/{n.name}: composite needs an inner graph")
@@ -338,13 +385,18 @@ class Graph:
                     inner_instances.get(p, [p])[0] for p in n.ports
                 )
             base = replace(n, inner=inner, ports=ports)
+            derates = n._derates()
             if n.count == 1:
                 instances[n.name] = [n.name]
-                nodes.append(base)
+                nodes.append(replace(base, derate=derates[0], instance_derates={}))
             else:
                 names = [f"{n.name}[{i}]" for i in range(n.count)]
                 instances[n.name] = names
-                nodes.extend(replace(base, name=nm, count=1) for nm in names)
+                nodes.extend(
+                    replace(base, name=nm, count=1, derate=derates[i],
+                            instance_derates={})
+                    for i, nm in enumerate(names)
+                )
         edges: list[Edge] = []
 
         def concrete(endpoint: str) -> list[str]:
@@ -394,6 +446,35 @@ class Graph:
         if sel is None:
             return members
         return [f"{base}[{i}]" for i in _selector_indices(sel, len(members))]
+
+    def derate_instances(self, spec: str, derate: float) -> None:
+        """Set the derate of selected instances of a node, in place.
+
+        `spec` is a selector against a grouped (unexpanded) node --
+        'tensix-fpu[132:140]' harvests the last 8 of 140 cores, 'gddr6-bank[3]'
+        disables one bank, 'core' (a count-1 or literal instance node) sets the
+        node-level derate.  On a counted group the selected indices get an
+        `instance_derates` override; expand() later bakes it into each
+        instance's plain `derate`.  Reuses the selector machinery, so an
+        out-of-range selector raises."""
+        if not 0.0 <= derate <= 1.0:
+            raise ValueError(f"derate {derate} not in [0, 1]")
+        if self.has_node(spec):  # literal name: a group with no selector, or
+            n = self.node(spec)  # an already-expanded instance ('tensix-fpu[3]')
+            if n.count == 1:
+                n.derate = derate
+            else:
+                for i in range(n.count):
+                    n.instance_derates[i] = derate
+            return
+        base, sel = split_endpoint(spec)
+        n = self.node(base)  # KeyError if the group is absent
+        if n.count == 1:
+            _selector_indices(sel, 1)  # only [0]/[0:1] valid on a count-1 node
+            n.derate = derate
+            return
+        for i in _selector_indices(sel, n.count):
+            n.instance_derates[i] = derate
 
     def max_flow(self, src: str | list[str], dst: str | list[str]) -> float:
         """Aggregate bandwidth between two groups: max flow with node
@@ -556,7 +637,8 @@ class Graph:
                 agg = _node_attr_summary(n, aggregate=True)
                 attrs = f"{attrs} each  (total {agg})"
             role = f" <{n.role}>" if n.role else ""
-            lines.append(f"{pad}  [{n.kind.value}]{role} {n.name}{mult}  {attrs}")
+            der = _derate_summary(n)
+            lines.append(f"{pad}  [{n.kind.value}]{role} {n.name}{mult}  {attrs}{der}")
             if n.inner is not None:
                 n.inner._describe(lines, depth + 2)
         for e in self.edges:
@@ -578,18 +660,37 @@ class Graph:
 
 
 def _node_attr_summary(n: Node, aggregate: bool = False) -> str:
-    k = n.count if aggregate else 1
     parts: list[str] = []
     if n.peak_flops:
         top = min(n.peak_flops, key=lambda d: d.bytes)
-        parts.append(f"{fmt_si(k * n.peak_flops[top], 'FLOP/s')} @{top.value}")
+        v = n.agg_flops[top] if aggregate else n.peak_flops[top]
+        parts.append(f"{fmt_si(v, 'FLOP/s')} @{top.value}")
     if n.capacity_bytes is not None:
-        parts.append(fmt_bytes(k * n.capacity_bytes))
+        v = n.agg_capacity if aggregate else n.capacity_bytes
+        parts.append(fmt_bytes(v))
     if n.bandwidth is not None:
-        parts.append(fmt_si(k * n.bandwidth, "B/s"))
+        v = n.agg_bandwidth if aggregate else n.bandwidth
+        parts.append(fmt_si(v, "B/s"))
     if n.latency_s and not aggregate:
         parts.append(fmt_time(n.latency_s))
     return ", ".join(parts)
+
+
+def _derate_summary(n: Node) -> str:
+    """A short note on the node line when any instance is derated/disabled."""
+    if n.instance_derates:
+        disabled = sum(1 for d in n._derates() if d == 0.0)
+        derated = sum(1 for d in n._derates() if 0.0 < d < 1.0)
+        bits = []
+        if disabled:
+            bits.append(f"{disabled} disabled")
+        if derated:
+            bits.append(f"{derated} derated")
+        return f"  [{n.enabled_count}/{n.count} live" + (
+            f", {', '.join(bits)}]" if bits else "]")
+    if n.derate != 1.0:
+        return f"  [derate {n.derate:g}]"
+    return ""
 
 
 def _node_to_dict(n: Node) -> dict[str, Any]:
@@ -604,6 +705,10 @@ def _node_to_dict(n: Node) -> dict[str, Any]:
     for attr in ("latency_s", "dynamic_power_w", "idle_power_w"):
         if getattr(n, attr):
             d[attr] = getattr(n, attr)
+    if n.derate != 1.0:
+        d["derate"] = n.derate
+    if n.instance_derates:
+        d["instance_derates"] = {str(k): v for k, v in n.instance_derates.items()}
     if n.role:
         d["role"] = n.role
     if n.inner is not None:
@@ -625,6 +730,8 @@ def _node_from_dict(d: dict[str, Any]) -> Node:
         capacity_bytes=d.get("capacity_bytes"),
         bandwidth=d.get("bandwidth"),
         latency_s=d.get("latency_s", 0.0),
+        derate=d.get("derate", 1.0),
+        instance_derates={int(k): v for k, v in d.get("instance_derates", {}).items()},
         dynamic_power_w=d.get("dynamic_power_w", 0.0),
         idle_power_w=d.get("idle_power_w", 0.0),
         role=d.get("role", ""),
