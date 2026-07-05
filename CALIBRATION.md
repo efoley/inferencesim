@@ -7,9 +7,10 @@ make such comparisons honest, the published derating ranges, and the transparent
 fit that produced `PROFILES["typical"]`.
 
 **Status (2026-07-05):** mechanism landed; `calibration.ANCHORS` is populated
-with 12 sourced anchors; `PROFILES["typical"]` is **fitted (coarse)** from them
-(§8). Every measured figure carries a source, a retrieval/publication date, and
-a provenance tag:
+with 12 sourced anchors; the cross-vendor `PROFILES["typical"]` is **fitted
+(coarse)** from them (§8); **per-vendor `typical-nv` / `typical-tt` profiles
+landed** (§8.1), selected by `--efficiency auto`. Every measured figure carries a
+source, a retrieval/publication date, and a provenance tag:
 
 - **VERIFIED** — an MLCommons-reviewed MLPerf submission.
 - **VENDOR** — vendor-published (NVIDIA/Tenstorrent docs, blogs). *VENDOR-CI*
@@ -275,27 +276,36 @@ ShareGPT ~2,352.82; TRT-LLM FP8 2000/100 → 5,902.
 ## 8. The encoded anchor set + the fit
 
 `calibration.ANCHORS` holds 12 anchors. Scored under `sol` (must be optimistic,
-`>= 1`) and the fitted `typical`:
+`>= 1`), the cross-vendor global `typical`, and `auto` (each anchor under its
+**per-vendor** profile — tt-* → `typical-tt`, else `typical-nv`; §8.1):
 
-| anchor | regime | metric | measured | sol | typical | role |
-|---|---|---|---|---|---|---|
-| h100-llama8b-trtllm-1k1k | mixed | output_tok_s | 14,991.6 | 1.44 | 0.81 | cross-check |
-| h100-llama8b-trtllm-2k128 | prefill | output_tok_s | 3,275.6 | 1.76 | 1.00 | **compute** |
-| dgxh100-llama70b-trtllm-tp2-1k1k | mixed | output_tok_s | 17,672 | 1.34 | 0.77 | cross-check |
-| dgxh100-llama70b-trtllm-tp2-8k1k | prefill | output_tok_s | 3,184 | 1.66 | 0.97 | **compute** |
-| dgxh100-llama70b-mlperf41-offline | mixed | decode_ceil_tok_s | 24,525 | 1.09 | 0.73 | cross-check |
-| dgxh100-gptoss-trtllm-dep4-1k1k | mixed | output_tok_s | 37,480 | 1.64 | 0.95 | cross-check (DEP4 mapping) |
-| gb300-gptoss-mlperf60-offline | mixed | output_tok_s | 1,046,150 | 1.01 | 0.56 | coarse (excl.) |
-| gb300-llama8b-mlperf51-offline | mixed | output_tok_s | 1,322,640 | 3.39 | 1.79 | coarse (excl.) |
-| qb2-qwen32b-ttmetal-b32 | mixed | output_tok_s | 691 | 1.57 | 0.96 | cross-check |
-| qb2-qwen32b-ttmetal-decode | decode | tpot_ms | 46.3 | 2.42 | 1.41 | cross-check (collective-contaminated) |
-| spark-llama8b-lmsys-decode | decode | tpot_ms | 48.78 | 1.76 | 1.00 | **memory** |
-| spark-llama8b-lmsys-b32 | mixed | output_tok_s | 368 | 1.16 | 0.66 | cross-check |
+| anchor | regime | metric | measured | sol | typical | auto | role |
+|---|---|---|---|---|---|---|---|
+| h100-llama8b-trtllm-1k1k | mixed | output_tok_s | 14,991.6 | 1.44 | 0.81 | 0.81 | cross-check |
+| h100-llama8b-trtllm-2k128 | prefill | output_tok_s | 3,275.6 | 1.76 | 1.00 | 1.00 | **compute** |
+| dgxh100-llama70b-trtllm-tp2-1k1k | mixed | output_tok_s | 17,672 | 1.34 | 0.77 | 0.77 | cross-check |
+| dgxh100-llama70b-trtllm-tp2-8k1k | prefill | output_tok_s | 3,184 | 1.66 | 0.97 | 0.97 | **compute** |
+| dgxh100-llama70b-mlperf41-offline | mixed | decode_ceil_tok_s | 24,525 | 1.09 | 0.73 | 0.73 | cross-check |
+| dgxh100-gptoss-trtllm-dep4-1k1k | mixed | output_tok_s | 37,480 | 1.64 | 0.95 | 0.95 | cross-check (DEP4 mapping) |
+| gb300-gptoss-mlperf60-offline | mixed | output_tok_s | 1,046,150 | 1.01 | 0.56 | 0.56 | coarse (excl.) |
+| gb300-llama8b-mlperf51-offline | mixed | output_tok_s | 1,322,640 | 3.39 | 1.79 | 1.79 | coarse (excl.) |
+| qb2-qwen32b-ttmetal-b32 | mixed | output_tok_s | 691 | 1.57 | 0.96 | **0.72** | cross-check (tt) |
+| qb2-qwen32b-ttmetal-decode | decode | tpot_ms | 46.3 | 2.42 | 1.41 | **1.02** | **memory (tt)** |
+| spark-llama8b-lmsys-decode | decode | tpot_ms | 48.78 | 1.76 | 1.00 | 1.00 | **memory (nv)** |
+| spark-llama8b-lmsys-b32 | mixed | output_tok_s | 368 | 1.16 | 0.66 | 0.66 | cross-check |
 
 **sol:** median **1.60×**, range [1.01×, 3.39×] — every anchor optimistic (the
-invariant holds; a test enforces it). **typical:** median **0.96×**, range
-[0.56×, 1.79×] — brackets 1. The DEP4 point (added with the attention-DP PR) is a
-clean mixed cross-check; the fit knobs are unchanged (it is not a fit driver).
+invariant holds; a test enforces it). **typical (global):** median **0.96×**,
+range [0.56×, 1.79×] — brackets 1. **auto (per-vendor):** median **0.88×**, range
+[0.56×, 1.79×]. Under `auto` every NVIDIA row is **identical to `typical`**
+(`typical-nv` == `typical`); the two Tenstorrent rows move: the decode/memory
+anchor `qb2-qwen32b-ttmetal-decode` goes **1.41× → 1.02×** (the residual the
+per-vendor profile exists to fix — see §8.1), while the mixed cross-check
+`qb2-qwen32b-ttmetal-b32` drops **0.96× → 0.72×** (it now *under*-reads: the harder
+memory derating compounds on a throughput metric, and our exclusive-prefill
+`output_tok_s` already under-reads the measured *pure-decode* aggregate 691 =
+21.6 tok/s/user × 32 — caveat 6). The clean tt memory probe is the decode anchor;
+the mixed one stays a soft cross-check.
 
 **The fit (simple + transparent):**
 - **memory = 0.57** = 1 / 1.76, the clean tp=1 batch-1 decode probe
@@ -314,10 +324,11 @@ clean mixed cross-check; the fit knobs are unchanged (it is not a fit driver).
 compute 0.58 ∈ [0.30, 0.58] ✓ (top edge); collective 0.85 ∈ [0.70, 0.95] ✓;
 overhead 1.5 µs ∈ [1, 10] ✓. The clean single-node probes (`2k128`, `tp2-8k1k`,
 `spark-decode`) land at ~1.0. **Residuals that don't bracket, and why:**
-- `qb2-qwen32b-decode` 1.41× — Tenstorrent effective memory is lower (implied
-  ~0.57/1.41 ≈ 0.40, matching The Register's 41-50%-of-peak) *and* the tp=4 ring
-  collective adds cost. A **per-vendor profile** (Tenstorrent runs lower) is the
-  right fix; one global `typical` keeps this residual by design.
+- `qb2-qwen32b-decode` 1.41× under the *global* `typical` — Tenstorrent effective
+  memory is lower (implied ~0.57/1.41 ≈ 0.40, matching The Register's 41-50%-of-
+  peak). **This is now fixed by the per-vendor `typical-tt` profile (§8.1): the
+  anchor brackets 1 at 1.02× under `auto`.** The global `typical` keeps the
+  residual by design (it is not refitted).
 - `gb300-gptoss` 0.56× and `gb300-llama8b` 1.79× — rack-scale disaggregated MLPerf
   runs with unknown parallelism/disagg (unmodeled); coarse cross-checks, excluded
   from the fit.
@@ -325,7 +336,56 @@ overhead 1.5 µs ∈ [1, 10] ✓. The clean single-node probes (`2k128`, `tp2-8k
   compute *and* memory compounds on mixed-regime throughput. Acceptable spread for
   a bracketing profile.
 
-Reproduce: `inferencesim calibrate --efficiency sol` and `--efficiency typical`.
+Reproduce: `inferencesim calibrate --efficiency sol`, `--efficiency typical`, and
+`--efficiency auto` (per-vendor).
+
+### 8.1 Per-vendor fit (`typical-nv`, `typical-tt`)
+
+One global knob set cannot serve both vendors: the residual above shows the
+Tenstorrent tt-metal stack reaching a markedly lower effective memory bandwidth
+than NVIDIA. So `efficiency.PROFILES` adds two vendor profiles, and
+`profile_for(hardware_key, "auto")` (CLI `--efficiency auto`) routes each hardware
+key to its vendor's — tt-* keys (plus the explicit fine-preset set, e.g.
+`blackhole-p150-fine`) → `typical-tt`, everything else → `typical-nv`. **New
+presets whose key does not start with `tt-` must be added to the mapping**
+(`efficiency._TT_KEYS`).
+
+**`typical-nv`** is an intentional **alias of the global `typical`** (compute
+0.58, memory 0.57, collective 0.85, 1.5 µs): the global fit was driven by the
+NVIDIA anchors, so NVIDIA hardware keeps those knobs. Kept as a separate entry so
+the two can diverge as anchors grow.
+
+**`typical-tt`** re-fits **only `memory`**; the other three knobs are **kept** from
+the global fit for lack of Tenstorrent-specific evidence (we do not invent
+numbers):
+
+- **memory = 0.40** — the *only* re-fitted knob. Derived from the clean tt
+  decode/memory probe `qb2-qwen32b-ttmetal-decode`: its residual under the global
+  `typical` (memory 0.57) is 1.41×, so the effective memory is `0.57 / 1.41 ≈
+  0.40`. Independently corroborated by [The Register's gen-1 QuietBox
+  review](https://www.theregister.com/on-prem/2025/11/27/blackhole-quietbox-tenstorrents-ai-workstation-reviewed/2113269)
+  (Nov 2025), which measured **41–50% of theoretical peak** on Blackhole; the
+  anchor-derived 0.40 sits just under that band. Both are cited; we take the
+  anchor-derived value. At memory 0.40 the decode anchor reads **1.02×** (brackets
+  1; a test enforces `0.9 ≤ ratio ≤ 1.1`).
+- **compute = 0.58** — **kept** from the global fit. Tenstorrent prefill evidence
+  is insufficient to re-fit it: the only tt prefill datum, the `qb2-qwen32b` TTFT
+  anchor (87 ms), is **memory-bound in our model** (weight streaming dominates at
+  prompt 558 / batch 32), so the compute knob barely moves it — sweeping compute
+  1.0→0.30 changes TTFT by <1 ms — and it cannot isolate MFU. The Register's
+  prefill-side numbers are thin. So we keep 0.58 rather than invent a tt value.
+  (Consequence: the tt TTFT still reads ~1.16× optimistic under `auto` — an honest
+  open residual, not a fitted point.)
+- **collective = 0.85** — **kept**. No Tenstorrent collective measurement exists;
+  the Warp400 ring's bus-bandwidth efficiency is unmeasured.
+- **op_overhead_s = 1.5 µs** — **kept**. No tt-specific launch-overhead
+  measurement.
+
+Reproduce: `inferencesim calibrate --efficiency auto`; or a single point,
+`inferencesim run --hardware tt-quietbox-2 --model qwen3-32b --tp 4 --batch 32
+--prompt 558 --output 128 --weight-dtype fp8 --kv-dtype fp8 --efficiency auto`
+(TPOT 45.5 ms vs the measured 46.3 ms; `--efficiency typical` reads 32.8 ms, `sol`
+19.1 ms).
 
 ---
 
@@ -344,8 +404,12 @@ Refit when anchors change (`inferencesim calibrate --efficiency sol`, then fit p
       date (Spark epoch drift is large); Tenstorrent BFP8 ≠ NVIDIA FP8.
 - [ ] Every anchor: set `Anchor.metric` to the normalised sim quantity; bake
       per-GPU/per-rack conversions into `measured` with the raw value in `notes`.
-- [ ] Consider a **per-vendor `Efficiency`** (Tenstorrent memory ~0.40) once more
-      vendor anchors exist — one global `typical` under-serves them today.
+- [x] **Per-vendor `Efficiency` landed** (§8.1): `typical-nv` (== global `typical`)
+      and `typical-tt` (memory re-fitted to **0.40** from the qb2 decode residual /
+      The Register 41–50%-of-peak; other knobs kept for lack of tt evidence), with
+      `profile_for(..., "auto")` / `--efficiency auto` routing tt-* keys to
+      `typical-tt`. Remaining: refit tt `compute`/`collective`/`op_overhead` once a
+      compute-bound tt prefill anchor and a tt collective measurement exist.
 - [x] Explicit **attention-DP + expert-parallel (TRT-LLM DEPn)** deployments
       landed: dense attention-DP is `Deployment.adp` (DP attention + TP FFN), and
       MoE `DEPn ≡ tp=1, ep=n` is documented/validated (README Parallelism,

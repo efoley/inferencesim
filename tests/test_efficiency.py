@@ -11,13 +11,25 @@ The governing invariants:
     expanded collectives and per-op overhead.
 """
 
+import argparse
 from statistics import median
 
 import pytest
 
-from inferencesim.calibration import ANCHORS, Anchor, optimism_ratio, run_anchor
+from inferencesim.calibration import (
+    ANCHORS,
+    Anchor,
+    calibrate_report,
+    optimism_ratio,
+    run_anchor,
+)
 from inferencesim.des import DESEngine
-from inferencesim.efficiency import PROFILES, Efficiency
+from inferencesim.efficiency import (
+    PROFILES,
+    Efficiency,
+    profile_for,
+    vendor_profile_name,
+)
 from inferencesim.engine import CommContext, RooflineEngine, ring_allreduce_time
 from inferencesim.graph import Edge, Graph, Node, NodeKind
 from inferencesim.graphdes import ChipModel
@@ -214,6 +226,113 @@ def test_profiles_present_and_sol_is_identity():
     typ = PROFILES["typical"]
     assert 0.0 < typ.compute <= 1.0 and 0.0 < typ.memory <= 1.0
     assert 0.0 < typ.collective <= 1.0 and typ.op_overhead_s >= 0.0
+
+
+def test_every_profile_validates():
+    """Every named profile is a valid Efficiency (its __post_init__ enforced the
+    (0,1] / >=0 invariants at construction)."""
+    for name, eff in PROFILES.items():
+        assert isinstance(eff, Efficiency), name
+        assert 0.0 < eff.compute <= 1.0 and 0.0 < eff.memory <= 1.0, name
+        assert 0.0 < eff.collective <= 1.0 and eff.op_overhead_s >= 0.0, name
+
+
+# ---- per-vendor profiles ----------------------------------------------------
+
+
+def test_typical_nv_aliases_the_global_typical():
+    """typical-nv == typical today (the global fit was driven by the NVIDIA
+    anchors), kept separate so the two can diverge later."""
+    assert PROFILES["typical-nv"] == PROFILES["typical"]
+
+
+def test_typical_tt_values_in_cited_bands():
+    """Tenstorrent memory is re-fitted to 0.40 (qb2 decode residual 0.57/1.41),
+    near The Register's 41-50%-of-peak band; the other knobs are kept from the
+    global fit for lack of tt-specific evidence."""
+    tt, nv = PROFILES["typical-tt"], PROFILES["typical-nv"]
+    # memory: anchor-derived 0.57/1.41 = 0.40, just under The Register 0.41-0.50
+    assert tt.memory == pytest.approx(0.40, abs=5e-3)
+    assert tt.memory < nv.memory  # tt derates harder than NVIDIA
+    # compute/collective/op_overhead kept from the global fit
+    assert tt.compute == nv.compute
+    assert tt.collective == nv.collective
+    assert tt.op_overhead_s == nv.op_overhead_s
+
+
+def test_profile_for_auto_maps_vendor():
+    """'auto' routes tt-* keys (and the explicit fine-preset set) to typical-tt,
+    everything else to typical-nv."""
+    for tt_key in ("tt-quietbox-2", "tt-quietbox", "tt-quietbox-fine",
+                   "blackhole-p150-fine"):
+        assert profile_for(tt_key) is PROFILES["typical-tt"], tt_key
+        assert vendor_profile_name(tt_key) == "typical-tt", tt_key
+    for nv_key in ("h100", "dgx-h100", "gb300-nvl72", "dgx-spark", "dgx-h100-fine"):
+        assert profile_for(nv_key) is PROFILES["typical-nv"], nv_key
+        assert vendor_profile_name(nv_key) == "typical-nv", nv_key
+
+
+def test_profile_for_explicit_name_bypasses_mapping():
+    """An explicit profile name is honoured even for tt hardware (no vendor
+    remapping)."""
+    assert profile_for("tt-quietbox-2", "sol") is PROFILES["sol"]
+    assert profile_for("tt-quietbox-2", "typical-nv") is PROFILES["typical-nv"]
+    assert profile_for("h100", "typical-tt") is PROFILES["typical-tt"]
+
+
+def test_profile_for_unknown_name_raises_with_available_list():
+    with pytest.raises(ValueError) as excinfo:
+        profile_for("h100", "bogus")
+    msg = str(excinfo.value)
+    assert "bogus" in msg
+    assert "typical-tt" in msg and "typical-nv" in msg  # lists the available set
+
+
+def test_qb2_decode_brackets_one_under_typical_tt():
+    """The tt decode/memory anchor -- a 1.41x residual under the global typical
+    (the motivation for per-vendor profiles) -- brackets 1 under typical-tt."""
+    dec = next(a for a in ANCHORS if a.name == "qb2-qwen32b-ttmetal-decode")
+    _, _, glob = run_anchor(dec, PROFILES["typical"])
+    assert glob > 1.3, "the global-typical residual this PR fixes"
+    _, _, tt = run_anchor(dec, PROFILES["typical-tt"])
+    assert 0.9 <= tt <= 1.1, f"qb2 decode under typical-tt: {tt:.3f}x"
+
+
+def test_calibrate_report_auto_labels_each_anchor_vendor():
+    """calibrate_report(resolve=...) scores each anchor under its vendor profile
+    and shows a profile column naming it -- tt and nv rows in one table."""
+    report = calibrate_report(resolve=lambda hw: profile_for(hw, "auto"))
+    assert "profile" in report
+    assert "typical-tt" in report and "typical-nv" in report
+
+
+def test_cli_efficiency_default_is_sol_auto_is_opt_in():
+    """The CLI default stays sol (identity) for every vendor -- 'auto' vendor
+    derating is strictly opt-in (this is the CLI counterpart to the bit-identical
+    guards above).  Explicit names bypass the mapping; --eff-* overrides layer on
+    top of the auto-resolved base."""
+    from inferencesim.cli import _efficiency_from_args
+
+    def ns(**kw):
+        base = dict(efficiency=None, eff_compute=None, eff_memory=None,
+                    eff_collective=None, op_overhead_s=None)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    # default (no --efficiency): sol regardless of hardware -- zero behaviour change
+    assert _efficiency_from_args(ns(), "tt-quietbox-2") == PROFILES["sol"]
+    assert _efficiency_from_args(ns(), "h100") == PROFILES["sol"]
+    # opt-in: --efficiency auto vendor-resolves per hardware key
+    assert _efficiency_from_args(ns(efficiency="auto"), "tt-quietbox-2") \
+        == PROFILES["typical-tt"]
+    assert _efficiency_from_args(ns(efficiency="auto"), "h100") == PROFILES["typical-nv"]
+    # an explicit named profile bypasses the vendor mapping
+    assert _efficiency_from_args(ns(efficiency="typical"), "tt-quietbox-2") \
+        == PROFILES["typical"]
+    # --eff-* overrides layer onto the auto-resolved base
+    got = _efficiency_from_args(ns(efficiency="auto", eff_memory=0.5), "tt-quietbox-2")
+    assert got.memory == 0.5
+    assert got.compute == PROFILES["typical-tt"].compute
 
 
 # ---- calibration anchors ----------------------------------------------------

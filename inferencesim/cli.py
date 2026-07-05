@@ -18,7 +18,7 @@ from pathlib import Path
 from .bridge import system_from_graph, system_to_graph
 from .calibration import calibrate_report
 from .des import DESEngine
-from .efficiency import PROFILES, Efficiency
+from .efficiency import PROFILES, Efficiency, profile_for
 from .engine import RooflineEngine
 from .graph import Graph
 from .hardware import DType, System
@@ -34,10 +34,14 @@ from .workload import Deployment, Scenario
 
 def _add_efficiency_args(parser: argparse.ArgumentParser) -> None:
     """The shared derating knobs: a named profile plus per-factor overrides."""
-    parser.add_argument("--efficiency", choices=sorted(PROFILES), default=None,
+    parser.add_argument("--efficiency", choices=[*sorted(PROFILES), "auto"],
+                        default=None,
                         help="named efficiency profile (default: sol = speed of "
-                             "light, no derating); 'typical' derates toward "
-                             "measured reality (values provisional until fitted)")
+                             "light, no derating). 'auto' picks the vendor-"
+                             "appropriate profile per hardware (tt-* -> typical-tt, "
+                             "else typical-nv); 'typical' is the cross-vendor global "
+                             "fit; 'typical-nv'/'typical-tt' select a vendor profile "
+                             "explicitly. See CALIBRATION.md.")
     parser.add_argument("--eff-compute", type=float, default=None,
                         help="override compute efficiency (fraction of peak FLOP/s)")
     parser.add_argument("--eff-memory", type=float, default=None,
@@ -48,10 +52,8 @@ def _add_efficiency_args(parser: argparse.ArgumentParser) -> None:
                         help="override fixed per-op overhead in seconds")
 
 
-def _efficiency_from_args(args: argparse.Namespace) -> Efficiency:
-    """Build an Efficiency: start from the named profile (default 'sol'), then
-    apply any explicitly-passed per-factor overrides."""
-    base = PROFILES[args.efficiency] if args.efficiency else PROFILES["sol"]
+def _override_dict(args: argparse.Namespace) -> dict:
+    """The explicitly-passed per-factor overrides, as replace() kwargs."""
     overrides = {}
     if args.eff_compute is not None:
         overrides["compute"] = args.eff_compute
@@ -61,6 +63,20 @@ def _efficiency_from_args(args: argparse.Namespace) -> Efficiency:
         overrides["collective"] = args.eff_collective
     if args.op_overhead_s is not None:
         overrides["op_overhead_s"] = args.op_overhead_s
+    return overrides
+
+
+def _efficiency_from_args(args: argparse.Namespace, hardware_key: str = "") -> Efficiency:
+    """Build an Efficiency: start from the named profile (default 'sol'; 'auto'
+    vendor-resolves against `hardware_key`), then apply any explicitly-passed
+    per-factor overrides."""
+    if args.efficiency == "auto":
+        base = profile_for(hardware_key, "auto")
+    elif args.efficiency:
+        base = PROFILES[args.efficiency]
+    else:
+        base = PROFILES["sol"]
+    overrides = _override_dict(args)
     return replace(base, **overrides) if overrides else base
 
 
@@ -166,7 +182,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         pue=args.pue,
     )
 
-    efficiency = _efficiency_from_args(args)
+    efficiency = _efficiency_from_args(args, getattr(args, "hardware", None) or "")
     if args.engine == "des":
         hw_graph = _resolve_hw_graph(args)
         chip_graph = _chip_graph_of(hw_graph) if hw_graph is not None else None
@@ -207,8 +223,18 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_calibrate(args: argparse.Namespace) -> int:
-    efficiency = _efficiency_from_args(args)
-    print(calibrate_report(efficiency))
+    if args.efficiency == "auto":
+        # score each anchor under its own vendor profile (tt anchors under
+        # typical-tt, NVIDIA under typical-nv), applying any --eff-* overrides.
+        overrides = _override_dict(args)
+
+        def resolve(hardware_key: str) -> Efficiency:
+            base = profile_for(hardware_key, "auto")
+            return replace(base, **overrides) if overrides else base
+
+        print(calibrate_report(resolve=resolve))
+    else:
+        print(calibrate_report(_efficiency_from_args(args)))
     return 0
 
 
@@ -268,7 +294,9 @@ def _cmd_serve(args: argparse.Namespace) -> int:
             output_dist=_parse_dist(args.output_dist),
             **common,
         )
-    report = serve(system, model, scen, dep, cfg)
+    efficiency = _efficiency_from_args(args, args.hardware or "")
+    report = serve(system, model, scen, dep, cfg,
+                   engine=RooflineEngine(efficiency))
     print(format_serve_report(report))
     return 0
 
@@ -396,6 +424,7 @@ def main(argv: list[str] | None = None) -> int:
     srv.add_argument("--weight-dtype", default="fp8", choices=[d.value for d in DType])
     srv.add_argument("--kv-dtype", default="bf16", choices=[d.value for d in DType])
     srv.add_argument("--act-dtype", default="bf16", choices=[d.value for d in DType])
+    _add_efficiency_args(srv)
     srv.set_defaults(fn=_cmd_serve)
 
     args = p.parse_args(argv)
