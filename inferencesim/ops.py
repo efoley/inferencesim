@@ -238,17 +238,22 @@ def _embed_and_head(model: ModelSpec, tokens_in: float, tokens_out: float,
     ]
 
 
-def decode_step_ops(model: ModelSpec, scen: Scenario, dep: Deployment) -> list[Op]:
-    """One decode round: every one of `batch` sequences emits one token, at
-    the scenario's mean context length.
+def decode_ops(model: ModelSpec, dep: Deployment, batch: float, ctx: float) -> list[Op]:
+    """One decode round for `batch` sequences, each at (mean) context `ctx`.
+
+    Split out of `decode_step_ops` so callers that step the batch or the
+    context by hand -- notably the request-level serving simulator, which
+    varies the running-batch size and grows the KV per token -- can lower a
+    decode iteration at an arbitrary (batch, ctx) without a Scenario.  Only
+    the attention op depends on `ctx`; everything else is a function of
+    `batch` alone (and, for MoE, of the expected active experts at that batch).
 
     With PP this is the pipeline round over pp microbatches; because stages
     are balanced it reduces to the whole-model op list at microbatch size
     (each stage streams its weights once per microbatch) plus pp hops.
     """
     validate_deployment(model, dep)
-    B = scen.batch
-    ctx = scen.mean_context
+    B = batch
     L = model.n_layers
     b_att = B / (dep.pp * dep.ep)  # sequences per attention group per microbatch
     b_tok = B / dep.pp  # tokens per microbatch across all ep groups
@@ -256,8 +261,7 @@ def decode_step_ops(model: ModelSpec, scen: Scenario, dep: Deployment) -> list[O
     ops: list[Op] = [
         _linear("qkv_proj", b_att, model.attn_qkv_params, model.d_model,
                 (model.n_heads + 2 * model.n_kv_heads) * model.d_head, dep, count=L),
-        _attention(model, n_seq=b_att, q_len=1, kv_len=ctx, causal_new=False,
-                   dep=dep, count=L),
+        decode_attention_op(model, dep, batch, ctx),
         _linear("out_proj", b_att, model.attn_out_params,
                 model.n_heads * model.d_head, model.d_model, dep, count=L),
         *_ffn_ops(model, tokens_per_group=b_att, tokens_total=b_tok, dep=dep, count=L),
@@ -268,6 +272,23 @@ def decode_step_ops(model: ModelSpec, scen: Scenario, dep: Deployment) -> list[O
         *_embed_and_head(model, tokens_in=b_att, tokens_out=b_att, dep=dep, count=dep.pp),
     ]
     return ops
+
+
+def decode_attention_op(model: ModelSpec, dep: Deployment, batch: float, ctx: float) -> Op:
+    """The single self-attention op of one decode iteration: `batch` sequences
+    each emit one token attending to `ctx` cached tokens.  Its flops and KV
+    bytes are linear in `batch * ctx` (= the total context streamed this step),
+    so a serving loop can recost just this op as the KV cache grows while the
+    rest of the decode step stays fixed for a given batch size."""
+    b_att = batch / (dep.pp * dep.ep)  # sequences per attention group
+    return _attention(model, n_seq=b_att, q_len=1, kv_len=ctx, causal_new=False,
+                      dep=dep, count=model.n_layers)
+
+
+def decode_step_ops(model: ModelSpec, scen: Scenario, dep: Deployment) -> list[Op]:
+    """One decode round: every one of `batch` sequences emits one token, at
+    the scenario's mean context length."""
+    return decode_ops(model, dep, scen.batch, scen.mean_context)
 
 
 def prefill_ops(model: ModelSpec, n_prompt_tokens: int, dep: Deployment) -> list[Op]:

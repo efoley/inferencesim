@@ -190,6 +190,39 @@ and `--trace` gain the chip resources (`chip:gddr6-bank[3]`, per-op
 topology in both modes (see above); modelling an op too serial to fill the
 chip (few-head attention) needs op structure `ops.py` doesn't carry yet.
 
+### Serving simulation
+
+`inferencesim run` reports steady-state averages. `inferencesim serve` instead
+runs a **request-level, iteration-granular** event loop for one replica, so the
+numbers carry queueing and prefill/decode interference rather than assuming them
+away:
+
+```
+inferencesim serve --hardware gb300-nvl72 --model llama-3.1-70b --tp 8 \
+    --rate 88 --requests 200 --max-batch 64 --prompt 4096 --output 1024 \
+    --weight-dtype fp4 --kv-dtype fp8
+inferencesim serve --hardware gb300-nvl72 --model gpt-oss-120b --tp 4 --ep 8 \
+    --arrivals trace.txt --max-batch 64        # one arrival time per line
+```
+
+Requests arrive by a seeded Poisson process (`--rate`, a whole-system rate
+divided by DP for one replica) or an explicit trace (`--arrivals`). The loop
+interleaves iterations under continuous batching: a waiting request is admitted
+when a batch slot is free *and* its conservative prompt+output KV footprint fits
+the per-chip budget; with `prefill_first` (vLLM-like default) a waiting
+request's *exclusive* whole-prompt prefill preempts the decoding batch, and each
+decode iteration emits one token for every running request while its attention
+is recost at the batch's actual Σ per-request context (per-token KV growth).
+Because pp=1, an iteration is a serial op chain, so its duration is a
+closed-form sum and there is no scheduler here — the interesting dynamics are
+all *between* iterations. It reports offered vs achieved throughput, TTFT
+p50/p95/p99 + mean (queueing included), per-request TPOT, the inter-token-gap
+p99 (prefill interference shows up as gaps many x the mean), batch occupancy,
+and peak KV. **Scope**: one replica, `pp == 1`, exclusive prefill; chunked
+prefill and task-level pp>1 serving are future work (see `DES_todo.md` §4). The
+per-iteration cost accepts a `DESEngine` so graph-refined chip costs can flow
+into serving numbers.
+
 ### Outputs
 
 - **Latency**: TTFT (prefill) and TPOT (decode at mean context), with a
@@ -213,7 +246,9 @@ chip (few-head attention) needs op structure `ops.py` doesn't carry yet.
 
 - **DES on the expanded chip graph**: contention on DRAM banks, NoC hops
   and per-core SRAM (the `expand()`ed graph is built for this);
-  heterogeneous chips; prefill/decode interference in one simulation.
+  heterogeneous chips. (Prefill/decode interference now lands in the
+  request-level serving loop, `inferencesim serve`; extending it to chunked
+  prefill and pp>1 is next — see `DES_todo.md` §4.)
 - **Graph editor UI** over the JSON graph format (nodes with constraints,
   edges with latencies, nesting for abstraction levels).
 - Multi-rack topologies (rail-optimized Ethernet/IB); prefill/decode
