@@ -25,7 +25,10 @@ these):
   * Edges at the root between "node" composites (possibly via a SWITCH)
     define the network.
   * Costs and host overhead power live in composite meta:
-    {"cost_usd": ..., "overhead_power_w": ..., "topology": ...}.
+    {"cost_usd": ..., "overhead_power_w": ...}.
+  * The interconnect topology (ring / all-to-all / mesh) lives on the fabric
+    SWITCH node's meta ({"topology": ...}) -- it is the interconnect's
+    property, not the chip's -- and defaults to all-to-all when absent.
 
 Convenience fallbacks: a graph with no composites at all is treated as one
 chip in a single-chip system; a graph whose root directly holds role="chip"
@@ -285,6 +288,15 @@ def _link_from_edges(g: Graph, composite_name: str, what: str) -> Link | None:
     )
 
 
+def _topology_from_switches(g: Graph) -> Topology:
+    """Interconnect topology from the fabric SWITCH node's meta (its single
+    home); defaults to all-to-all when no switch declares one."""
+    for n in g.nodes:
+        if n.kind is NodeKind.SWITCH and "topology" in n.meta:
+            return Topology(n.meta["topology"])
+    return Topology.ALL_TO_ALL
+
+
 def _node_from_graph(g: Graph, meta: dict[str, Any], name: str) -> HwNode:
     chips = g.find(role="chip")
     if not chips:
@@ -308,7 +320,9 @@ def _node_from_graph(g: Graph, meta: dict[str, Any], name: str) -> HwNode:
         # maybe chips connect pairwise chip <-> chip; a self-edge is invalid,
         # so nothing to find: require a fabric or explicit edge
         raise ValueError(f"{g.name}: {cc.count} chips but no interconnect edge")
-    topo = str(cc.meta.get("topology", g.meta.get("topology", Topology.ALL_TO_ALL.value)))
+    # topology is a property of the interconnect: node_to_graph writes it onto
+    # the fabric SWITCH node's meta, so read it back from there.
+    topo = _topology_from_switches(g)
     return HwNode(
         name=name,
         chip=chip,

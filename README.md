@@ -152,11 +152,21 @@ scheduling/contention. What's emergent rather than assumed: pipeline
 microbatch overlap (TPOT is the *measured* steady-state round period),
 the real cost of unbalanced stages (`n_layers % pp != 0` — the analytic
 engine only warns), LM-head/hop overlap with other stages' work, and
-serial fill/drain for single-request prefill. The report adds a
-per-resource utilisation line per phase (which stage unit / collective
-fabric / hop was the bottleneck), and `--trace out.json` writes a
-Chrome/Perfetto timeline of the run. The scheduler core (`sched.py`)
-supports k-server pools and bandwidth-shared links.
+serial fill/drain for single-request prefill. Collectives are expanded to
+their actual per-step transfers over the declared fabric topology
+(`collectives.py`): a ring allreduce becomes 2(g-1) barrier-separated steps
+on per-member directional links, and a MoE all-to-all becomes g-1 per-member
+messages on a switched (all-to-all) fabric or shortest-way store-and-forward
+routing on a ring — so ring vs all-to-all fabrics genuinely differ, and
+collectives contend with pipeline hops (which ride the boundary chip's link)
+instead of on a lumped fabric. Link resources carry only bandwidth occupancy
+(`bytes/bw`); propagation latency rides the dependency chain, never a link —
+so each collective reproduces its closed form exactly in isolation and
+diverges only under genuine bandwidth contention. The report adds a
+per-resource utilisation line per phase (which stage unit / link was the
+bottleneck), and `--trace out.json` writes a Chrome/Perfetto timeline of the
+run. The scheduler core (`sched.py`) supports k-server pools and
+bandwidth-shared links.
 
 **Graph mode** refines this further when the hardware source is a graph
 (`--graph FILE` or a fine-grained preset such as `tt-quietbox-fine`) and
@@ -176,9 +186,9 @@ memory tiling only makes tiles smaller. It is a strict refinement: with a
 single bank, unconstrained links and infinite SRAM it collapses to the
 lumped result, and it is never optimistic. The per-phase utilisation line
 and `--trace` gain the chip resources (`chip:gddr6-bank[3]`, per-op
-`op:ffn/…` tracks). Collectives stay closed-form; modelling an op too serial
-to fill the chip (few-head attention) needs op structure `ops.py` doesn't
-carry yet.
+`op:ffn/…` tracks). Collectives are expanded per-step over the fabric
+topology in both modes (see above); modelling an op too serial to fill the
+chip (few-head attention) needs op structure `ops.py` doesn't carry yet.
 
 ### Outputs
 

@@ -9,13 +9,15 @@ from inferencesim.bridge import (
     system_to_graph,
 )
 from inferencesim.graph import Edge, Graph, Node, NodeKind
-from inferencesim.hardware import DType
+from inferencesim.hardware import DType, Topology
 from inferencesim.presets import (
     BLACKHOLE_P150,
+    DGX_H100,
     HARDWARE,
     LLAMA_3_1_8B,
     LLAMA_3_1_70B,
     TT_QUIETBOX,
+    TT_QUIETBOX_2,
 )
 from inferencesim.presets_fine import blackhole_p150_fine, tt_quietbox_fine
 from inferencesim.simulate import simulate
@@ -146,8 +148,30 @@ def test_chip_round_trip_preserves_roofline_quantities():
     assert chip.max_power_w == pytest.approx(BLACKHOLE_P150.max_power_w)
 
 
+def test_ring_topology_survives_system_graph_round_trip():
+    """Interconnect topology lives on the fabric SWITCH node's meta (its
+    single home); a RING system must round-trip through the graph and back
+    without silently reverting to the ALL_TO_ALL default.
+
+    Regression: node_to_graph wrote topology onto the fabric switch, but the
+    extractor used to read it from the chip *composite*'s meta and so always
+    fell back to ALL_TO_ALL.  test_system_round_trip_simulates_identically
+    could not have caught this -- it deploys at tp=1, where topology is dead
+    weight (no collective crosses a link), so the timing was identical either
+    way.  The stage-DES collective expansion made topology load-bearing."""
+    for system in (TT_QUIETBOX, TT_QUIETBOX_2):
+        rebuilt = system_from_graph(system_to_graph(system))
+        assert rebuilt.node.topology is Topology.RING
+        # ... and an ALL_TO_ALL system stays ALL_TO_ALL
+    rebuilt = system_from_graph(system_to_graph(DGX_H100))
+    assert rebuilt.node.topology is Topology.ALL_TO_ALL
+
+
 @pytest.mark.parametrize("key", list(HARDWARE))
 def test_system_round_trip_simulates_identically(key):
+    """tp=1, so topology is timing-dead (no collective crosses a link) and the
+    two engines agree byte-for-byte regardless of the interconnect topology;
+    the RING topology round-trip itself is checked separately above."""
     system = HARDWARE[key]
     rebuilt = system_from_graph(system_to_graph(system))
     model = LLAMA_3_1_8B
