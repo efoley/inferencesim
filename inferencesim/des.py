@@ -6,13 +6,15 @@ real task graph -- one task per (round, microbatch, pipeline stage, layer
 block) with explicit dependencies -- and simulates it against resources
 with FIFO queues:
 
-    u{s}          the stage-s execution unit (its tp chips' compute+DRAM,
-                  kernels serialise on it)
-    s{s}.l{i}.cw  member i's clockwise outbound link at stage s; .ccw its
-    s{s}.l{i}.ccw counter-clockwise one.  Collectives are expanded to their
-                  per-step transfers over these links (collectives.py), and
-                  the pipeline hop rides member 0's link -- so collective/hop
-                  and collective/collective contention emerges here.
+    u{s}           the stage-s execution unit (its tp chips' compute+DRAM,
+                   kernels serialise on it)
+    s{s}.l{i}.out  member i's outbound link at stage s, named for its fabric:
+    s{s}.l{i}.cw   `.out` (one egress port) on a switched fabric, or the two
+    s{s}.l{i}.ccw  distinct `.cw`/`.ccw` cables on a ring.  Collectives are
+                   expanded to their per-step transfers over these links
+                   (collectives.py), and the pipeline hop rides member 0's
+                   link -- so collective/hop and collective/collective
+                   contention emerges here.
 
 Because tasks only run when their inputs are ready *and* their resource is
 free, the interesting behaviour is emergent rather than assumed:
@@ -222,9 +224,12 @@ class DESEngine(Engine):
                   plan: _CommPlan, label: str) -> int:
         """A pipeline hop rides the sending chip's (member 0) outbound link,
         carrying only its bandwidth occupancy; the flight time follows on a
-        per-hop propagation resource so it never occupies the link."""
+        per-hop propagation resource so it never occupies the link.  The link
+        is named for the stage's fabric -- by convention the tp-group topology
+        (`.out` on a switched fabric, `.cw` on a ring)."""
+        link = collectives.egress(f"s{s}", 0, plan.ar_topo)
         occ = plan.hop_bytes / plan.hop_bw if plan.hop_bw else 0.0
-        prev = collectives._add(tasks, f"s{s}.l0.cw", occ, [prev], label)
+        prev = collectives._add(tasks, link, occ, [prev], label)
         if plan.hop_lat > 0.0:
             prev = collectives._add(
                 tasks, f"s{s}.prop_h{len(tasks)}", plan.hop_lat, [prev], label)

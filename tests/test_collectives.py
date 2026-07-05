@@ -24,11 +24,11 @@ def test_ring_allreduce_matches_closed_form(g, lat):
     """The expanded ring allreduce, scheduled in isolation, has makespan
     exactly equal to ring_allreduce_time -- the validation oracle -- while
     each link's busy time is pure bandwidth occupancy 2(g-1)*payload/(g*bw)
-    with no phantom latency."""
+    with no phantom latency.  (Named on a RING fabric, so sends use `.cw`.)"""
     payload, bw = 4e6, 100e9
     tasks: list[Task] = []
     exit_key = collectives.ring_allreduce(tasks, None, g, payload, bw, lat,
-                                          "s0", "ar")
+                                          Topology.RING, "s0", "ar")
     r = schedule(tasks)
     assert r.makespan == pytest.approx(
         ring_allreduce_time(payload, g, Link("l", bw, lat)), rel=1e-9
@@ -43,19 +43,29 @@ def test_ring_allreduce_group_one_is_noop():
     (as the roofline charges 0 for a tp=1 allreduce)."""
     tasks: list[Task] = []
     assert collectives.ring_allreduce(tasks, 7, 1, 1e6, 100e9, 1e-6,
-                                      "s0", "ar") == 7
+                                      Topology.RING, "s0", "ar") == 7
     assert tasks == []
 
 
-def test_allreduce_dispatch_ring_and_switched_expand_equally():
+def test_allreduce_topology_aware_link_naming():
     """The ring algorithm is bandwidth-optimal on both RING and ALL_TO_ALL
-    fabrics, so allreduce() expands identically on each (only MESH_2D differs)."""
-    for topo in (Topology.RING, Topology.ALL_TO_ALL):
-        tasks: list[Task] = []
-        collectives.allreduce(tasks, None, 4, 4e6, 100e9, 1e-6, topo, "s0", "ar")
-        assert schedule(tasks).makespan == pytest.approx(
-            ring_allreduce_time(4e6, 4, Link("l", 100e9, 1e-6)), rel=1e-9
-        )
+    fabrics, so allreduce() expands to the same makespan on each (only MESH_2D
+    differs).  The link *names* follow the fabric: a switched fabric egresses a
+    member via its single `.out` port; a ring uses the `.cw` cable."""
+    oracle = ring_allreduce_time(4e6, 4, Link("l", 100e9, 1e-6))
+    ring: list[Task] = []
+    collectives.allreduce(ring, None, 4, 4e6, 100e9, 1e-6, Topology.RING,
+                          "s0", "ar")
+    r_ring = schedule(ring)
+    assert r_ring.makespan == pytest.approx(oracle, rel=1e-9)
+    assert "s0.l0.cw" in r_ring.busy and not any(".out" in k for k in r_ring.busy)
+
+    sw: list[Task] = []
+    collectives.allreduce(sw, None, 4, 4e6, 100e9, 1e-6, Topology.ALL_TO_ALL,
+                          "s0", "ar")
+    r_sw = schedule(sw)
+    assert r_sw.makespan == pytest.approx(oracle, rel=1e-9)  # identical timing
+    assert "s0.l0.out" in r_sw.busy and not any(".cw" in k for k in r_sw.busy)
 
 
 # ---- switched all-to-all: exact closed form ---------------------------------
@@ -65,18 +75,19 @@ def test_allreduce_dispatch_ring_and_switched_expand_equally():
 @pytest.mark.parametrize("lat", [0.0, 2e-6])
 def test_a2a_switched_matches_closed_form(g, lat):
     """On an ALL_TO_ALL fabric every member serialises the g-1 messages'
-    bandwidth occupancies on its one outbound link (total comm_bytes/bw), and
-    a single exit barrier carries one propagation latency (flight time
-    overlaps across the injected messages).  So the isolation makespan is
-    exactly the closed form comm_bytes/bw + lat -- for every g, including the
-    32-way MoE case -- and the link busy-time is pure occupancy."""
+    bandwidth occupancies on its single egress port (`.out`, total
+    comm_bytes/bw), and a single exit barrier carries one propagation latency
+    (flight time overlaps across the injected messages).  So the isolation
+    makespan is exactly the closed form comm_bytes/bw + lat -- for every g,
+    including the 32-way MoE case -- and the link busy-time is pure
+    occupancy."""
     comm_bytes, bw = 3.1e6, 100e9
     tasks: list[Task] = []
     collectives.all_to_all(tasks, None, g, comm_bytes, bw, lat,
                            Topology.ALL_TO_ALL, "s0", "a2a")
     r = schedule(tasks)
     assert r.makespan == pytest.approx(comm_bytes / bw + lat, rel=1e-9)
-    assert r.busy["s0.l0.cw"] == pytest.approx(comm_bytes / bw, rel=1e-9)
+    assert r.busy["s0.l0.out"] == pytest.approx(comm_bytes / bw, rel=1e-9)
 
 
 def test_a2a_group_one_is_noop():
@@ -146,13 +157,15 @@ def test_hop_bandwidth_contends_with_allreduce_on_member0_link():
     payload = 2 * occ * bw  # send occupancy = payload/(2*bw) = occ
 
     shared: list[Task] = []
-    collectives.ring_allreduce(shared, None, 2, payload, bw, lat, "s0", "ar")
+    collectives.ring_allreduce(shared, None, 2, payload, bw, lat,
+                               Topology.RING, "s0", "ar")
     k = collectives._add(shared, "s0.l0.cw", 0.5, [], "hop")
     collectives._add(shared, "s0.prop_h", 0.3, [k], "hop")
     assert schedule(shared).makespan == pytest.approx(2.7, rel=1e-12)
 
     indep: list[Task] = []
-    collectives.ring_allreduce(indep, None, 2, payload, bw, lat, "s0", "ar")
+    collectives.ring_allreduce(indep, None, 2, payload, bw, lat,
+                               Topology.RING, "s0", "ar")
     k = collectives._add(indep, "hop_only", 0.5, [], "hop")
     collectives._add(indep, "hop_prop", 0.3, [k], "hop")
     assert schedule(indep).makespan == pytest.approx(2.4, rel=1e-12)
@@ -175,8 +188,10 @@ def test_overlapping_collectives_serialize_only_on_shared_links():
     occ, lat, bw = 1.0, 0.2, 1.0
     payload = 2 * occ * bw
     tasks: list[Task] = []
-    collectives.ring_allreduce(tasks, None, 2, payload, bw, lat, "s0", "arA")
-    collectives.ring_allreduce(tasks, None, 2, payload, bw, lat, "s0", "arB")
+    collectives.ring_allreduce(tasks, None, 2, payload, bw, lat,
+                               Topology.RING, "s0", "arA")
+    collectives.ring_allreduce(tasks, None, 2, payload, bw, lat,
+                               Topology.RING, "s0", "arB")
     r = schedule(tasks)
     single = 2 * (occ + lat)  # one instance in isolation = 2.4
     assert r.makespan == pytest.approx(4 * occ + lat, rel=1e-12)  # 4.2
