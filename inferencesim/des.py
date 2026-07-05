@@ -6,10 +6,13 @@ real task graph -- one task per (round, microbatch, pipeline stage, layer
 block) with explicit dependencies -- and simulates it against resources
 with FIFO queues:
 
-    u{s}   the stage-s execution unit (its tp chips' compute+DRAM,
-           kernels serialise on it)
-    c{s}   the stage-s collective fabric (tp allreduces, MoE all-to-alls)
-    h{s}   the point-to-point link out of stage s (pipeline hops)
+    u{s}          the stage-s execution unit (its tp chips' compute+DRAM,
+                  kernels serialise on it)
+    s{s}.l{i}.cw  member i's clockwise outbound link at stage s; .ccw its
+    s{s}.l{i}.ccw counter-clockwise one.  Collectives are expanded to their
+                  per-step transfers over these links (collectives.py), and
+                  the pipeline hop rides member 0's link -- so collective/hop
+                  and collective/collective contention emerges here.
 
 Because tasks only run when their inputs are ready *and* their resource is
 free, the interesting behaviour is emergent rather than assumed:
@@ -32,19 +35,24 @@ Current granularity: pipeline stages and their links.  Passing a
 `chip_graph` refines just the per-op unit cost: instead of the roofline
 `max(flops/peak, bytes/bw)`, a COMPUTE op is lowered to a tile task graph
 over the expanded chip's DRAM banks, NoC and per-core SRAM/matrix engines
-(graphdes.ChipModel) and its wall time measured.  Comm ops stay closed-form
-(collective internals are a later roadmap item).  Behaviour is byte-for-byte
-unchanged without a chip_graph.
+(graphdes.ChipModel) and its wall time measured.  Collectives are always
+expanded per-step over the fabric topology (collectives.py); MESH_2D still
+falls back to the closed form.  Because a link carries only bandwidth
+occupancy and latency rides the dependency chain, an isolated collective
+reproduces its closed form exactly, so the expansion changes results only
+where a collective genuinely contends for link bandwidth (with a hop or a
+concurrent collective).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from . import collectives
 from .engine import CommContext, Engine, Phase, RooflineEngine
 from .graph import Graph
 from .graphdes import ChipModel, OpSchedule
-from .hardware import System
+from .hardware import System, Topology
 from .ops import Op, OpKind
 from .sched import ScheduleResult, Task, schedule
 from .workload import Deployment
@@ -69,6 +77,35 @@ class _LayerCosts:
     hop: float = 0.0  # pipeline p2p
     edge: float = 0.0  # embed + lm_head on the edge stages
     n_layers: int = 1
+
+
+@dataclass
+class _CommPlan:
+    """Raw per-collective transfer parameters (payload, group size, link
+    bandwidth/latency, fabric topology) recovered from the op list + comm
+    context, so `collectives.py` can expand each collective into its per-step
+    link transfers.  `_LayerCosts` keeps the closed-form *unit times*; this
+    keeps the *ingredients* of those closed forms.  Links are None-safe: a
+    group of size <= 1 is never expanded, so its 0.0 bw/lat is unused."""
+
+    # allreduce: ring over the tp group
+    ar_group: int = 1
+    ar_bytes: float = 0.0
+    ar_bw: float = 0.0
+    ar_lat: float = 0.0
+    ar_topo: Topology = Topology.ALL_TO_ALL
+    # MoE dispatch/combine: all-to-all over the tp*ep array
+    a2a_group: int = 1
+    dispatch_bytes: float = 0.0
+    combine_bytes: float = 0.0
+    a2a_bw: float = 0.0
+    a2a_lat: float = 0.0
+    a2a_topo: Topology = Topology.ALL_TO_ALL
+    # pipeline p2p hop: split into bandwidth occupancy (on the link) and flight
+    # time (on the dependency chain), so hop latency does not occupy the link.
+    hop_bytes: float = 0.0
+    hop_bw: float = 0.0
+    hop_lat: float = 0.0
 
 
 _ATTN_OPS = {"qkv_proj", "attention", "out_proj"}
@@ -157,41 +194,97 @@ class DESEngine(Engine):
                 c.n_allreduce = max(1, round(op.count / c.n_layers))
         return c, op_runs, buckets
 
+    def _comm_plan(
+        self, ops: list[Op], dep: Deployment, comm: CommContext
+    ) -> _CommPlan:
+        """Recover the per-collective transfer ingredients from the op list."""
+        payload = {op.name: op.comm_bytes for op in ops if op.is_comm}
+
+        def bwlat(link) -> tuple[float, float]:
+            return (link.bandwidth, link.latency_s) if link else (0.0, 0.0)
+
+        ar_bw, ar_lat = bwlat(comm.tp_link)
+        a2a_bw, a2a_lat = bwlat(comm.a2a_link)
+        hop_bw, hop_lat = bwlat(comm.p2p_link)
+        return _CommPlan(
+            ar_group=comm.tp,
+            ar_bytes=payload.get("allreduce", 0.0),
+            ar_bw=ar_bw, ar_lat=ar_lat, ar_topo=comm.tp_topology,
+            a2a_group=dep.tp * dep.ep,
+            dispatch_bytes=payload.get("moe_dispatch", 0.0),
+            combine_bytes=payload.get("moe_combine", 0.0),
+            a2a_bw=a2a_bw, a2a_lat=a2a_lat, a2a_topo=comm.a2a_topology,
+            hop_bytes=payload.get("pp_hop", 0.0),
+            hop_bw=hop_bw, hop_lat=hop_lat,
+        )
+
+    def _emit_hop(self, tasks: list[Task], prev: int, s: int,
+                  plan: _CommPlan, label: str) -> int:
+        """A pipeline hop rides the sending chip's (member 0) outbound link,
+        carrying only its bandwidth occupancy; the flight time follows on a
+        per-hop propagation resource so it never occupies the link."""
+        occ = plan.hop_bytes / plan.hop_bw if plan.hop_bw else 0.0
+        prev = collectives._add(tasks, f"s{s}.l0.cw", occ, [prev], label)
+        if plan.hop_lat > 0.0:
+            prev = collectives._add(
+                tasks, f"s{s}.prop_h{len(tasks)}", plan.hop_lat, [prev], label)
+        return prev
+
     # ---- task-graph construction ---------------------------------------------
 
-    def _stage_tasks(self, tasks: list[Task], c: _LayerCosts, s: int,
-                     n_layers_here: int, prev: int | None, tag: str,
+    def _stage_tasks(self, tasks: list[Task], c: _LayerCosts, plan: _CommPlan,
+                     s: int, n_layers_here: int, prev: int | None, tag: str,
                      is_first: bool, is_last: bool) -> int:
-        """Append the serial task chain for one (microbatch, round) passing
-        through stage s; returns the key of its last task."""
+        """Append the task chain for one (microbatch, round) passing through
+        stage s; returns the key of its last task.
 
-        def add(resource: str, duration: float, label: str) -> int:
+        Collectives are expanded to their per-step link transfers (see
+        collectives.py) on the stage's per-member outbound link resources
+        (`s{s}.l{i}.cw` / `.ccw`), which also carry the pipeline hops on
+        member 0 -- so collective/hop contention emerges here rather than
+        being averaged into a lumped `c{s}` fabric."""
+        prefix = f"s{s}"
+
+        def add(resource: str, duration: float, label: str) -> None:
+            nonlocal prev_key
             key = len(tasks)
             deps = [prev_key] if prev_key is not None else []
             tasks.append(Task(key, resource, duration, deps, label))
-            return key
+            prev_key = key
+
+        def allreduce() -> None:
+            nonlocal prev_key
+            prev_key = collectives.allreduce(
+                tasks, prev_key, plan.ar_group, plan.ar_bytes, plan.ar_bw,
+                plan.ar_lat, plan.ar_topo, prefix, f"{tag} ar")
+
+        def all_to_all(payload: float) -> None:
+            nonlocal prev_key
+            prev_key = collectives.all_to_all(
+                tasks, prev_key, plan.a2a_group, payload, plan.a2a_bw,
+                plan.a2a_lat, plan.a2a_topo, prefix, f"{tag} a2a")
 
         prev_key = prev
         if is_first and c.edge:
-            prev_key = add(f"u{s}", 0.0, f"{tag} embed")  # embed cost folded
+            add(f"u{s}", 0.0, f"{tag} embed")  # embed cost folded
         for _ in range(n_layers_here):
-            prev_key = add(f"u{s}", c.attn, f"{tag} attn")
+            add(f"u{s}", c.attn, f"{tag} attn")
             if c.n_allreduce >= 2 and c.allreduce:
-                prev_key = add(f"c{s}", c.allreduce, f"{tag} ar")
+                allreduce()
             if c.dispatch:
-                prev_key = add(f"c{s}", c.dispatch, f"{tag} a2a")
-            prev_key = add(f"u{s}", c.ffn, f"{tag} ffn")
+                all_to_all(plan.dispatch_bytes)
+            add(f"u{s}", c.ffn, f"{tag} ffn")
             if c.combine:
-                prev_key = add(f"c{s}", c.combine, f"{tag} a2a")
+                all_to_all(plan.combine_bytes)
             if c.n_allreduce >= 1 and c.allreduce:
-                prev_key = add(f"c{s}", c.allreduce, f"{tag} ar")
+                allreduce()
         if is_last and c.edge:
-            prev_key = add(f"u{s}", c.edge, f"{tag} head")
+            add(f"u{s}", c.edge, f"{tag} head")
         assert prev_key is not None
         return prev_key
 
     def _decode_wall(
-        self, c: _LayerCosts, dep: Deployment
+        self, c: _LayerCosts, plan: _CommPlan, dep: Deployment
     ) -> tuple[float, list[Task], ScheduleResult]:
         """Steady-state pipeline round period: every microbatch advances one
         token per round."""
@@ -205,17 +298,16 @@ class DESEngine(Engine):
                 prev = tail.get(m)
                 for s in range(pp):
                     last = self._stage_tasks(
-                        tasks, c, s, layers[s], prev, f"r{r}m{m}s{s}",
+                        tasks, c, plan, s, layers[s], prev, f"r{r}m{m}s{s}",
                         is_first=(s == 0), is_last=(s == pp - 1),
                     )
                     token_done[r].append(last) if s == pp - 1 else None
                     if c.hop and pp > 1:
-                        # hop to the next stage (wrap-around feeds the next
-                        # round's first stage)
-                        key = len(tasks)
-                        tasks.append(Task(key, f"h{s}", c.hop, [last],
-                                          f"r{r}m{m}h{s}"))
-                        last = key
+                        # hop to the next stage on the sending chip's (member 0)
+                        # outbound link, so its bandwidth contends with that
+                        # chip's collective sends.  Wrap-around feeds the next
+                        # round.
+                        last = self._emit_hop(tasks, last, s, plan, f"r{r}m{m}h{s}")
                     prev = last
                 tail[m] = prev
         result = schedule(tasks)
@@ -225,7 +317,7 @@ class DESEngine(Engine):
         return wall, tasks, result
 
     def _prefill_wall(
-        self, c: _LayerCosts, dep: Deployment
+        self, c: _LayerCosts, plan: _CommPlan, dep: Deployment
     ) -> tuple[float, list[Task], ScheduleResult]:
         """A single request walks the stages sequentially (no other work in
         flight during TTFT measurement)."""
@@ -234,12 +326,10 @@ class DESEngine(Engine):
         tasks: list[Task] = []
         prev: int | None = None
         for s in range(pp):
-            prev = self._stage_tasks(tasks, c, s, layers[s], prev, f"s{s}",
+            prev = self._stage_tasks(tasks, c, plan, s, layers[s], prev, f"s{s}",
                                      is_first=(s == 0), is_last=(s == pp - 1))
             if c.hop and s < pp - 1:
-                key = len(tasks)
-                tasks.append(Task(key, f"h{s}", c.hop, [prev], f"h{s}"))
-                prev = key
+                prev = self._emit_hop(tasks, prev, s, plan, f"h{s}")
         result = schedule(tasks)
         return result.makespan, tasks, result
 
@@ -280,16 +370,23 @@ class DESEngine(Engine):
         chip = system.node.chip
         timings = [self._roofline.time_op(op, chip, comm) for op in ops]
         costs, op_runs, buckets = self._costs(ops, system, dep, comm)
+        plan = self._comm_plan(ops, dep, comm)
         if name == "decode":
-            wall, tasks, result = self._decode_wall(costs, dep)
+            wall, tasks, result = self._decode_wall(costs, plan, dep)
         else:
-            wall, tasks, result = self._prefill_wall(costs, dep)
+            wall, tasks, result = self._prefill_wall(costs, plan, dep)
         self.last_runs[name] = (tasks, result)
         self.last_op_runs[name] = op_runs
-        resource_busy = result.busy
+        # drop the collective sync tasks (barriers / propagation) from the
+        # reported utilisation: they carry dependency-chain latency, not
+        # physical link occupancy.  They stay in `last_runs`/the trace.
+        resource_busy = {
+            r: b for r, b in result.busy.items()
+            if b > 0.0 and not collectives.is_sync_resource(r)
+        }
         if op_runs:  # graph mode: merge in per-chip resource utilisation
             resource_busy = {
-                **result.busy,
+                **resource_busy,
                 **self._chip_resource_busy(tasks, op_runs, buckets, dep.pp),
             }
         return Phase(name, timings, wall_time=wall,

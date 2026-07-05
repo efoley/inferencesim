@@ -210,3 +210,12 @@ class System:
         if group_size <= self.node.n_chips:
             return self.node.interconnect
         return self.network
+
+    def topology_for_group(self, group_size: int) -> Topology:
+        """Interconnect topology a communication group of `group_size` chips
+        travels over.  Groups that fit inside one node use the node's declared
+        topology; larger groups span the network, which is modelled as
+        all-to-all (a switched fabric -- rail/spine detail is future work)."""
+        if group_size <= self.node.n_chips:
+            return self.node.topology
+        return Topology.ALL_TO_ALL

@@ -18,7 +18,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
-from .hardware import Chip, Link, System
+from .hardware import Chip, Link, System, Topology
 from .ops import Op, OpKind
 from .workload import Deployment
 
@@ -139,6 +139,10 @@ class CommContext:
     tp_link: Link | None  # allreduce: spans the tp group
     a2a_link: Link | None  # MoE all-to-all: spans the tp*ep array
     p2p_link: Link | None  # pipeline hop: crosses stage boundaries
+    # topology of each group's fabric (the discrete-event engine expands
+    # collectives per-step over it; the roofline engine ignores it).
+    tp_topology: Topology = Topology.ALL_TO_ALL
+    a2a_topology: Topology = Topology.ALL_TO_ALL
 
     @classmethod
     def for_deployment(cls, system: System, dep: Deployment) -> "CommContext":
@@ -147,6 +151,8 @@ class CommContext:
             tp_link=system.link_for_group(dep.tp),
             a2a_link=system.link_for_group(dep.tp * dep.ep),
             p2p_link=system.link_for_group(dep.replica_chips),
+            tp_topology=system.topology_for_group(dep.tp),
+            a2a_topology=system.topology_for_group(dep.tp * dep.ep),
         )
 
 
