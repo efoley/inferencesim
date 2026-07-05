@@ -115,10 +115,18 @@ engine needs. Collectives pick the slowest link their group crosses.
 
 ### Workload and lowering
 
-`ModelSpec` covers dense and MoE decoder-only transformers with GQA
-(parameter counts are validated against published totals in the tests). The
-lowering in `ops.py` turns a serving scenario into per-chip `Op` records —
-FLOPs, DRAM bytes, collective bytes — for the two phases:
+`ModelSpec` covers dense and MoE decoder-only transformers with a choice of
+attention: plain **GQA**, **sliding-window** (`swa_window` + `swa_every`, e.g.
+gpt-oss's 128-token window on alternating layers), or **multi-head latent
+attention** (**MLA**, the DeepSeek-V2/V3 compressed-KV cache — also how
+attention-DP serving is done in practice). Windowed layers cap their KV cache
+and decode reads at the window; MLA caches only the shared compressed latent
+(`kv_lora_rank + qk_rope_head_dim` per token per layer), ~2 orders of magnitude
+smaller than an MHA cache and replicated (not sharded) under TP. Parameter
+counts are validated against published totals in the tests — including the
+`deepseek-v3` preset (671B total / 37B active, MoE + MLA). The lowering in
+`ops.py` turns a serving scenario into per-chip `Op` records — FLOPs, DRAM
+bytes, collective bytes — for the two phases:
 
 - **prefill** (one request, compute-bound at speed of light), and
 - **decode** (a batch of sequences, dominated by streaming weights + KV).
@@ -406,4 +414,9 @@ prefill). See `DES_todo.md` §4.
   (`CALIBRATION.md` §8.1). Next: confirm the `[VERIFY]` anchors, refit the tt
   `compute`/`collective` knobs once a compute-bound tt anchor exists, and score
   offline throughput through the interleaving `serve` path.
-- Richer attention variants (MLA, sliding window) and speculative decoding.
+- Richer attention variants (MLA, sliding window) — *landed*: sliding-window
+  attention (`swa_window`/`swa_every`; the `gpt-oss-120b` preset now models its
+  128-token alternating window, cutting KV and decode-attention traffic on half
+  its layers) and MLA (the `deepseek-v3` preset, 671B/37B-active MoE + MLA, with
+  the compressed latent replicated under TP and batch-sharded under EP). Next:
+  speculative decoding.

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from .hardware import Chip, Compute, DType, Link, Memory, Node, System, Topology
 from .units import GB, GIGA, MB, PETA, TB, TERA, US
-from .workload import ModelSpec, MoEConfig
+from .workload import MLAConfig, ModelSpec, MoEConfig
 
 # =============================================================================
 # Chips
@@ -271,11 +271,43 @@ QWEN3_32B = ModelSpec(
     d_ff=25600, vocab_size=151936,
 )
 
+# GPT-OSS-120B uses a 128-token sliding window on alternating layers: the
+# published config.json (openai/gpt-oss-120b) sets sliding_window=128 with
+# layer_types alternating "sliding_attention"/"full_attention" across the 36
+# layers (18 windowed + 18 dense).  Modelling this cuts the KV cache and decode
+# attention traffic on half the layers -- ignoring it over-counts both.
+# Source: https://huggingface.co/openai/gpt-oss-120b/blob/main/config.json
+# (num_hidden_layers 36, hidden_size 2880, num_attention_heads 64,
+#  num_key_value_heads 8, head_dim 64, sliding_window 128, num_local_experts
+#  128, num_experts_per_tok 4; retrieved 2026-07-05).
 GPT_OSS_120B = ModelSpec(
     name="gpt-oss-120b",
     n_layers=36, d_model=2880, n_heads=64, n_kv_heads=8, d_head=64,
     d_ff=2880, vocab_size=201088,
     moe=MoEConfig(n_experts=128, top_k=4, d_ff_expert=2880),
+    swa_window=128, swa_every=2,  # every other layer is windowed (gpt-oss)
+)
+
+# DeepSeek-V3: 671B-total / 37B-active MoE with multi-head latent attention.
+# From the published config.json (deepseek-ai/DeepSeek-V3): num_hidden_layers
+# 61, hidden_size 7168, num_attention_heads 128 (full MHA, no GQA), MLA dims
+# q_lora_rank 1536 / kv_lora_rank 512 / qk_nope_head_dim 128 / qk_rope_head_dim
+# 64 / v_head_dim 128; MoE n_routed_experts 256, num_experts_per_tok 8,
+# n_shared_experts 1, moe_intermediate_size 2048; first_k_dense_replace 3 dense
+# layers of intermediate_size 18432; vocab_size 129280 (untied embeddings).
+# Approximations: the 3 dense-prefix layers are modelled as dense for param
+# counting/memory (n_dense_layers) but as MoE in the op lowering; MTP is
+# omitted.  Validated to 671B total / 37B active.  d_head/n_kv_heads below are
+# placeholders (MLA overrides every attention path).
+# Source: https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json
+DEEPSEEK_V3 = ModelSpec(
+    name="deepseek-v3",
+    n_layers=61, d_model=7168, n_heads=128, n_kv_heads=128, d_head=128,
+    d_ff=18432, vocab_size=129280,
+    moe=MoEConfig(n_experts=256, top_k=8, d_ff_expert=2048, d_ff_shared=2048,
+                  n_dense_layers=3),
+    mla=MLAConfig(kv_lora_rank=512, qk_rope_head_dim=64, qk_nope_head_dim=128,
+                  v_head_dim=128, q_lora_rank=1536),
 )
 
 MODELS: dict[str, ModelSpec] = {
@@ -283,4 +315,5 @@ MODELS: dict[str, ModelSpec] = {
     "llama-3.1-70b": LLAMA_3_1_70B,
     "qwen3-32b": QWEN3_32B,
     "gpt-oss-120b": GPT_OSS_120B,
+    "deepseek-v3": DEEPSEEK_V3,
 }

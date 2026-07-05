@@ -99,14 +99,32 @@ def _kv_heads_per_chip(model: ModelSpec, tp: int) -> float:
 
 
 def kv_cache_bytes_per_chip(model: ModelSpec, n_tokens: float, dep: Deployment) -> float:
-    """KV bytes per chip for n_tokens total cached tokens in the replica.
+    """KV bytes per chip for ONE sequence holding `n_tokens` of context (the
+    per-sequence footprint; callers multiply by the batch).
 
     A chip stores its pipeline stage's layers (1/pp) for its attention
-    group's sequences (1/ep for MoE, 1/adp for dense attention-DP), sharded
-    across kv heads (up to n_kv ways).  The batch-sharding by ep/adp is the
-    point of those patterns: it cuts per-chip KV by the group degree.
+    group's sequences (1/ep for MoE, 1/adp for dense attention-DP).  The
+    batch-sharding by ep/adp is the point of those patterns: it cuts per-chip
+    KV by the group degree.
+
+    Attention variants:
+      * GQA: sharded across kv heads (up to n_kv ways); linear in n_tokens.
+      * MLA: only the shared compressed latent (kv_lora_rank + qk_rope_head_dim)
+        is cached, replicated across the tp group (it is tiny), so per-chip KV
+        does NOT divide by tp -- only by pp*ep*adp.
+      * SWA: windowed layers cap at `swa_window` tokens (a ring buffer), so the
+        footprint is sub-linear once the window saturates.
     """
+    groups = dep.pp * dep.ep * dep.adp
+    if model.mla is not None:
+        # compressed latent, shared across heads AND replicated across tp
+        per_token = model.n_layers * model.mla.latent_dim * dep.kv_dtype.bytes
+        return per_token * n_tokens / groups
     per_layer = 2 * _kv_heads_per_chip(model, dep.tp) * model.d_head * dep.kv_dtype.bytes
+    swa = model.n_swa_layers
+    if swa:
+        cached = model.n_full_attn_layers * n_tokens + swa * min(n_tokens, model.swa_window)
+        return per_layer * cached / groups
     return model.n_layers * per_layer * n_tokens / (dep.pp * dep.ep * dep.adp)
 
 
@@ -142,9 +160,35 @@ def _linear(
     )
 
 
+def _attention_ops(model: ModelSpec, n_seq: float, q_len: float, kv_len: float,
+                   causal_new: bool, dep: Deployment, count: int) -> list[Op]:
+    """Self-attention over the KV cache, lowered to one or more Ops.
+
+    * GQA (default): a single `attention` op (count = all layers).
+    * MLA: a single `attention` op that streams the shared compressed latent.
+    * SWA: the layers split by class, so their heterogeneous costs are honest --
+      an `attention` op over the `n_full_attn_layers` dense layers plus an
+      `attention_swa` op over the `n_swa_layers` windowed layers (which read and
+      score only the last `swa_window` cached tokens).  Both keep category
+      `attention`, so the DES/serve cost paths bucket and recost them together.
+    """
+    if model.mla is not None:
+        return [_mla_attention(model, n_seq, q_len, kv_len, causal_new, dep, count)]
+    swa = model.n_swa_layers
+    if not swa:
+        return [_attention(model, n_seq, q_len, kv_len, causal_new, dep, count)]
+    ops: list[Op] = []
+    full = model.n_full_attn_layers
+    if full:
+        ops.append(_attention(model, n_seq, q_len, kv_len, causal_new, dep, full))
+    ops.append(_swa_attention(model, n_seq, q_len, kv_len, causal_new, dep, swa))
+    return ops
+
+
 def _attention(model: ModelSpec, n_seq: float, q_len: float, kv_len: float,
-               causal_new: bool, dep: Deployment, count: int) -> Op:
-    """Self-attention over the KV cache for n_seq sequences.
+               causal_new: bool, dep: Deployment, count: int,
+               name: str = "attention") -> Op:
+    """Full-context GQA self-attention for n_seq sequences.
 
     q_len queries attend to kv_len cached tokens each; causal_new halves the
     score work (prefill attends triangularly to its own tokens)."""
@@ -152,7 +196,7 @@ def _attention(model: ModelSpec, n_seq: float, q_len: float, kv_len: float,
     heads = model.n_heads / dep.tp
     frac = 0.5 if causal_new else 1.0
     return Op(
-        name="attention",
+        name=name,
         kind=OpKind.COMPUTE,
         dtype=dep.act_dtype,
         category="attention",
@@ -162,6 +206,84 @@ def _attention(model: ModelSpec, n_seq: float, q_len: float, kv_len: float,
         # speed-of-light flash attention: stream K,V once; append new K,V
         dram_read=n_seq * kv_len * 2 * kvh * model.d_head * dep.kv_dtype.bytes,
         dram_write=n_seq * q_len * 2 * kvh * model.d_head * dep.kv_dtype.bytes,
+    )
+
+
+def _swa_attention(model: ModelSpec, n_seq: float, q_len: float, kv_len: float,
+                   causal_new: bool, dep: Deployment, count: int) -> Op:
+    """Sliding-window GQA self-attention over the windowed layers.
+
+    Decode / chunk (causal_new=False): each query attends only to the last
+    W = swa_window cached tokens, so both the score work and the KV DRAM read
+    stream min(kv_len, W) tokens instead of kv_len -- the decode win.
+
+    Prefill (causal_new=True, q_len == kv_len == S): the causal score matrix is
+    *banded*.  Position i attends to min(i+1, W) keys, so the number of score
+    entries is sum_i min(i+1, W) = S^2/2 - max(0, S-W)^2/2, which is the full
+    triangle S^2/2 when S <= W and S*W - W^2/2 when S >= W (dropping the +S/2
+    diagonal, consistent with the dense op's frac=0.5).  Each K,V is still
+    streamed once (every cached token lies in some query's band), so the DRAM
+    read matches the dense prefill -- the prefill win is in FLOPs, not bytes."""
+    W = model.swa_window
+    kvh = _kv_heads_per_chip(model, dep.tp)
+    heads = model.n_heads / dep.tp
+    if causal_new:
+        excess = max(0.0, q_len - W)
+        score_pairs = 0.5 * (q_len * q_len - excess * excess)
+        kv_tokens = kv_len
+    else:
+        eff = min(kv_len, W)
+        score_pairs = q_len * eff
+        kv_tokens = eff
+    return Op(
+        name="attention_swa",
+        kind=OpKind.COMPUTE,
+        dtype=dep.act_dtype,
+        category="attention",
+        count=count,
+        flops=n_seq * heads * 2 * 2.0 * score_pairs * model.d_head,
+        dram_read=n_seq * kv_tokens * 2 * kvh * model.d_head * dep.kv_dtype.bytes,
+        dram_write=n_seq * q_len * 2 * kvh * model.d_head * dep.kv_dtype.bytes,
+    )
+
+
+def _mla_attention(model: ModelSpec, n_seq: float, q_len: float, kv_len: float,
+                   causal_new: bool, dep: Deployment, count: int) -> Op:
+    """Multi-head latent attention (DeepSeek-V2/V3).
+
+    The KV cache is the shared compressed latent (kv_lora_rank + qk_rope_head_dim
+    per token per layer), streamed ONCE per step regardless of head count -- that
+    single small read is the MLA memory win.  It is replicated across the tp
+    group (tiny), so the DRAM read does not divide by tp; only the FLOPs (which
+    shard with the heads) do.
+
+    Decode FLOPs use the absorbed-weight inference form (DeepSeek-V2 paper,
+    arXiv:2405.04434, §"absorbing" the up-projections into Q/O): per cached
+    position per head, the score q.[c^{KV};k^R] costs (d_c + d_R) MACs and the
+    value softmax.c^{KV} costs d_c MACs, i.e. 2*d_c + d_R MACs/position/head.
+    Prefill uses the naive decompressed form instead (the absorbed matrices are
+    huge for long q, so real stacks decompress during prefill): per (query,key)
+    pair per head, QK^T over qk_head_dim + PV over v_head_dim.  Simplifications:
+    the small Q/KV down/up projections are folded into qkv_proj (a GEMM), and the
+    RoPE application is free at speed-of-light."""
+    m = model.mla
+    assert m is not None
+    heads = model.n_heads / dep.tp
+    frac = 0.5 if causal_new else 1.0
+    if q_len == 1:  # decode: absorbed weights, score + value against the latent
+        per_pos = 2 * m.kv_lora_rank + m.qk_rope_head_dim
+    else:  # prefill / chunk: decompressed per-head attention
+        per_pos = m.qk_head_dim + m.v_head_dim
+    latent = m.latent_dim
+    return Op(
+        name="attention",
+        kind=OpKind.COMPUTE,
+        dtype=dep.act_dtype,
+        category="attention",
+        count=count,
+        flops=n_seq * heads * 2.0 * q_len * kv_len * frac * per_pos,
+        dram_read=n_seq * kv_len * latent * dep.kv_dtype.bytes,
+        dram_write=n_seq * q_len * latent * dep.kv_dtype.bytes,
     )
 
 
@@ -336,10 +458,10 @@ def decode_ops(model: ModelSpec, dep: Deployment, batch: float, ctx: float) -> l
 
     ops: list[Op] = [
         _linear("qkv_proj", b_att, model.attn_qkv_params, model.d_model,
-                (model.n_heads + 2 * model.n_kv_heads) * model.d_head, dep, count=L),
-        decode_attention_op(model, dep, batch, ctx),
+                model.qkv_proj_out_dim, dep, count=L),
+        *decode_attention_ops(model, dep, batch, ctx),
         _linear("out_proj", b_att, model.attn_out_params,
-                model.n_heads * model.d_head, model.d_model, dep, count=L),
+                model.out_proj_in_dim, model.d_model, dep, count=L),
         *_ffn_ops(model, tokens_per_group=b_att, tokens_total=b_tok, dep=dep, count=L),
         _allreduce(b_att, model, dep, count=_allreduces_per_layer(model, dep) * L),
         # pp hops per round: pp-1 forward plus the wrap-around to start the
@@ -350,15 +472,17 @@ def decode_ops(model: ModelSpec, dep: Deployment, batch: float, ctx: float) -> l
     return ops
 
 
-def decode_attention_op(model: ModelSpec, dep: Deployment, batch: float, ctx: float) -> Op:
-    """The single self-attention op of one decode iteration: `batch` sequences
-    each emit one token attending to `ctx` cached tokens.  Its flops and KV
-    bytes are linear in `batch * ctx` (= the total context streamed this step),
-    so a serving loop can recost just this op as the KV cache grows while the
-    rest of the decode step stays fixed for a given batch size."""
+def decode_attention_ops(model: ModelSpec, dep: Deployment, batch: float,
+                         ctx: float) -> list[Op]:
+    """The self-attention op(s) of one decode iteration: `batch` sequences each
+    emit one token attending to `ctx` cached tokens.  Their flops and KV bytes
+    are (piecewise) linear in the total context streamed this step, so a serving
+    loop can recost just these ops as the KV cache grows while the rest of the
+    decode step stays fixed for a given batch size.  Usually one op; SWA models
+    return two (full-context + windowed layer classes), MLA one (compressed)."""
     b_att = batch / (dep.pp * dep.ep * dep.adp)  # sequences per attention group
-    return _attention(model, n_seq=b_att, q_len=1, kv_len=ctx, causal_new=False,
-                      dep=dep, count=model.n_layers)
+    return _attention_ops(model, n_seq=b_att, q_len=1, kv_len=ctx, causal_new=False,
+                          dep=dep, count=model.n_layers)
 
 
 def decode_step_ops(model: ModelSpec, scen: Scenario, dep: Deployment) -> list[Op]:
@@ -377,11 +501,11 @@ def prefill_ops(model: ModelSpec, n_prompt_tokens: int, dep: Deployment) -> list
 
     ops: list[Op] = [
         _linear("qkv_proj", S, model.attn_qkv_params, model.d_model,
-                (model.n_heads + 2 * model.n_kv_heads) * model.d_head, dep, count=L),
-        _attention(model, n_seq=1, q_len=S, kv_len=S, causal_new=True,
-                   dep=dep, count=L),
+                model.qkv_proj_out_dim, dep, count=L),
+        *_attention_ops(model, n_seq=1, q_len=S, kv_len=S, causal_new=True,
+                        dep=dep, count=L),
         _linear("out_proj", S, model.attn_out_params,
-                model.n_heads * model.d_head, model.d_model, dep, count=L),
+                model.out_proj_in_dim, model.d_model, dep, count=L),
         *_ffn_ops(model, tokens_per_group=S, tokens_total=S, dep=dep, count=L),
         _allreduce(S, model, dep, count=_allreduces_per_layer(model, dep) * L),
         *_pipeline_hops(S, model, dep, count=dep.pp - 1),
@@ -413,11 +537,11 @@ def prefill_chunk_ops(model: ModelSpec, dep: Deployment, chunk: int,
     edge = _embed_and_head(model, tokens_in=chunk, tokens_out=1, dep=dep, count=1)
     ops: list[Op] = [
         _linear("qkv_proj", chunk, model.attn_qkv_params, model.d_model,
-                (model.n_heads + 2 * model.n_kv_heads) * model.d_head, dep, count=L),
-        _attention(model, n_seq=1, q_len=chunk, kv_len=kv_len, causal_new=False,
-                   dep=dep, count=L),
+                model.qkv_proj_out_dim, dep, count=L),
+        *_attention_ops(model, n_seq=1, q_len=chunk, kv_len=kv_len, causal_new=False,
+                        dep=dep, count=L),
         _linear("out_proj", chunk, model.attn_out_params,
-                model.n_heads * model.d_head, model.d_model, dep, count=L),
+                model.out_proj_in_dim, model.d_model, dep, count=L),
         *_ffn_ops(model, tokens_per_group=chunk, tokens_total=chunk, dep=dep, count=L),
         _allreduce(chunk, model, dep, count=_allreduces_per_layer(model, dep) * L),
         *_pipeline_hops(chunk, model, dep, count=dep.pp - 1),

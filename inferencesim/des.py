@@ -116,7 +116,7 @@ class _CommPlan:
     hop_lat: float = 0.0
 
 
-_ATTN_OPS = {"qkv_proj", "attention", "out_proj"}
+_ATTN_OPS = {"qkv_proj", "attention", "attention_swa", "out_proj"}
 _FFN_OPS = {"ffn", "moe_routed", "moe_shared"}
 _EDGE_OPS = {"embed", "lm_head"}
 
@@ -229,7 +229,15 @@ class DESEngine(Engine):
         c = _LayerCosts()
         for op in ops:
             if op.name in _ATTN_OPS:
-                c.attn += one(op)
+                if op.category == "attention":
+                    # the attention op may be split into per-layer classes with
+                    # distinct counts (SWA: full + windowed layers); charge each
+                    # its share of the per-layer cost so the sum over the stage's
+                    # layers is exact (qkv_proj -- always first -- has set
+                    # n_layers by now).
+                    c.attn += one(op) * op.count / max(c.n_layers, 1)
+                else:
+                    c.attn += one(op)
                 buckets[op.name] = "attn"
                 if op.name == "qkv_proj":
                     c.n_layers = op.count

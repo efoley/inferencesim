@@ -208,8 +208,10 @@ the same ranks. `DEPn` maps **exactly** to `tp=1, ep=n` in this simulator
 dispatch/combine all-to-alls, zero-cost tp=1 attention allreduce — validated in
 `tests/test_dep.py` and documented in the README Parallelism section). Encoded
 as `dgxh100-gptoss-trtllm-dep4-1k1k`: MXFP4, 1000/1000, **4,685 tok/s/GPU** ×8
-GPUs (dp=2 × ep4) = **37,480 system-total**, sol **1.64×** / typical **0.95×**
-(a clean mixed cross-check). **[VERIFY]** the per-GPU figure against a pinned
+GPUs (dp=2 × ep4) = **37,480 system-total**, sol **1.74×** / typical **1.02×**
+(a clean mixed cross-check; **the preset now models gpt-oss's 128-token
+sliding-window on alternating layers, which raised both ratios from 1.64×/0.95×**).
+**[VERIFY]** the per-GPU figure against a pinned
 TRT-LLM commit; DEP4 additionally uses EPLB redundant-expert load balancing that
 `tp=1, ep=4` does not model.
 
@@ -296,18 +298,28 @@ ShareGPT ~2,352.82; TRT-LLM FP8 2000/100 → 5,902.
 | dgxh100-llama70b-trtllm-tp2-1k1k | mixed | output_tok_s | 17,672 | 1.34 | 0.77 | 0.77 | cross-check |
 | dgxh100-llama70b-trtllm-tp2-8k1k | prefill | output_tok_s | 3,184 | 1.66 | 0.97 | 0.97 | **compute** |
 | dgxh100-llama70b-mlperf41-offline | mixed | decode_ceil_tok_s | 24,525 | 1.09 | 0.73 | 0.73 | cross-check |
-| dgxh100-gptoss-trtllm-dep4-1k1k | mixed | output_tok_s | 37,480 | 1.64 | 0.95 | 0.95 | cross-check (DEP4 mapping) |
-| gb300-gptoss-mlperf60-offline | mixed | output_tok_s | 1,046,150 | 1.01 | 0.56 | 0.56 | coarse (excl.) |
+| dgxh100-gptoss-trtllm-dep4-1k1k | mixed | output_tok_s | 37,480 | 1.74 | 1.02 | 1.02 | cross-check (DEP4 mapping) |
+| gb300-gptoss-mlperf60-offline | mixed | output_tok_s | 1,046,150 | 1.07 | 0.59 | 0.59 | coarse (excl.) |
 | gb300-llama8b-mlperf51-offline | mixed | output_tok_s | 1,322,640 | 3.39 | 1.79 | 1.79 | coarse (excl.) |
 | qb2-qwen32b-ttmetal-b32 | mixed | output_tok_s | 691 | 1.57 | 0.96 | **0.72** | cross-check (tt) |
 | qb2-qwen32b-ttmetal-decode | decode | tpot_ms | 46.3 | 2.42 | 1.41 | **1.02** | **memory (tt)** |
 | spark-llama8b-lmsys-decode | decode | tpot_ms | 48.78 | 1.76 | 1.00 | 1.00 | **memory (nv)** |
 | spark-llama8b-lmsys-b32 | mixed | output_tok_s | 368 | 1.16 | 0.66 | 0.66 | cross-check |
 
-**sol:** median **1.60×**, range [1.01×, 3.39×] — every anchor optimistic (the
-invariant holds; a test enforces it). **typical (global):** median **0.96×**,
-range [0.56×, 1.79×] — brackets 1. **auto (per-vendor):** median **0.88×**, range
-[0.56×, 1.79×]. Under `auto` every NVIDIA row is **identical to `typical`**
+**sol:** median **1.61×**, range [1.07×, 3.39×] — every anchor optimistic (the
+invariant holds; a test enforces it). **typical (global):** median **0.97×**,
+range [0.59×, 1.79×] — brackets 1. **auto (per-vendor):** median **0.89×**, range
+[0.59×, 1.79×].
+
+**Both gpt-oss anchors moved when the preset was corrected to model its 128-token
+sliding window on alternating layers** (§4, §6.3): the windowed layers cut decode
+KV traffic on half the model, so simulated throughput rose and the optimism ratios
+climbed — `dgxh100-gptoss-trtllm-dep4-1k1k` **sol 1.64× → 1.74×, typical/auto
+0.95× → 1.02×**, and `gb300-gptoss-mlperf60-offline` **sol 1.01× → 1.07×,
+typical/auto 0.56× → 0.59×**. Profiles were **not** refitted: the fit is driven by
+the single-node llama/spark prefill+decode probes (`2k128`, `tp2-8k1k`,
+`spark-decode`), which are unchanged, and both gpt-oss rows are cross-checks /
+coarse (excluded), so the knobs stay put. Under `auto` every NVIDIA row is **identical to `typical`**
 (`typical-nv` == `typical`); the two Tenstorrent rows move: the decode/memory
 anchor `qb2-qwen32b-ttmetal-decode` goes **1.41× → 1.02×** (the residual the
 per-vendor profile exists to fix — see §8.1), while the mixed cross-check
@@ -339,7 +351,7 @@ overhead 1.5 µs ∈ [1, 10] ✓. The clean single-node probes (`2k128`, `tp2-8k
   peak). **This is now fixed by the per-vendor `typical-tt` profile (§8.1): the
   anchor brackets 1 at 1.02× under `auto`.** The global `typical` keeps the
   residual by design (it is not refitted).
-- `gb300-gptoss` 0.56× and `gb300-llama8b` 1.79× — rack-scale MLPerf runs whose
+- `gb300-gptoss` 0.59× and `gb300-llama8b` 1.79× — rack-scale MLPerf runs whose
   Dynamo *disaggregated* serving architecture our aggregated `simulate` path
   cannot express (unknown pool split / parallelism / ISL–OSL). The architecture
   itself is now expressible (`serve --disagg`, §Serving in the README), so a

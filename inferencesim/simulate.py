@@ -29,14 +29,25 @@ def weight_bytes_per_chip(model: ModelSpec, dep: Deployment) -> float:
         layer_replicated = model.attn_params  # replicated across adp groups
         layer_ffn = model.ffn_params_total  # dense FFN shards over tp*adp
         ffn_denom = dep.tp * dep.adp * dep.pp
-    else:
-        layer_replicated = model.attn_params + model.shared_expert_params
-        layer_ffn = model.moe.n_experts * model.expert_params  # shards over tp*ep
-        ffn_denom = dep.tp * dep.ep * dep.pp
+        params = (
+            model.embedding_params / dep.tp
+            + model.n_layers * layer_replicated / (dep.tp * dep.pp)
+            + model.n_layers * layer_ffn / ffn_denom
+        )
+        return params * dep.weight_dtype.bytes
+    # MoE: attention + shared expert replicated across ep groups (tp*pp), the
+    # expert bank sharded over the whole tp*ep array.  A DeepSeek-style
+    # `n_dense_layers` prefix carries plain dense FFNs (width d_ff) instead of
+    # experts -- those shard over tp and replicate across ep, like attention.
+    nd = model.moe.n_dense_layers
+    moe_layers = model.n_layers - nd
+    experts_bank = model.moe.n_experts * model.expert_params
     params = (
         model.embedding_params / dep.tp
-        + model.n_layers * layer_replicated / (dep.tp * dep.pp)
-        + model.n_layers * layer_ffn / ffn_denom
+        + model.n_layers * model.attn_params / (dep.tp * dep.pp)
+        + moe_layers * model.shared_expert_params / (dep.tp * dep.pp)
+        + moe_layers * experts_bank / (dep.tp * dep.ep * dep.pp)
+        + nd * model._dense_ffn_params / (dep.tp * dep.pp)
     )
     return params * dep.weight_dtype.bytes
 
