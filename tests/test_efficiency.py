@@ -11,8 +11,11 @@ The governing invariants:
     expanded collectives and per-op overhead.
 """
 
+from statistics import median
+
 import pytest
 
+from inferencesim.calibration import ANCHORS, Anchor, optimism_ratio, run_anchor
 from inferencesim.des import DESEngine
 from inferencesim.efficiency import PROFILES, Efficiency
 from inferencesim.engine import CommContext, RooflineEngine, ring_allreduce_time
@@ -211,3 +214,52 @@ def test_profiles_present_and_sol_is_identity():
     typ = PROFILES["typical"]
     assert 0.0 < typ.compute <= 1.0 and 0.0 < typ.memory <= 1.0
     assert 0.0 < typ.collective <= 1.0 and typ.op_overhead_s >= 0.0
+
+
+# ---- calibration anchors ----------------------------------------------------
+
+
+def test_every_anchor_resolves_and_runs():
+    """Every ANCHOR's hardware/model keys resolve and run_anchor executes,
+    returning a positive simulated value, its measured value, and a finite
+    positive optimism ratio."""
+    assert ANCHORS  # the set is populated
+    for a in ANCHORS:
+        simulated, measured, ratio = run_anchor(a, Efficiency())
+        assert simulated > 0, a.name
+        assert measured == a.measured > 0, a.name
+        assert ratio == ratio and ratio > 0, a.name  # finite (not NaN), positive
+
+
+def test_sol_is_optimistic_for_every_anchor():
+    """The roofline is an upper bound: at `sol` every anchor's optimism ratio
+    must be >= ~1.  A sub-1 sol ratio is a preset/spec or unit error, not a fit
+    target -- this guards the calibration invariant."""
+    for a in ANCHORS:
+        _, _, ratio = run_anchor(a, PROFILES["sol"])
+        assert ratio >= 0.95, f"{a.name}: sol optimism {ratio:.2f}x < 1 (investigate)"
+    ratios = [run_anchor(a, PROFILES["sol"])[2] for a in ANCHORS]
+    assert median(ratios) > 1.2  # aggregate optimism is robustly > 1
+
+
+def test_typical_brackets_one():
+    """The fitted `typical` profile brings the optimism ratios to bracket 1."""
+    ratios = [run_anchor(a, PROFILES["typical"])[2] for a in ANCHORS]
+    assert 0.8 <= median(ratios) <= 1.2
+
+
+def test_optimism_ratio_inverts_for_latency_metrics():
+    """A faster (lower) simulated latency reads as optimistic (>1); a higher
+    simulated throughput reads as optimistic (>1)."""
+    assert optimism_ratio(200.0, 100.0, "output_tok_s") == pytest.approx(2.0)
+    assert optimism_ratio(50.0, 100.0, "tpot_ms") == pytest.approx(2.0)  # sim faster
+    assert optimism_ratio(200.0, 100.0, "tpot_ms") == pytest.approx(0.5)  # sim slower
+
+
+def test_anchor_validation_rejects_bad_metric_and_regime():
+    with pytest.raises(ValueError):
+        Anchor(name="x", hardware_key="h100", model_key="llama-3.1-8b",
+               metric="bogus", measured=1.0, source="")
+    with pytest.raises(ValueError):
+        Anchor(name="x", hardware_key="h100", model_key="llama-3.1-8b",
+               metric="tpot_ms", measured=1.0, source="", regime="bogus")

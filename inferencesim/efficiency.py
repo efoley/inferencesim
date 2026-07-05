@@ -61,23 +61,29 @@ class Efficiency:
 # Named profiles.  `sol` is the identity (leaves the roofline untouched);
 # `typical` derates toward measured reality.
 #
-# TODO(calibration): the `typical` numbers below are *provisional placeholders*,
-# not fitted values.  They await the measured-anchor fit tracked in
-# calibration.py / CALIBRATION.md (MLPerf + vendor benchmarks) and WILL be
-# updated before this ships.  They are deliberately round, defensible ballparks
-# for modern accelerators running well-optimised LLM inference:
-#   compute 0.80    -- decode is rarely compute-bound; prefill GEMMs hit
-#                      ~0.6-0.85 MFU on tuned stacks.
-#   memory  0.80    -- achievable HBM/GDDR streaming bandwidth vs the datasheet
-#                      peak (memory-bound decode lives here).
-#   collective 0.75 -- NCCL/RCCL bus-bandwidth efficiency for allreduce/a2a.
-#   op_overhead 5us -- per-kernel launch/dispatch on the critical path.
+# `typical` is FITTED against the measured anchors in calibration.py by the
+# transparent recipe documented in CALIBRATION.md section 7 (retrieved
+# 2026-07-05).  It is a COARSE single global profile over a small, partly-proxy
+# anchor set -- refine it as anchors are confirmed/added:
+#   compute 0.58    -- 1/median(sol optimism ratios of the prefill-bound anchors
+#                      h100-llama8b-2k128 1.76x, dgxh100-70b-tp2-8k1k 1.66x);
+#                      top of the ~0.30-0.58 inference-prefill MFU band.
+#   memory  0.57    -- 1/1.76, the clean tp=1 batch-1 decode probe
+#                      (spark-llama8b-lmsys-decode); inside Databricks' ~0.55-0.70
+#                      decode-MBU band.
+#   collective 0.85 -- literature, NOT anchor-fitted (NCCL allreduce ~0.70-0.80
+#                      of line rate without SHARP, 0.90+ with).
+#   op_overhead 1.5us -- CUDA Graphs recover ~20% of a batch-1 decode step
+#                      (arXiv:2605.30571); effective per-op launch under batching.
+# Fitted ratios bracket 1 (median 0.96x); the clean single-node probes land at
+# ~1.0.  Per-vendor profiles (Tenstorrent runs lower -- QuietBox decode residual
+# ~1.4x under this global fit) are future work.
 PROFILES: dict[str, Efficiency] = {
     "sol": Efficiency(),
     "typical": Efficiency(
-        compute=0.80,
-        memory=0.80,
-        collective=0.75,
-        op_overhead_s=5e-6,
+        compute=0.58,
+        memory=0.57,
+        collective=0.85,
+        op_overhead_s=1.5e-6,
     ),
 }

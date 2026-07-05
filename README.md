@@ -281,9 +281,11 @@ serving numbers.
   To derate toward measured reality, pass `--efficiency typical`, which scales
   peak compute/memory/collective bandwidth and adds a per-op launch overhead
   (an `Efficiency`); the same knobs are available piecemeal (`--eff-compute`,
-  `--eff-memory`, `--eff-collective`, `--op-overhead-s`). **The `typical`
-  numbers are provisional placeholders** awaiting a fit against measured
-  anchors (see below); until then they are round ballparks, not calibrated.
+  `--eff-memory`, `--eff-collective`, `--op-overhead-s`). The `typical` profile
+  is **fitted (coarse)** against measured anchors — `inferencesim calibrate`
+  scores the simulator against them and the fit is documented in
+  `CALIBRATION.md`. It is one global profile over a small, partly-proxy anchor
+  set; expect it to move as anchors are confirmed and per-vendor profiles land.
 
   ```bash
   inferencesim run --hardware gb300-nvl72 --model llama-3.1-70b \
@@ -301,10 +303,13 @@ serving numbers.
   edges with latencies, nesting for abstraction levels).
 - Multi-rack topologies (rail-optimized Ethernet/IB); prefill/decode
   disaggregation; MoE expert load imbalance.
+- Explicit attention-DP + expert-parallel (TRT-LLM `DEPn`) deployments — today
+  such benchmark points are compared against `tp=1, ep=n` as an approximation.
 - **Efficiency factors calibrated against measured benchmarks** (MLPerf,
-  vendor numbers) to bracket roofline optimism — *in progress*: the mechanism
-  has landed (`Efficiency`, `--efficiency`, `inferencesim calibrate`, the
-  `calibration.py` anchor harness), and the measured anchors are being fitted
-  (research tracked in `CALIBRATION.md`); the `typical` profile ships with
-  provisional placeholders until then.
+  vendor numbers) to bracket roofline optimism — *mechanism landed, coarse fit
+  landed, refinement ongoing*: `Efficiency`, `--efficiency`, `inferencesim
+  calibrate`, and the `calibration.py` anchor harness are in; `typical` is
+  fitted against 11 sourced anchors (`CALIBRATION.md`). Next: confirm the
+  `[VERIFY]` anchors, add per-vendor profiles (Tenstorrent runs lower), and
+  score offline throughput through the interleaving `serve` path.
 - Richer attention variants (MLA, sliding window) and speculative decoding.
