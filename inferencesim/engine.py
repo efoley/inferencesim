@@ -16,8 +16,9 @@ channels, NoC hops, SRAM banks, links).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
+from .efficiency import Efficiency
 from .hardware import Chip, Link, System, Topology
 from .ops import Op, OpKind
 from .workload import Deployment
@@ -163,29 +164,60 @@ class Engine(ABC):
     ) -> Phase: ...
 
 
+def _scaled_link(link: Link, factor: float) -> Link:
+    """A copy of `link` with its bandwidth derated by `factor` (the collective
+    efficiency).  Only the bandwidth is touched -- `latency_s` is physical
+    flight time and must not be scaled -- so it feeds directly into the ring /
+    a2a closed forms, which read `link.bandwidth` for the occupancy term and
+    `link.latency_s` for the (unscaled) latency term.  At factor 1.0 the copy
+    carries an identical bandwidth value, so the result is bit-identical."""
+    return replace(link, bandwidth=link.bandwidth * factor)
+
+
 class RooflineEngine(Engine):
-    """Speed-of-light timing: t(op) = max(flops/peak, bytes/eff_bw)."""
+    """Speed-of-light timing: t(op) = max(flops/peak, bytes/eff_bw).
+
+    An `Efficiency` derates each peak (compute FLOP/s, memory bandwidth,
+    collective link bandwidth) and adds a fixed per-op-instance overhead.  The
+    default `Efficiency()` is the identity, so a bare `RooflineEngine()` is
+    byte-for-byte the historical speed-of-light engine.
+    """
+
+    def __init__(self, efficiency: Efficiency = Efficiency()) -> None:
+        self.efficiency = efficiency
 
     def time_op(self, op: Op, chip: Chip, comm: CommContext) -> OpTiming:
+        eff = self.efficiency
         if op.kind is OpKind.ALLREDUCE:
             one = (
-                ring_allreduce_time(op.comm_bytes, comm.tp, comm.tp_link)
+                ring_allreduce_time(
+                    op.comm_bytes, comm.tp, _scaled_link(comm.tp_link, eff.collective)
+                )
                 if comm.tp > 1
                 else 0.0
             )
+            one += eff.op_overhead_s
             return OpTiming(op, op.count * one, 0.0, 0.0, op.count * one)
         if op.kind in (OpKind.ALLTOALL, OpKind.P2P):
             link = comm.a2a_link if op.kind is OpKind.ALLTOALL else comm.p2p_link
             if link is None:
                 raise ValueError(f"{op.name}: no link available for {op.kind.value}")
-            # speed of light: payload streams at line rate after one latency
-            one = op.comm_bytes / link.bandwidth + link.latency_s
+            # speed of light: payload streams at (derated) line rate after one
+            # latency; the collective efficiency scales bandwidth, not latency.
+            one = op.comm_bytes / (link.bandwidth * eff.collective) + link.latency_s
+            one += eff.op_overhead_s
             return OpTiming(op, op.count * one, 0.0, 0.0, op.count * one)
 
-        compute_t = op.flops / chip.compute.flops(op.dtype) if op.flops else 0.0
+        compute_t = (
+            op.flops / (chip.compute.flops(op.dtype) * eff.compute) if op.flops else 0.0
+        )
         bytes_moved = op.dram_read + op.dram_write
-        mem_t = bytes_moved / chip.effective_dram_bandwidth if bytes_moved else 0.0
-        one = max(compute_t, mem_t)
+        mem_t = (
+            bytes_moved / (chip.effective_dram_bandwidth * eff.memory)
+            if bytes_moved
+            else 0.0
+        )
+        one = max(compute_t, mem_t) + eff.op_overhead_s
         return OpTiming(
             op,
             op.count * one,

@@ -12,10 +12,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from .bridge import system_from_graph, system_to_graph
+from .calibration import calibrate_report
 from .des import DESEngine
+from .efficiency import PROFILES, Efficiency
 from .engine import RooflineEngine
 from .graph import Graph
 from .hardware import DType, System
@@ -27,6 +30,38 @@ from .serve import LengthDist, ServeConfig, format_serve_report, serve
 from .simulate import CostModel, simulate
 from .units import fmt_bytes, fmt_si
 from .workload import Deployment, Scenario
+
+
+def _add_efficiency_args(parser: argparse.ArgumentParser) -> None:
+    """The shared derating knobs: a named profile plus per-factor overrides."""
+    parser.add_argument("--efficiency", choices=sorted(PROFILES), default=None,
+                        help="named efficiency profile (default: sol = speed of "
+                             "light, no derating); 'typical' derates toward "
+                             "measured reality (values provisional until fitted)")
+    parser.add_argument("--eff-compute", type=float, default=None,
+                        help="override compute efficiency (fraction of peak FLOP/s)")
+    parser.add_argument("--eff-memory", type=float, default=None,
+                        help="override memory efficiency (fraction of peak bandwidth)")
+    parser.add_argument("--eff-collective", type=float, default=None,
+                        help="override collective efficiency (fraction of link bw)")
+    parser.add_argument("--op-overhead-s", type=float, default=None,
+                        help="override fixed per-op overhead in seconds")
+
+
+def _efficiency_from_args(args: argparse.Namespace) -> Efficiency:
+    """Build an Efficiency: start from the named profile (default 'sol'), then
+    apply any explicitly-passed per-factor overrides."""
+    base = PROFILES[args.efficiency] if args.efficiency else PROFILES["sol"]
+    overrides = {}
+    if args.eff_compute is not None:
+        overrides["compute"] = args.eff_compute
+    if args.eff_memory is not None:
+        overrides["memory"] = args.eff_memory
+    if args.eff_collective is not None:
+        overrides["collective"] = args.eff_collective
+    if args.op_overhead_s is not None:
+        overrides["op_overhead_s"] = args.op_overhead_s
+    return replace(base, **overrides) if overrides else base
 
 
 def _resolve_graph(key: str) -> Graph | None:
@@ -130,6 +165,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         pue=args.pue,
     )
 
+    efficiency = _efficiency_from_args(args)
     if args.engine == "des":
         hw_graph = _resolve_hw_graph(args)
         chip_graph = _chip_graph_of(hw_graph) if hw_graph is not None else None
@@ -138,9 +174,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
                   f"'{chip_graph.name}' graph (tile-fill {args.tile_fill})",
                   file=sys.stderr)
         engine = DESEngine(decode_rounds=args.decode_rounds,
-                           chip_graph=chip_graph, tile_fill=args.tile_fill)
+                           chip_graph=chip_graph, tile_fill=args.tile_fill,
+                           efficiency=efficiency)
     else:
-        engine = RooflineEngine()
+        engine = RooflineEngine(efficiency)
     batches = [int(b) for b in args.batch.split(",")]
     for i, batch in enumerate(batches):
         scen = Scenario(batch=batch, prompt_len=args.prompt, output_len=args.output)
@@ -165,6 +202,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
             json.dumps({"traceEvents": events, "displayTimeUnit": "ms"}))
         print(f"wrote Chrome trace ({len(events)} events) to {args.trace}",
               file=sys.stderr)
+    return 0
+
+
+def _cmd_calibrate(args: argparse.Namespace) -> int:
+    efficiency = _efficiency_from_args(args)
+    print(calibrate_report(efficiency))
     return 0
 
 
@@ -293,7 +336,14 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--amortization-years", type=float, default=4.0)
     run.add_argument("--kwh-price", type=float, default=0.12, help="USD per kWh")
     run.add_argument("--pue", type=float, default=1.25)
+    _add_efficiency_args(run)
     run.set_defaults(fn=_cmd_run)
+
+    cal = sub.add_parser("calibrate",
+                         help="score the simulator against measured anchors "
+                              "under an efficiency profile")
+    _add_efficiency_args(cal)
+    cal.set_defaults(fn=_cmd_calibrate)
 
     srv = sub.add_parser("serve", help="request-level continuous-batching serving "
                                        "simulation (one replica, pp=1)")
