@@ -173,6 +173,34 @@ simulator for ONE replica (dp = arrival-rate / dp, per `simulate.py`).
 - [ ] **KV swap / disk offload preemption**: preemption is recompute-only —
       a preempted request rebuilds its KV from scratch on re-admission. Swapping
       KV to host/NVMe and restoring it (vLLM's other policy) is future work.
+- [x] **Prefill/decode disaggregation**: `serve_disagg()` (`serve.py`,
+      `--disagg`) partitions the chips into a prefill pool and a decode pool and
+      streams the KV cache between them (DistServe/Dynamo). Event-driven
+      multi-replica loop: each prefill/decode replica has its own clock, a global
+      heap advances the earliest completion; prefill replicas run one whole
+      prompt exclusively, decode replicas run pure decode (never prefill-stalled
+      — the itg spike is eliminated at no TTFT cost). Reuses the polished request
+      construction (mixed lengths flow through the pools) and BOTH KV policies:
+      under `on_demand` a decode-replica overflow preempts its newest decoder,
+      which returns to the FRONT of the *prefill* pool to recompute prompt +
+      generated tokens and then re-transfers — so a preemption honestly costs a
+      re-prefill AND a re-transfer. KV transfer = `kv_bytes/bw + lat` over the
+      node/network link (`link_for_group` semantics). Degenerate anchor: a lone
+      request through a zero-cost link reproduces the aggregated TTFT/completion
+      exactly (rel=1e-9) under either KV policy; transfer accounting is exact;
+      interference-elimination, decode-ceiling capacity, prefill-starvation, and
+      preemption re-prefill are tested (`tests/test_serve_disagg.py`).
+- [ ] **Transfer-link contention (disagg)**: concurrent KV transfers each pay
+      their own `bytes/bw + lat` with no shared-link occupancy; a hot prefill
+      pool feeding one decode replica should contend on the pool-to-pool link
+      (wire onto `sched.py` shared-link resources, as the collectives already do).
+- [ ] **Chunked prefill + disagg**: `--disagg` rejects `prefill_chunk` — exclusive
+      prefill replicas make chunking moot (chunking caps the interference stall
+      that disaggregation removes outright). Modelling a chunked prefill *pool*
+      (e.g. Sarathi within each prefill replica) is future work.
+- [ ] **Context-parallel prefill (disagg)**: a prefill replica runs one whole
+      prompt on one replica (tp/ep/adp only); sequence/context parallelism to
+      split a very long prompt across a prefill replica's chips is future work.
 - [ ] **Task-level pp>1 serving**: `serve()` restricts to pp=1 (at pp=1 an
       iteration is a serial chain, so its cost is a closed-form sum and needs
       no scheduler). pp>1 needs pipeline fill/drain across stages per

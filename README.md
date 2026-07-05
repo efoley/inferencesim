@@ -283,6 +283,56 @@ KV swap). Task-level pp>1 serving is future work (see `DES_todo.md` §4). The
 per-iteration cost accepts a `DESEngine`, so graph-refined chip costs flow into
 serving numbers.
 
+#### Prefill/decode disaggregation (`--disagg`)
+
+`inferencesim serve --disagg` partitions the chips into two pools — a **prefill
+pool** and a **decode pool** — and streams the KV cache between them, the
+DistServe / NVIDIA Dynamo *disaggregated serving* architecture. A waiting
+request runs its whole prompt on any free prefill replica (exclusive, one
+request per prefill replica — prefill replicas never batch decode, which is the
+point); on completion the KV cache transfers to the least-loaded decode replica
+with headroom, and decode runs there as pure decode iterations, **never stalled
+by a prefill**. That is the architectural win: the inter-token-gap spike the
+aggregated loop pays when a prefill preempts a decoding batch simply does not
+arise, and it costs no TTFT (unlike chunked prefill, which caps the stall by
+paying more TTFT). First token lands at prefill completion + KV transfer, so
+TTFT includes the transfer delay.
+
+```bash
+inferencesim serve --hardware gb300-nvl72 --model llama-3.1-70b --disagg \
+    --prefill-tp 8 --prefill-replicas 3 --decode-tp 8 --decode-replicas 6 \
+    --rate 58 --requests 2000 --prompt 4096 --output 1024 \
+    --weight-dtype fp4 --kv-dtype fp8
+```
+
+The pools each carry their own `--{prefill,decode}-tp/-ep/-adp` (adp/ep compose
+on either side); the chips are partitioned as
+`n_p·prefill.replica_chips + n_d·decode.replica_chips ≤ total_chips` (idle chips
+reported). Everything else — the arrival process, **mixed request lengths**
+(`--prompt-dist`/`--output-dist` or a `time prompt output` trace), `--max-batch`,
+and the **`--kv-policy`** — comes from the same `ServeConfig` the aggregated loop
+uses, so the whole polished admission surface applies unchanged. The KV transfer
+costs `kv_bytes(context) / bw + latency`, where the link resolves from the system
+with `link_for_group` semantics — the node interconnect if both pools fit one
+node, else the network (`--transfer-bw` / `--transfer-latency` override). The
+report gains per-pool utilisation and transfer stats; TTFT now includes the
+transfer. The sweet spot balances the pools against the workload's prefill-time
+share (a 4k/1k llama-70b point spends ~⅓ of its time in prefill → ~3 of 9 GB300
+replicas prefill): undersize the prefill pool and TTFT queues while decode idles;
+undersize decode and it saturates.
+
+Under `--kv-policy on_demand` (the default), a decode replica that would overflow
+its KV budget preempts its newest decoder — and because decode replicas have no
+prefill hardware, the victim returns to the **front of the prefill pool** to
+recompute prompt + generated tokens and then **re-transfers**, so a preemption
+honestly costs a re-prefill *and* a re-transfer (reported as `n_preemptions`).
+`--kv-policy reserve` admits only full-footprint requests and never preempts.
+**v1 simplifications**: **no transfer-link contention** between concurrent
+transfers (each pays its own `bytes/bw + lat`); **chunked prefill is N/A** with
+`--disagg` (exclusive prefill replicas make it moot — the combination is
+rejected); prefill is one whole prompt on one replica (no context-parallel
+prefill). See `DES_todo.md` §4.
+
 ### Outputs
 
 - **Latency**: TTFT (prefill) and TPOT (decode at mean context), with a
@@ -336,8 +386,11 @@ serving numbers.
   prefill and pp>1 is next — see `DES_todo.md` §4.)
 - **Graph editor UI** over the JSON graph format (nodes with constraints,
   edges with latencies, nesting for abstraction levels).
-- Multi-rack topologies (rail-optimized Ethernet/IB); prefill/decode
-  disaggregation; MoE expert load imbalance.
+- Multi-rack topologies (rail-optimized Ethernet/IB); MoE expert load
+  imbalance. (**Prefill/decode disaggregation landed**: `serve --disagg`, a
+  prefill pool + decode pool with KV streamed between them — DistServe/Dynamo;
+  see the Serving subsection. Remaining: transfer-link contention,
+  chunked+disagg, context-parallel prefill.)
 - Explicit attention-DP + expert-parallel (TRT-LLM `DEPn`) deployments —
   *landed*: dense attention-DP is `--adp n` (DP attention + TP FFN, KV cut by
   `adp`, FFN streamed over `tp*adp`); MoE `DEPn ≡ tp=1, ep=n` (validated, see

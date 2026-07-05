@@ -189,7 +189,17 @@ widely cited **~24,525 system tok/s** ([MLCommons](https://mlcommons.org/benchma
 
 *Encoded (coarse cross-checks, excluded from the fit):* `gb300-gptoss-mlperf60`
 (MXFP4, ep8, disagg/parallelism unknown), `gb300-llama8b-mlperf51` (NVFP4,
-disaggregated → unmodeled, so wide).
+disaggregated → the *serving architecture* is now expressible via
+`serve --disagg` (a prefill pool + decode pool with KV streamed between them),
+but the anchor stays **excluded from the fit**: the disagg architecture is a
+scheduling/placement change, not a kernel-efficiency one, and the MLPerf run's
+pool split / parallelism / ISL–OSL are unpublished, so it cannot pin an
+`Efficiency` knob. To *reproduce a disagg comparison* on this rack (not a fit),
+run e.g. `inferencesim serve --hardware gb300-nvl72 --model llama-3.1-8b
+--disagg --prefill-tp 1 --prefill-replicas K --decode-tp 1 --decode-replicas J
+...` and read the per-pool utilisation / TTFT-incl-transfer against the
+aggregated `serve` numbers; the anchor remains a coarse throughput cross-check
+under the roofline `simulate` path.
 
 **DEP4 (attention-DP + expert-parallel) on DGX H100.** TRT-LLM benchmarks
 gpt-oss-120b in a `DEPn` layout — attention data-parallel, experts sharded over
@@ -329,9 +339,13 @@ overhead 1.5 µs ∈ [1, 10] ✓. The clean single-node probes (`2k128`, `tp2-8k
   peak). **This is now fixed by the per-vendor `typical-tt` profile (§8.1): the
   anchor brackets 1 at 1.02× under `auto`.** The global `typical` keeps the
   residual by design (it is not refitted).
-- `gb300-gptoss` 0.56× and `gb300-llama8b` 1.79× — rack-scale disaggregated MLPerf
-  runs with unknown parallelism/disagg (unmodeled); coarse cross-checks, excluded
-  from the fit.
+- `gb300-gptoss` 0.56× and `gb300-llama8b` 1.79× — rack-scale MLPerf runs whose
+  Dynamo *disaggregated* serving architecture our aggregated `simulate` path
+  cannot express (unknown pool split / parallelism / ISL–OSL). The architecture
+  itself is now expressible (`serve --disagg`, §Serving in the README), so a
+  disagg comparison run can be reproduced, but these stay **excluded from the
+  fit**: disaggregation is a placement/scheduling change, not kernel efficiency,
+  so it cannot pin an `Efficiency` knob. Coarse cross-checks only.
 - balanced `output_tok_s` cross-checks (0.66-0.96×) sit just under 1: derating
   compute *and* memory compounds on mixed-regime throughput. Acceptable spread for
   a bracketing profile.
@@ -399,7 +413,9 @@ Refit when anchors change (`inferencesim calibrate --efficiency sol`, then fit p
 - [ ] MLPerf: pin round + submitter + system + division; read the results file,
       not the interactive table; label Llama-2-70B a proxy.
 - [ ] GB300 rack anchors: unknown parallelism/disagg → keep coarse, excluded from
-      the fit; treat any GB200→GB300 uplift as interpolation.
+      the fit; treat any GB200→GB300 uplift as interpolation. The disaggregated
+      *architecture* is now expressible (`serve --disagg`) for a comparison run,
+      but that does not make the anchor a fit driver (architecture ≠ efficiency).
 - [ ] Spark / Tenstorrent: record per-user vs per-GPU vs total, stack version +
       date (Spark epoch drift is large); Tenstorrent BFP8 ≠ NVIDIA FP8.
 - [ ] Every anchor: set `Anchor.metric` to the normalised sim quantity; bake
