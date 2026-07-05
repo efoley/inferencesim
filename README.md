@@ -210,27 +210,54 @@ away:
 inferencesim serve --hardware gb300-nvl72 --model llama-3.1-70b --tp 8 \
     --rate 88 --requests 200 --max-batch 64 --prompt 4096 --output 1024 \
     --weight-dtype fp4 --kv-dtype fp8
+# mixed-length trace ("time prompt output" per line) + chunked prefill
+inferencesim serve --hardware gb300-nvl72 --model llama-3.1-70b --tp 8 \
+    --arrivals chat.txt --prefill-chunk 512 --max-batch 64
+# Poisson with sampled lengths and the reserve KV policy
 inferencesim serve --hardware gb300-nvl72 --model gpt-oss-120b --tp 4 --ep 8 \
-    --arrivals trace.txt --max-batch 64        # one arrival time per line
+    --rate 20 --prompt-dist lognormal:2048:0.5 --output-dist uniform:64:1024 \
+    --kv-policy reserve
 ```
 
 Requests arrive by a seeded Poisson process (`--rate`, a whole-system rate
-divided by DP for one replica) or an explicit trace (`--arrivals`). The loop
-interleaves iterations under continuous batching: a waiting request is admitted
-when a batch slot is free *and* its conservative prompt+output KV footprint fits
-the per-chip budget; with `prefill_first` (vLLM-like default) a waiting
-request's *exclusive* whole-prompt prefill preempts the decoding batch, and each
-decode iteration emits one token for every running request while its attention
-is recost at the batch's actual Σ per-request context (per-token KV growth).
-Because pp=1, an iteration is a serial op chain, so its duration is a
-closed-form sum and there is no scheduler here — the interesting dynamics are
-all *between* iterations. It reports offered vs achieved throughput, TTFT
-p50/p95/p99 + mean (queueing included), per-request TPOT, the inter-token-gap
-p99 (prefill interference shows up as gaps many x the mean), batch occupancy,
-and peak KV. **Scope**: one replica, `pp == 1`, exclusive prefill; chunked
-prefill and task-level pp>1 serving are future work (see `DES_todo.md` §4). The
-per-iteration cost accepts a `DESEngine` so graph-refined chip costs can flow
-into serving numbers.
+divided by DP for one replica) or an explicit trace (`--arrivals`). Prompt and
+output lengths are per request: fixed from the scenario, given per-line in the
+trace (`time [prompt output]`), or sampled from a `--prompt-dist`/`--output-dist`
+(`uniform:LO:HI` or `lognormal:MEDIAN:SIGMA`, off the same seeded RNG).
+
+The loop interleaves iterations under continuous batching. Admission and prefill
+have knobs that mirror vLLM:
+
+- **KV policy** (`--kv-policy`). `on_demand` (default) admits a request against
+  only its prompt KV (up to a `--kv-watermark` fraction of the budget), grows KV
+  a token at a time, and **preempts** the newest decoder (recompute) when a step
+  would overflow — the victim's KV is freed, it returns to the front of the
+  queue, and on re-admission its prefill recomputes prompt + tokens-so-far before
+  decoding resumes (total tokens stay correct, the recompute shows up as a big
+  inter-token gap for the victim). `reserve` admits only if the full
+  prompt+output KV fits, so it never preempts but packs fewer requests.
+- **Prefill** (`--prefill-chunk`). Default is *exclusive*: a waiting request's
+  whole prompt is one iteration that freezes the decode batch (a big inter-token
+  gap). `--prefill-chunk K` instead mixes a K-token prefill chunk into each
+  decode iteration (Sarathi-style): the long-prefill stall collapses into small
+  per-iteration bumps, at the cost of a longer TTFT for the prefilling request
+  (each chunk re-streams weights and re-reads its growing KV). A 32k-prompt
+  request landing in chat traffic on a GB300 replica: exclusive drives the
+  batch's inter-token p99 to ~380 ms; `--prefill-chunk 512` collapses it to
+  ~10 ms while the 32k request's TTFT roughly doubles.
+
+Each decode iteration emits one token for every running request, its attention
+recost at the batch's actual Σ per-request context (per-token KV growth).
+Because pp=1 an iteration is a serial op chain — its duration a closed-form sum,
+so there is no scheduler here; the interesting dynamics are all *between*
+iterations. The report gives offered vs achieved throughput, TTFT p50/p95/p99 +
+mean (queueing included), per-request TPOT, inter-token-gap p99 (the
+interference metric), batch occupancy, peak KV, preemption count, and
+prompt/output length percentiles when lengths are mixed. **Scope**: one replica,
+`pp == 1`; a single request prefills at a time; preemption is recompute-only (no
+KV swap). Task-level pp>1 serving is future work (see `DES_todo.md` §4). The
+per-iteration cost accepts a `DESEngine`, so graph-refined chip costs flow into
+serving numbers.
 
 ### Outputs
 

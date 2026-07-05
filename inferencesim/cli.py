@@ -23,7 +23,7 @@ from .presets import HARDWARE, MODELS
 from .presets_fine import GRAPH_PRESETS
 from .report import format_report
 from .sched import chrome_trace
-from .serve import ServeConfig, format_serve_report, serve
+from .serve import LengthDist, ServeConfig, format_serve_report, serve
 from .simulate import CostModel, simulate
 from .units import fmt_bytes, fmt_si
 from .workload import Deployment, Scenario
@@ -188,20 +188,60 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         act_dtype=DType(args.act_dtype),
     )
     scen = Scenario(batch=args.max_batch, prompt_len=args.prompt, output_len=args.output)
+    common = dict(
+        max_batch=args.max_batch, seed=args.seed,
+        prefill_first=not args.decode_first, kv_policy=args.kv_policy,
+        kv_watermark=args.kv_watermark, prefill_chunk=args.prefill_chunk,
+    )
     if args.arrivals:
-        arrivals = [float(x) for x in Path(args.arrivals).read_text().split()]
+        # each line: `time` or `time prompt output`
+        arrivals: list[float] = []
+        prompt_lens: list[int] = []
+        output_lens: list[int] = []
+        mixed = False
+        for line in Path(args.arrivals).read_text().splitlines():
+            cols = line.split()
+            if not cols:
+                continue
+            arrivals.append(float(cols[0]))
+            if len(cols) >= 3:
+                mixed = True
+                prompt_lens.append(int(cols[1]))
+                output_lens.append(int(cols[2]))
+            else:
+                prompt_lens.append(args.prompt)
+                output_lens.append(args.output)
         cfg = ServeConfig(
-            arrivals=arrivals, n_requests=len(arrivals), max_batch=args.max_batch,
-            seed=args.seed, prefill_first=not args.decode_first,
+            arrivals=arrivals,
+            prompt_lens=prompt_lens if mixed else None,
+            output_lens=output_lens if mixed else None,
+            **common,
         )
     else:
         cfg = ServeConfig(
-            arrival_rate=args.rate, n_requests=args.requests, max_batch=args.max_batch,
-            seed=args.seed, prefill_first=not args.decode_first,
+            arrival_rate=args.rate, n_requests=args.requests,
+            prompt_dist=_parse_dist(args.prompt_dist),
+            output_dist=_parse_dist(args.output_dist),
+            **common,
         )
     report = serve(system, model, scen, dep, cfg)
     print(format_serve_report(report))
     return 0
+
+
+def _parse_dist(spec: str | None) -> LengthDist | None:
+    """Parse `uniform:LO:HI` or `lognormal:MEDIAN:SIGMA` into a LengthDist."""
+    if not spec:
+        return None
+    parts = spec.split(":")
+    if len(parts) != 3:
+        raise SystemExit(f"bad --*-dist {spec!r}: use uniform:LO:HI or lognormal:MED:SIGMA")
+    kind, a, b = parts[0], float(parts[1]), float(parts[2])
+    if kind == "uniform":
+        return LengthDist.uniform(int(a), int(b))
+    if kind == "lognormal":
+        return LengthDist.lognormal(a, b)
+    raise SystemExit(f"unknown distribution {kind!r} (uniform | lognormal)")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -277,9 +317,24 @@ def main(argv: list[str] | None = None) -> int:
     srv.add_argument("--decode-first", action="store_true",
                      help="decode has priority over waiting prefills "
                           "(default: prefill-first, vLLM-like)")
+    srv.add_argument("--kv-policy", choices=["on_demand", "reserve"],
+                     default="on_demand",
+                     help="on_demand: admit against prompt KV, preempt (recompute) "
+                          "on overflow; reserve: admit only if full prompt+output "
+                          "KV fits, never preempt")
+    srv.add_argument("--kv-watermark", type=float, default=0.95,
+                     help="usable fraction of the KV budget (on_demand only)")
+    srv.add_argument("--prefill-chunk", type=int, default=None,
+                     help="mix this many prefill tokens into each decode iteration "
+                          "(Sarathi chunked prefill); default: exclusive prefill")
+    srv.add_argument("--prompt-dist", metavar="SPEC",
+                     help="Poisson-mode prompt length distribution: "
+                          "uniform:LO:HI or lognormal:MEDIAN:SIGMA")
+    srv.add_argument("--output-dist", metavar="SPEC",
+                     help="Poisson-mode output length distribution (see --prompt-dist)")
     srv.add_argument("--arrivals", metavar="FILE",
-                     help="read explicit per-replica arrival times (one float per "
-                          "line) instead of a Poisson --rate")
+                     help="explicit per-replica arrivals, one per line as "
+                          "`time` or `time prompt output` (mixed lengths)")
     srv.add_argument("--weight-dtype", default="fp8", choices=[d.value for d in DType])
     srv.add_argument("--kv-dtype", default="bf16", choices=[d.value for d in DType])
     srv.add_argument("--act-dtype", default="bf16", choices=[d.value for d in DType])

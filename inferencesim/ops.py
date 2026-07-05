@@ -313,3 +313,40 @@ def prefill_ops(model: ModelSpec, n_prompt_tokens: int, dep: Deployment) -> list
         *_embed_and_head(model, tokens_in=S, tokens_out=1, dep=dep, count=1),
     ]
     return ops
+
+
+def prefill_chunk_ops(model: ModelSpec, dep: Deployment, chunk: int,
+                      prior_context: int, produce_logits: bool) -> list[Op]:
+    """One chunked-prefill iteration: `chunk` fresh prompt tokens processed with
+    `prior_context` tokens already in the KV cache (Sarathi / vLLM chunked
+    prefill).
+
+    The chunk's `chunk` query positions attend to kv_len = prior_context + chunk
+    keys.  `causal_new=False` costs that as a full [chunk x kv_len] block: the
+    cross-chunk part (chunk x prior_context) is genuinely dense and the
+    intra-chunk triangle is over-counted by chunk^2/2 -- negligible for
+    chunk << context, and the term that actually makes chunking cost MORE than
+    an exclusive prefill lives in two places this lowering already captures: the
+    attention op re-reads the whole prior KV every chunk (dram_read grows with
+    prior_context), and the per-layer weights are re-streamed once per chunk
+    (each chunk is its own op list).  Only the final chunk runs the LM head
+    (it emits the request's first token)."""
+    validate_deployment(model, dep)
+    L = model.n_layers
+    kv_len = prior_context + chunk
+    edge = _embed_and_head(model, tokens_in=chunk, tokens_out=1, dep=dep, count=1)
+    ops: list[Op] = [
+        _linear("qkv_proj", chunk, model.attn_qkv_params, model.d_model,
+                (model.n_heads + 2 * model.n_kv_heads) * model.d_head, dep, count=L),
+        _attention(model, n_seq=1, q_len=chunk, kv_len=kv_len, causal_new=False,
+                   dep=dep, count=L),
+        _linear("out_proj", chunk, model.attn_out_params,
+                model.n_heads * model.d_head, model.d_model, dep, count=L),
+        *_ffn_ops(model, tokens_per_group=chunk, tokens_total=chunk, dep=dep, count=L),
+        _allreduce(chunk, model, dep, count=_allreduces_per_layer(model, dep) * L),
+        *_pipeline_hops(chunk, model, dep, count=dep.pp - 1),
+        edge[0],  # embed the chunk's tokens
+    ]
+    if produce_logits:
+        ops.append(edge[1])  # LM head on the last position -> first output token
+    return ops
