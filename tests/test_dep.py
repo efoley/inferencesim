@@ -29,7 +29,7 @@ from inferencesim.engine import (
 from inferencesim.hardware import DType, Link, Topology
 from inferencesim.ops import (
     OpKind,
-    decode_attention_op,
+    decode_attention_ops,
     decode_ops,
     kv_cache_bytes_per_chip,
     prefill_ops,
@@ -256,10 +256,11 @@ def test_moe_ep_is_dep_structure():
     assert {"moe_dispatch", "moe_combine"} <= {op.name for op in ops}
 
     # attention runs data-parallel over 4: b_att = B/4 (compare flops to ep=1)
-    att4 = decode_attention_op(m, dep, B, 2048.0)
-    att1 = decode_attention_op(m, Deployment(tp=1, ep=1, weight_dtype=DType.FP4),
-                               B, 2048.0)
-    assert att4.flops == pytest.approx(att1.flops / 4, rel=1e-12)
+    # (gpt-oss is SWA, so attention lowers to full + windowed op classes)
+    att4 = sum(op.flops for op in decode_attention_ops(m, dep, B, 2048.0))
+    att1 = sum(op.flops for op in decode_attention_ops(
+        m, Deployment(tp=1, ep=1, weight_dtype=DType.FP4), B, 2048.0))
+    assert att4 == pytest.approx(att1 / 4, rel=1e-12)
 
     # the single (attention) allreduce costs zero at tp=1 -- no FFN allreduce
     engine = RooflineEngine()

@@ -81,7 +81,7 @@ from .engine import CommContext, Engine, RooflineEngine
 from .hardware import System
 from .ops import (
     Op,
-    decode_attention_op,
+    decode_attention_ops,
     decode_ops,
     kv_cache_bytes_per_chip,
     prefill_chunk_ops,
@@ -244,6 +244,39 @@ def _ceil_grid(n: int, grid: int) -> int:
     return int(ceil(n / grid)) * grid
 
 
+def _kv_accounting(model: ModelSpec, dep: Deployment):
+    """KV-budget helpers for the serving loop, variant-aware.
+
+    Returns (kv_per_token, kv_bytes, kv_grow):
+      kv_per_token : per-chip KV a fresh token adds before any window saturates
+                     (all layers grow) -- the admission/reserve unit.
+      kv_bytes(ctx): per-chip KV footprint of one sequence at `ctx` tokens.  For
+                     SWA the windowed layers cap at the window; for every
+                     non-windowed model (GQA and MLA, both linear) it is exactly
+                     `ctx * kv_per_token`, bit-for-bit, so the historical paths
+                     are unchanged.
+      kv_grow(ctx) : bytes added when a sequence already holding `ctx` tokens
+                     emits one more token (drops to the dense-layer share once
+                     the window is full)."""
+    kpt = kv_cache_bytes_per_chip(model, 1, dep)
+    swa = model.n_swa_layers
+    W = model.swa_window or 0
+    swa_share = kpt * swa / model.n_layers if swa else 0.0  # windowed-layer part
+
+    def kv_bytes(ctx: float) -> float:
+        b = ctx * kpt
+        if swa and ctx > W:
+            b -= (ctx - W) * swa_share
+        return b
+
+    def kv_grow(ctx_before: float) -> float:
+        if swa and ctx_before >= W:
+            return kpt - swa_share
+        return kpt
+
+    return kpt, kv_bytes, kv_grow
+
+
 # ---- per-iteration cost model -----------------------------------------------
 
 
@@ -274,7 +307,9 @@ class _DecodeCost:
     dep: Deployment
 
     def iter_time(self, n: int, sum_ctx: float) -> float:
-        att = self._attn_cost(decode_attention_op(self.model, self.dep, n, sum_ctx / n))
+        # sum over the attention op class(es): SWA emits full + windowed, MLA one
+        att = sum(self._attn_cost(op) for op in
+                  decode_attention_ops(self.model, self.dep, n, sum_ctx / n))
         return self.base[n] + att
 
 
@@ -286,7 +321,8 @@ def _build_decode_cost(
     for n in range(1, max_batch + 1):
         # context is irrelevant to the non-attention ops; pass a dummy 1.0
         base[n] = sum(
-            cost_op(op) for op in decode_ops(model, dep, n, 1.0) if op.name != "attention"
+            cost_op(op) for op in decode_ops(model, dep, n, 1.0)
+            if op.category != "attention"
         )
     return _DecodeCost(base, cost_op, model, dep)
 
@@ -558,7 +594,7 @@ def serve(
     microbatch = config.max_batch / (deployment.pp * deployment.ep * deployment.adp)
     activations = 4 * microbatch * model.d_model * deployment.act_dtype.bytes
     kv_budget = chip.dram.capacity_bytes - weights - activations
-    kv_per_token = kv_cache_bytes_per_chip(model, 1, deployment)
+    kv_per_token, kv_bytes, kv_grow = _kv_accounting(model, deployment)
     # usable KV: on_demand keeps a watermark of headroom; reserve uses it all
     usable = (config.kv_watermark * kv_budget) if on_demand else kv_budget
     if usable <= 0:
@@ -582,7 +618,7 @@ def serve(
     # still served: it force-admits when the replica is idle and runs over the
     # watermark up to the hard budget -- guard #2 below, a warning not an error.)
     for r in reqs_in:
-        full = (r.prompt_len + r.output_len) * kv_per_token
+        full = kv_bytes(r.prompt_len + r.output_len)
         if full > kv_budget + _EPS:
             raise ValueError(
                 f"request {r.idx} needs {full / 1e9:.2f} GB of KV at full context "
@@ -646,7 +682,7 @@ def serve(
     backlog_at_last_arrival = 0
 
     def full_fp(r: _Req) -> float:
-        return (r.prompt_len + r.output_len) * kv_per_token
+        return kv_bytes(r.prompt_len + r.output_len)
 
     def can_admit(r: _Req) -> bool:
         if len(running) >= config.max_batch:
@@ -658,15 +694,15 @@ def serve(
             # prompts, not full prompt+output, is what lets on_demand pack more
             # requests than reserve.
             committed = sum(
-                (x.prefill_target if x.needs_prefill else x.context) * kv_per_token
+                kv_bytes(x.prefill_target if x.needs_prefill else x.context)
                 for x in running
             )
-            return committed + r.prefill_target * kv_per_token <= usable + _EPS
+            return committed + kv_bytes(r.prefill_target) <= usable + _EPS
         return kv_reserved + full_fp(r) <= kv_budget + _EPS
 
     def preempt(victim: _Req) -> None:
         nonlocal kv_used, n_preempt
-        kv_used -= victim.context * kv_per_token
+        kv_used -= kv_bytes(victim.context)
         running.remove(victim)
         victim.needs_prefill = True
         victim.prefill_done = 0
@@ -688,7 +724,7 @@ def serve(
             tpot=tpot, n_preemptions=r.preemptions,
         ))
         running.remove(r)
-        kv_used -= r.context * kv_per_token
+        kv_used -= kv_bytes(r.context)
         if not on_demand:
             kv_reserved -= full_fp(r)
 
@@ -718,8 +754,8 @@ def serve(
             r.gen += 1
             gaps.append(clock - r.last_emit)
             r.last_emit = clock
+            kv_used += kv_grow(r.context)  # windowed layers stop growing at W
             r.context += 1
-            kv_used += kv_per_token
             if r.gen >= r.output_len:
                 done.append(r)
         return done
@@ -782,7 +818,7 @@ def serve(
                 # ---- exclusive prefill: the whole (re)prefill in one iteration,
                 # stalling the decode batch ----
                 r = prefiller
-                need = r.prefill_target * kv_per_token  # r holds 0 (prefill_done=0)
+                need = kv_bytes(r.prefill_target)  # r holds 0 (prefill_done=0)
                 if on_demand:
                     while kv_used + need > usable + _EPS:
                         v = latest_decoder(exclude=r)
@@ -1031,7 +1067,7 @@ def serve_disagg(
     microbatch = config.max_batch / (d_dep.pp * d_dep.ep * d_dep.adp)
     d_activations = 4 * microbatch * model.d_model * d_dep.act_dtype.bytes
     kv_budget = chip.dram.capacity_bytes - d_weights - d_activations
-    kv_per_token = kv_cache_bytes_per_chip(model, 1, d_dep)
+    kv_per_token, kv_bytes, kv_grow = _kv_accounting(model, d_dep)
     usable = (config.kv_watermark * kv_budget) if on_demand else kv_budget
     if usable <= 0:
         raise ValueError(
@@ -1051,7 +1087,7 @@ def serve_disagg(
     # a request whose full context can't fit a decode replica's hard budget can
     # never complete -- fail loudly (mirrors serve()'s guard #1)
     for r in reqs_in:
-        full = (r.prompt_len + r.output_len) * kv_per_token
+        full = kv_bytes(r.prompt_len + r.output_len)
         if full > kv_budget + _EPS:
             raise ValueError(
                 f"request {r.idx} needs {full / 1e9:.2f} GB of KV at full context "
@@ -1117,7 +1153,7 @@ def serve_disagg(
             "arrivals_seen": 0, "backlog": 0, "victims": False}
 
     def full_fp(r: _Req) -> float:
-        return (r.prompt_len + r.output_len) * kv_per_token
+        return kv_bytes(r.prompt_len + r.output_len)
 
     def dispatch_prefill(now: float) -> None:
         for i, pr in enumerate(preps):
@@ -1138,13 +1174,13 @@ def serve_disagg(
         if len(dr.running) >= config.max_batch:
             return False
         if on_demand:
-            committed = sum(x.context for x in dr.running) * kv_per_token
-            return committed + r.context * kv_per_token <= usable + _EPS
+            committed = sum(kv_bytes(x.context) for x in dr.running)
+            return committed + kv_bytes(r.context) <= usable + _EPS
         return dr.kv_reserved + full_fp(r) <= kv_budget + _EPS
 
     def admit_to_decode(dr: _DecodeReplica, r: _Req) -> None:
         dr.running.append(r)
-        dr.kv_used += r.context * kv_per_token
+        dr.kv_used += kv_bytes(r.context)
         if not on_demand:
             dr.kv_reserved += full_fp(r)
         stat["peak_kv"] = max(stat["peak_kv"], dr.kv_used)
@@ -1154,7 +1190,7 @@ def serve_disagg(
         # free the victim's KV and send it to the FRONT of the PREFILL pool to
         # recompute prompt+generated tokens, then re-transfer (the honest disagg
         # preemption penalty).  gen is kept, so prefill_target = prompt + gen.
-        dr.kv_used -= v.context * kv_per_token
+        dr.kv_used -= kv_bytes(v.context)
         dr.running.remove(v)
         v.needs_prefill = True
         v.prefill_done = 0
@@ -1215,7 +1251,7 @@ def serve_disagg(
             tpot=tpot, n_preemptions=r.preemptions, transfer=r.transfer_delay,
         ))
         dr.running.remove(r)
-        dr.kv_used -= r.context * kv_per_token
+        dr.kv_used -= kv_bytes(r.context)
         if not on_demand:
             dr.kv_reserved -= full_fp(r)
 
@@ -1280,8 +1316,8 @@ def serve_disagg(
                 r.gen += 1
                 gaps.append(now - r.last_emit)
                 r.last_emit = now
+                dr.kv_used += kv_grow(r.context)  # windowed layers cap at W
                 r.context += 1
-                dr.kv_used += kv_per_token
                 if r.gen >= r.output_len:
                     done.append(r)
             stat["peak_kv"] = max(stat["peak_kv"], dr.kv_used)

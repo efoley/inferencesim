@@ -2,7 +2,7 @@
 inference factories, built from chip-level hardware blocks."""
 
 from .hardware import Chip, Compute, DType, Link, Memory, Node, System, Topology
-from .workload import Deployment, ModelSpec, MoEConfig, Scenario
+from .workload import Deployment, MLAConfig, ModelSpec, MoEConfig, Scenario
 from .efficiency import Efficiency, PROFILES, profile_for, vendor_profile_name
 from .engine import Engine, RooflineEngine, ring_allreduce_time
 from .sched import Resource, ScheduleResult, Task, chrome_trace, schedule
@@ -40,7 +40,7 @@ __version__ = "0.2.0"
 
 __all__ = [
     "Chip", "Compute", "DType", "Link", "Memory", "Node", "System", "Topology",
-    "Deployment", "ModelSpec", "MoEConfig", "Scenario",
+    "Deployment", "ModelSpec", "MoEConfig", "MLAConfig", "Scenario",
     "Efficiency", "PROFILES", "profile_for", "vendor_profile_name",
     "Anchor", "ANCHORS", "calibrate_report", "run_anchor",
     "Engine", "RooflineEngine", "DESEngine", "ring_allreduce_time",
