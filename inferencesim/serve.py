@@ -207,9 +207,15 @@ class ServeReport:
     dp: int
     idle_chips: int
 
-    # offered vs achieved load (per replica and whole-system = x dp)
+    # offered vs achieved load (per replica and whole-system = x dp).
+    # `achieved` divides completions by (last completion - first arrival), so
+    # it includes the post-arrival drain tail and under-reads sustained
+    # capacity on short runs; `backlog_at_last_arrival` is the direct
+    # queue-growth evidence (O(1) excursion when stable, grows linearly with
+    # the run length past capacity).
     offered_rate_replica: float | None
     achieved_rate_replica: float
+    backlog_at_last_arrival: int
     output_tokens_per_s_replica: float
     input_tokens_per_s_replica: float
 
@@ -388,11 +394,15 @@ def serve(
     n_prefill = 0
     n_decode = 0
 
+    backlog_at_last_arrival = 0
+
     while len(completed) < n_total:
         # intake: newly-arrived requests join the FIFO waiting queue
         while arr_i < n_total and reqs_in[arr_i].arrival <= clock:
             waiting.append(reqs_in[arr_i])
             arr_i += 1
+            if arr_i == n_total:
+                backlog_at_last_arrival = len(waiting)
         # admission: FIFO, gated by the batch slot count and the KV budget
         while (
             waiting
@@ -474,24 +484,21 @@ def serve(
     total_input = sum(rec.prompt_len for rec in completed)
 
     achieved = n_total / makespan if makespan > 0 else 0.0
-    # Saturated = the replica can't keep up AND latency is inflating with queue.
-    # Both are needed: over a finite Poisson sample the empirical arrival rate
-    # is a noisy estimate of `offered_rate_replica`, so a throughput shortfall
-    # alone gives false positives; pairing it with a TTFT blow-up over the
-    # no-queue baseline (a lone request's prefill) makes the flag mean what it
-    # says.
-    baseline_ttft = prefill_cost(scenario.prompt_len)
-    saturated = (
-        offered_rate_replica is not None
-        and achieved < 0.9 * offered_rate_replica
-        and _percentile(ttfts, 99) > 3.0 * baseline_ttft
-    )
+    # Saturated = the waiting queue GREW over the arrival window -- the direct
+    # queueing-theory definition of not keeping up.  Throughput shortfall and
+    # TTFT inflation are both unreliable here: `achieved` under-reads on short
+    # runs (drain tail), and p99 TTFT spikes transiently on stable-but-loaded
+    # systems.  A stable system shows an O(1) backlog excursion at the last
+    # arrival; past capacity the backlog scales with the run, so a threshold
+    # that grows with the per-replica request count separates them.
+    saturated = backlog_at_last_arrival > max(4, ceil(0.1 * n_total))
 
     return ServeReport(
         system=system, model=model, scenario=scenario, deployment=deployment,
         config=config, dp=dp, idle_chips=idle_chips,
         offered_rate_replica=offered_rate_replica,
         achieved_rate_replica=achieved,
+        backlog_at_last_arrival=backlog_at_last_arrival,
         output_tokens_per_s_replica=total_output / makespan if makespan > 0 else 0.0,
         input_tokens_per_s_replica=total_input / makespan if makespan > 0 else 0.0,
         ttft_mean=sum(ttfts) / len(ttfts) if ttfts else 0.0,
@@ -536,8 +543,11 @@ def format_serve_report(r: ServeReport) -> str:
     off_s = "n/a" if r.offered_rate_system is None else f"{r.offered_rate_system:.3f}"
     add(f"Offered load : {off_r} req/s/replica  ({off_s} req/s system)")
     add(f"Achieved     : {r.achieved_rate_replica:.3f} req/s/replica  "
-        f"({r.achieved_rate_system:.3f} req/s system)"
+        f"({r.achieved_rate_system:.3f} req/s system, incl. drain tail)"
         + ("   ** SATURATED **" if r.saturated else ""))
+    if r.backlog_at_last_arrival:
+        add(f"Backlog      : {r.backlog_at_last_arrival} waiting at last arrival "
+            f"(stable systems show an O(1) excursion here)")
     add(f"Throughput   : {fmt_si(r.output_tokens_per_s_replica, 'tok/s')} output/replica  "
         f"({fmt_si(r.output_tokens_per_s_system, 'tok/s')} system)")
     add("-" * 72)
