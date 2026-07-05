@@ -154,6 +154,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         tp=args.tp,
         pp=args.pp,
         ep=args.ep,
+        adp=args.adp,
         weight_dtype=DType(args.weight_dtype),
         kv_dtype=DType(args.kv_dtype),
         act_dtype=DType(args.act_dtype),
@@ -225,7 +226,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         return 2
     model = MODELS[args.model]
     dep = Deployment(
-        tp=args.tp, pp=args.pp, ep=args.ep,
+        tp=args.tp, pp=args.pp, ep=args.ep, adp=args.adp,
         weight_dtype=DType(args.weight_dtype),
         kv_dtype=DType(args.kv_dtype),
         act_dtype=DType(args.act_dtype),
@@ -309,6 +310,10 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--pp", type=int, default=1, help="pipeline-parallel stages")
     run.add_argument("--ep", type=int, default=1,
                      help="expert-parallel groups (MoE models only)")
+    run.add_argument("--adp", type=int, default=1,
+                     help="attention-data-parallel groups (dense models only): "
+                          "DP attention + TP FFN, TRT-LLM DEPn -- cuts per-chip "
+                          "KV by adp, streams the FFN over the tp*adp array")
     run.add_argument("--batch", default="32",
                      help="concurrent sequences per replica (comma list sweeps)")
     run.add_argument("--prompt", type=int, default=2048, help="prompt tokens per request")
@@ -354,6 +359,9 @@ def main(argv: list[str] | None = None) -> int:
     srv.add_argument("--pp", type=int, default=1, help="pipeline stages (serve requires 1)")
     srv.add_argument("--ep", type=int, default=1,
                      help="expert-parallel groups (MoE models only)")
+    srv.add_argument("--adp", type=int, default=1,
+                     help="attention-data-parallel groups (dense models only): "
+                          "DP attention + TP FFN, TRT-LLM DEPn")
     srv.add_argument("--rate", type=float, default=5.0,
                      help="whole-system arrival rate (requests/s, Poisson); "
                           "divided by DP for one replica")
