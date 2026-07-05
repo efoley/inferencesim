@@ -29,8 +29,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from statistics import median
+from typing import Callable
 
-from .efficiency import Efficiency
+from .efficiency import Efficiency, vendor_profile_name
 from .engine import RooflineEngine
 from .hardware import DType, System
 from .presets import HARDWARE, MODELS
@@ -340,45 +341,72 @@ def run_anchor(anchor: Anchor, efficiency: Efficiency) -> tuple[float, float, fl
 
 
 def calibrate_report(
-    efficiency: Efficiency, anchors: list[Anchor] | None = None
+    efficiency: Efficiency | None = None,
+    anchors: list[Anchor] | None = None,
+    *,
+    resolve: Callable[[str], Efficiency] | None = None,
 ) -> str:
-    """A plain-text table scoring every anchor under `efficiency`.
+    """A plain-text table scoring every anchor.
 
-    Columns: anchor, regime, metric, measured, simulated, optimism ratio.  The
-    optimism ratio is `>= 1` when the simulator is optimistic (metric-direction
-    agnostic, see `optimism_ratio`); a fitted profile brings it toward 1."""
+    By default every anchor is scored under the single `efficiency`.  Pass a
+    `resolve` callable (`hardware_key -> Efficiency`, e.g. the vendor "auto"
+    resolver) to score each anchor under its own profile instead: the table then
+    gains a `profile` column naming the resolved vendor profile, so Tenstorrent
+    anchors scored under typical-tt sit beside NVIDIA anchors scored under
+    typical-nv in one table.  Exactly one of `efficiency` / `resolve` is used.
+
+    Columns: anchor, [profile,] regime, metric, measured, simulated, optimism
+    ratio.  The optimism ratio is `>= 1` when the simulator is optimistic (metric-
+    direction agnostic, see `optimism_ratio`); a fitted profile brings it toward 1.
+    """
     anchors = ANCHORS if anchors is None else anchors
+    w = 102 if resolve is not None else 90
     lines: list[str] = []
     add = lines.append
-    add("=" * 90)
+    add("=" * w)
     add("inferencesim calibrate")
-    add("=" * 90)
-    add(f"Efficiency   : compute={efficiency.compute:g}  memory={efficiency.memory:g}"
-        f"  collective={efficiency.collective:g}"
-        f"  op_overhead={efficiency.op_overhead_s * 1e6:g}us")
-    add("-" * 90)
+    add("=" * w)
+    if resolve is not None:
+        add("Efficiency   : auto (per-anchor vendor profile -- "
+            "tt-* -> typical-tt, else typical-nv)")
+    else:
+        add(f"Efficiency   : compute={efficiency.compute:g}  memory={efficiency.memory:g}"
+            f"  collective={efficiency.collective:g}"
+            f"  op_overhead={efficiency.op_overhead_s * 1e6:g}us")
+    add("-" * w)
     if not anchors:
         add("No calibration anchors are defined yet.")
         add("The measured-number research is tracked in CALIBRATION.md; "
             "calibration.ANCHORS encodes its recommended set.")
-        add("=" * 90)
+        add("=" * w)
         return "\n".join(lines)
 
-    add(f"{'anchor':<34}{'regime':<9}{'metric':<12}{'measured':>13}"
-        f"{'simulated':>13}{'optimism':>10}")
-    add("-" * 90)
+    if resolve is not None:
+        add(f"{'anchor':<34}{'profile':<12}{'regime':<9}{'metric':<12}"
+            f"{'measured':>13}{'simulated':>13}{'optimism':>10}")
+    else:
+        add(f"{'anchor':<34}{'regime':<9}{'metric':<12}{'measured':>13}"
+            f"{'simulated':>13}{'optimism':>10}")
+    add("-" * w)
     ratios: list[float] = []
     for a in anchors:
-        simulated, measured, ratio = run_anchor(a, efficiency)
+        eff = resolve(a.hardware_key) if resolve is not None else efficiency
+        simulated, measured, ratio = run_anchor(a, eff)
         ok = ratio == ratio  # not NaN
-        ratios.append(ratio) if ok else None
+        if ok:
+            ratios.append(ratio)
         ratio_s = f"{ratio:.2f}x" if ok else "n/a"
-        add(f"{a.name:<34}{a.regime:<9}{a.metric:<12}{measured:>13.4g}"
-            f"{simulated:>13.4g}{ratio_s:>10}")
-    add("-" * 90)
+        if resolve is not None:
+            prof = vendor_profile_name(a.hardware_key)
+            add(f"{a.name:<34}{prof:<12}{a.regime:<9}{a.metric:<12}{measured:>13.4g}"
+                f"{simulated:>13.4g}{ratio_s:>10}")
+        else:
+            add(f"{a.name:<34}{a.regime:<9}{a.metric:<12}{measured:>13.4g}"
+                f"{simulated:>13.4g}{ratio_s:>10}")
+    add("-" * w)
     if ratios:
         lo, hi = min(ratios), max(ratios)
         add(f"optimism ratio: median {median(ratios):.2f}x, "
             f"range [{lo:.2f}x, {hi:.2f}x]  (>= 1 == optimistic; fit brackets 1)")
-    add("=" * 90)
+    add("=" * w)
     return "\n".join(lines)

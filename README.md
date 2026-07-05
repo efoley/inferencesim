@@ -308,12 +308,23 @@ serving numbers.
   `--eff-memory`, `--eff-collective`, `--op-overhead-s`). The `typical` profile
   is **fitted (coarse)** against measured anchors — `inferencesim calibrate`
   scores the simulator against them and the fit is documented in
-  `CALIBRATION.md`. It is one global profile over a small, partly-proxy anchor
-  set; expect it to move as anchors are confirmed and per-vendor profiles land.
+  `CALIBRATION.md`.
+- **Per-vendor derating (`--efficiency auto`).** One global `typical` cannot
+  serve both vendors: the Tenstorrent tt-metal stack reaches a lower effective
+  memory bandwidth than NVIDIA (~0.40 vs 0.57), so a QuietBox decode point reads
+  ~1.4× optimistic under the global fit. `--efficiency auto` picks the
+  vendor-appropriate profile per hardware key — `typical-tt` for Tenstorrent
+  (`tt-*`), `typical-nv` (== `typical`) otherwise — bringing that anchor to ~1.0×
+  while leaving every NVIDIA number unchanged. `typical-nv` / `typical-tt` can
+  also be named explicitly; the default stays `sol` everywhere (`auto` is opt-in).
+  Works on `run`, `serve`, and `calibrate`; see `CALIBRATION.md` §8.1.
 
   ```bash
   inferencesim run --hardware gb300-nvl72 --model llama-3.1-70b \
       --tp 8 --batch 64 --weight-dtype fp4 --kv-dtype fp8 --efficiency typical
+  # per-vendor: Tenstorrent decode derated to match tt-metal (~0.40 memory)
+  inferencesim run --hardware tt-quietbox-2 --model qwen3-32b --tp 4 \
+      --batch 32 --prompt 558 --output 128 --kv-dtype fp8 --efficiency auto
   ```
 
 ## Roadmap
@@ -334,9 +345,12 @@ serving numbers.
   redundant-expert load balancing and mixed ADP+TP MoE attention.
 - **Efficiency factors calibrated against measured benchmarks** (MLPerf,
   vendor numbers) to bracket roofline optimism — *mechanism landed, coarse fit
-  landed, refinement ongoing*: `Efficiency`, `--efficiency`, `inferencesim
-  calibrate`, and the `calibration.py` anchor harness are in; `typical` is
-  fitted against 11 sourced anchors (`CALIBRATION.md`). Next: confirm the
-  `[VERIFY]` anchors, add per-vendor profiles (Tenstorrent runs lower), and
-  score offline throughput through the interleaving `serve` path.
+  landed, per-vendor profiles landed, refinement ongoing*: `Efficiency`,
+  `--efficiency` (incl. `auto`), `inferencesim calibrate`, and the
+  `calibration.py` anchor harness are in; the cross-vendor `typical` is fitted
+  against 12 sourced anchors, and per-vendor `typical-nv` / `typical-tt`
+  (Tenstorrent memory 0.40) are selected by `--efficiency auto`
+  (`CALIBRATION.md` §8.1). Next: confirm the `[VERIFY]` anchors, refit the tt
+  `compute`/`collective` knobs once a compute-bound tt anchor exists, and score
+  offline throughput through the interleaving `serve` path.
 - Richer attention variants (MLA, sliding window) and speculative decoding.
