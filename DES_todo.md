@@ -91,26 +91,32 @@ Drive per-chip work against `chip_graph.expand()` resources instead of one
       flow is identical to FIFO). Not yet wired into stage links — the
       expanded-graph PR will map bandwidth-shared edges onto it.
 - [x] **Collective internals**: `collectives.py` expands each collective into
-      its per-step link transfers on per-member directional outbound links
-      (`s{s}.l{i}.cw`/`.ccw`), which also carry the pipeline hops (member 0) --
-      so collective/hop and collective/collective contention emerges. Link
-      resources carry only *bandwidth occupancy* (`bytes/bw`); propagation
-      *latency* rides the dependency chain (barrier / propagation tasks, unique
-      per collective instance / message so concurrent instances never falsely
-      serialise their flight times), never a link. So each expansion reproduces
-      its closed form exactly in isolation and diverges only under genuine
-      bandwidth contention. Ring allreduce = 2(g-1) barrier-separated steps
-      (bandwidth-optimal on RING and ALL_TO_ALL alike); MoE all-to-all is g-1
-      per-member messages on a switched fabric (occupancies serialise on the
-      outbound link, one flight time on the exit barrier), or shortest-way
-      store-and-forward routing on a RING; MESH_2D falls back to the closed
-      form (no preset uses it). `engine.ring_allreduce_time` and the switched
-      all-to-all closed form are the oracles (exact, rel=1e-9); a hand-computed
-      g=4 case oracles the routed ring all-to-all. Also fixed a bridge bug
-      where interconnect topology (now load-bearing) was written to the fabric
-      switch's meta but read from the chip composite's, so a RING system
-      silently round-tripped to ALL_TO_ALL; the switch node's meta is now its
-      single home.
+      its per-step link transfers on per-member outbound-link resources, named
+      for the fabric they egress onto (`s{s}.l{i}.out` egress port on a
+      switched fabric, `.cw`/`.ccw` cables on a ring), which also carry the
+      pipeline hops (member 0) -- so collective/hop and collective/collective
+      contention emerges. Link resources carry only *bandwidth occupancy*
+      (`bytes/bw`); propagation *latency* rides the dependency chain (barrier /
+      propagation tasks, unique per collective instance / message so concurrent
+      instances never falsely serialise their flight times), never a link. So
+      each expansion reproduces its closed form exactly in isolation and
+      diverges only under genuine bandwidth contention. Ring allreduce = 2(g-1)
+      barrier-separated steps (bandwidth-optimal on RING and ALL_TO_ALL alike);
+      MoE all-to-all is g-1 per-member messages on a switched fabric
+      (occupancies serialise on the egress port, one flight time on the exit
+      barrier), or shortest-way store-and-forward routing on a RING; MESH_2D
+      falls back to the closed form (no preset uses it). `engine.ring_allreduce_time`
+      and the switched all-to-all closed form are the oracles (exact, rel=1e-9);
+      a hand-computed g=4 case oracles the routed ring all-to-all. Also fixed a
+      bridge bug where interconnect topology (now load-bearing) was written to
+      the fabric switch's meta but read from the chip composite's, so a RING
+      system silently round-tripped to ALL_TO_ALL; the switch node's meta is now
+      its single home.
+    - Ingress/incast is unmodeled: each member has an *egress* resource, but
+      simultaneous *arrivals* at a member are unbounded -- harmless for uniform
+      collectives (per-member ingress load equals egress load), but a hot-expert
+      MoE all-to-all would incast onto the busy owners and needs a per-member
+      ingress resource before that imbalance is faithful.
 
 ### 3. Heterogeneity (lift the homogeneous-chip restriction)
 

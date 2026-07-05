@@ -137,11 +137,12 @@ def test_des_ring_fabric_moe_free_is_sane():
 
 def test_des_populates_resource_utilisation():
     """A tp>1, pp>1 run exercises the stage execution units (u{s}) and the
-    per-member outbound links (s{s}.l{i}.cw) that now carry both the expanded
-    collectives and the pipeline hops; the DES surfaces per-resource
-    utilisation in (0, 1].  The dependency-chain sync tasks (barriers /
-    propagation, which carry latency rather than link occupancy) are filtered
-    out of the report."""
+    per-member outbound links that now carry both the expanded collectives and
+    the pipeline hops; the DES surfaces per-resource utilisation in (0, 1].
+    DGX_H100 is a switched (ALL_TO_ALL) fabric, so the links are `.out` egress
+    ports.  The dependency-chain sync tasks (barriers / propagation, which
+    carry latency rather than link occupancy) are filtered out of the
+    report."""
     dep = Deployment(tp=2, pp=2, weight_dtype=DType.FP8)
     scen = Scenario(batch=32, prompt_len=2048, output_len=512)
     engine = DESEngine()
@@ -149,8 +150,8 @@ def test_des_populates_resource_utilisation():
     assert r.resource_util is not None
     decode_util = r.resource_util["decode"]
     assert any(k.startswith("u") for k in decode_util)     # stage execution units
-    assert any(".l0.cw" in k for k in decode_util)         # member-0 link (collective + hops)
-    assert any(".l1.cw" in k for k in decode_util)         # member-1 collective link
+    assert any(".l0.out" in k for k in decode_util)        # member-0 egress (collective + hops)
+    assert any(".l1.out" in k for k in decode_util)        # member-1 egress port
     assert not any(".bar" in k or ".prop" in k for k in decode_util)  # sync filtered
     assert all(0.0 < f <= 1.0 for f in decode_util.values())
 
