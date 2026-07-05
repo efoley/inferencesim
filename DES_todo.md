@@ -124,10 +124,21 @@ Drive per-chip work against `chip_graph.expand()` resources instead of one
       composite. The DES has no such need — let it consume a graph with
       mixed chips / cards directly (e.g. a Grace CPU node + GPU nodes, or
       hot vs harvested dies).
-- [ ] **Per-instance heterogeneity**: MoE hot-expert imbalance, one
-      throttled chip, a harvested 132-of-140-core die — expressible via
-      selectors + `disabled`/derated instance attributes (needs a small
-      node-attribute addition).
+- [x] **Per-instance heterogeneity** (within a chip graph): a harvested
+      132-of-140-core die, a throttled core, a derated/dead DRAM bank.
+      `Node.derate` scales an instance's rate-like figures (peak_flops,
+      bandwidth); `Node.instance_derates` overrides it per instance of a
+      counted group, and `Graph.derate_instances('tensix-fpu[132:140]', 0.0)`
+      sets it via the selector machinery. The rule: derate scales *rate-like*
+      figures only; a disabled instance (derate 0) is excluded from every
+      aggregate (including capacity), a derated-but-live one keeps full
+      capacity. `expand()` bakes overrides into each instance's plain derate,
+      `chip_from_graph` aggregates the live fraction, and `ChipModel` drops
+      disabled cores/banks and schedules on per-instance rates. Work
+      distribution is static round-robin, so the slowest instance assigned a
+      tile paces the op tail (the intended physical behaviour); work-stealing
+      and multi-chip-type systems (the bullet above, e.g. Grace + GPU or mixed
+      pipeline stages) remain future work.
 
 ### 4. Whole-system dynamics (beyond one phase in isolation)
 

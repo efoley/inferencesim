@@ -14,6 +14,7 @@ from inferencesim.graph import Edge, Graph, Node, NodeKind
 from inferencesim.graphdes import ChipModel
 from inferencesim.hardware import DType
 from inferencesim.ops import Op, OpKind
+from inferencesim.presets import BLACKHOLE_P150
 from inferencesim.presets_fine import blackhole_p150_fine, h100_sxm_fine
 
 
@@ -201,3 +202,63 @@ def test_h100_graph_des_refines_lumped_des():
     assert graph.tpot_s > 0
     assert graph.tpot_s >= lumped.tpot_s * (1 - 1e-9)
     assert graph.tpot_s == pytest.approx(lumped.tpot_s, rel=0.25)
+
+
+# ---- per-instance heterogeneity (derate) ------------------------------------
+
+
+def test_unit_derate_is_identical_to_no_derate():
+    """Degenerate case: derate 1.0 everywhere reproduces the underived chip
+    bit-for-bit (the real guard is the whole suite passing unchanged)."""
+    g2 = blackhole_p150_fine()
+    g2.derate_instances("tensix-fpu[0:140]", 1.0)  # explicit no-op derate
+    g2.derate_instances("gddr6-bank[0:8]", 1.0)
+    op = _mixed_op(read=1e7, flops=5e12)
+    a = ChipModel(blackhole_p150_fine()).op_wall(op).wall
+    b = ChipModel(g2).op_wall(op).wall
+    assert b == a
+
+
+def test_harvested_die_schedules_on_live_cores():
+    """A 132-of-140-core Blackhole: a pure-compute op with tiles a multiple of
+    132 runs on 132 cores at flops/(132 * per-core rate)."""
+    g = blackhole_p150_fine()
+    g.derate_instances("tensix-fpu[132:140]", 0.0)
+    m = ChipModel(g)
+    assert m.n_cores == 132
+    per_core = BLACKHOLE_P150.compute.flops(DType.FP8) / 140
+    F = 1e12
+    s = m.op_wall(Op("x", OpKind.COMPUTE, DType.FP8, "linear", 1, F, 0.0, 0.0))
+    assert s.n_tiles == 132  # one tile per live core
+    assert s.wall == pytest.approx(F / (132 * per_core), rel=1e-9)
+
+
+def test_disabled_bank_mem_bound_is_bytes_over_live_banks():
+    """A dead bank leaves the DRAM round-robin: a mem-bound op with tiles a
+    multiple of the 7 live banks is bytes/(7 * bank_bw), and the aggregate
+    DRAM min-cut drops to 7/8."""
+    B, R = 1e11, 3.5e6  # tile_bytes = 5e5 -> 7 tiles over 7 live banks
+    g = _chip(n_banks=8, n_cores=8, bank_bw=B, sram_cap=1e6)
+    assert g.max_flow("bank", "core") == pytest.approx(8 * B)
+    g.derate_instances("bank[7]", 0.0)
+    assert g.max_flow("bank", "core") == pytest.approx(7 * B)  # 7/8
+    m = ChipModel(g, tile_fill=0.5)
+    assert m.n_banks == 7
+    s = m.op_wall(_mem_op(R))
+    assert s.n_tiles == 7
+    assert s.wall == pytest.approx(R / (7 * B), rel=1e-9)
+
+
+def test_throttled_core_paces_the_op_tail():
+    """Two cores, one at derate 0.5, one compute tile each: the slow core's
+    tile time paces the makespan (static round-robin work distribution), and
+    the aggregate reflects 1.5 live cores."""
+    rate, F = 1e12, 2e12
+    g = _chip(n_banks=2, n_cores=2, core_flops=rate, sram_cap=1e6)
+    g.derate_instances("core[1]", 0.5)
+    m = ChipModel(g)
+    s = m.op_wall(_mixed_op(read=0.0, flops=F))
+    assert s.n_tiles == 2  # one tile per live core
+    slow_tile = (F / 2) / (rate * 0.5)
+    assert s.wall == pytest.approx(slow_tile, rel=1e-9)
+    assert g.node("core").agg_flops[DType.FP16] == pytest.approx(1.5 * rate)
