@@ -30,6 +30,7 @@ from collections import deque
 from dataclasses import dataclass
 from math import ceil, floor
 
+from .efficiency import Efficiency
 from .graph import Edge, Graph, Node, NodeKind, split_endpoint
 from .hardware import Compute
 from .ops import Op
@@ -77,12 +78,22 @@ class ChipModel:
     tile_fill is the fraction of a core's SRAM one tile may occupy; a core
     then double-buffers `max(1, floor(1/tile_fill))` tiles (0.5 -> 2 buffers:
     the next tile's read overlaps the current tile's compute).
+
+    `efficiency` derates the chip's peaks consistently with the roofline /
+    stage-DES: every element bandwidth (bank, NoC, SRAM, edges) is scaled by
+    `efficiency.memory`, every per-core FLOP/s by `efficiency.compute`, and
+    `efficiency.op_overhead_s` is added once to each op's wall (a fixed
+    per-launched-op dispatch cost -- the tiles are one kernel's internal
+    pipeline, so the overhead is charged per op, never per tile).  The default
+    `Efficiency()` is the identity and leaves every wall bit-identical.
     """
 
-    def __init__(self, graph: Graph, tile_fill: float = 0.5):
+    def __init__(self, graph: Graph, tile_fill: float = 0.5,
+                 efficiency: Efficiency = Efficiency()):
         if not 0.0 < tile_fill <= 1.0:
             raise ValueError("tile_fill must be in (0, 1]")
         self.tile_fill = tile_fill
+        self.efficiency = efficiency
         g = graph.expand(deep=True)
         g.validate()
         self.graph = g
@@ -109,10 +120,13 @@ class ChipModel:
             raise ValueError(f"{graph.name}: every compute instance is disabled")
         self.compute_instances = [n.name for n in enabled]
         self.n_cores = len(self.compute_instances)
-        # per-instance effective peak rates (peak_flops * derate); non-uniform
-        # once any core is throttled/harvested.
+        # per-instance effective peak rates (peak_flops * derate * compute
+        # efficiency); non-uniform once any core is throttled/harvested.
         self._core_flops: dict[str, dict[DType, float]] = {
-            n.name: {d: f * n.derate for d, f in (n.peak_flops or {}).items()}
+            n.name: {
+                d: f * n.derate * efficiency.compute
+                for d, f in (n.peak_flops or {}).items()
+            }
             for n in enabled
         }
 
@@ -203,12 +217,14 @@ class ChipModel:
                 # harmless because the derated node element is the binding stage
                 # of the store-and-forward chain).
                 elements.append(
-                    _Element(name, nd.bandwidth * nd.derate, nd.kind is NodeKind.SWITCH)
+                    _Element(name, nd.bandwidth * nd.derate * self.efficiency.memory,
+                             nd.kind is NodeKind.SWITCH)
                 )
             e = edges[i]
             if e.bandwidth is not None:
                 elements.append(
-                    _Element(_edge_res(name, nodes[i + 1]), e.bandwidth, False)
+                    _Element(_edge_res(name, nodes[i + 1]),
+                             e.bandwidth * self.efficiency.memory, False)
                 )
         self._chain_cache[(bank, core)] = elements
         return elements
@@ -301,4 +317,8 @@ class ChipModel:
             rel.append(comp if comp is not None else prev)
 
         result = schedule(tasks, resources)
-        return OpSchedule(result.makespan, n_tiles, tasks, result, resources)
+        # fixed per-launched-op dispatch overhead (kernel launch), added once
+        # per op rather than per tile: the tiles are this one kernel's internal
+        # double-buffered pipeline.
+        wall = result.makespan + self.efficiency.op_overhead_s
+        return OpSchedule(wall, n_tiles, tasks, result, resources)

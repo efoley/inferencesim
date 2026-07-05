@@ -275,8 +275,20 @@ serving numbers.
 - Preset spec numbers (FLOPs, bandwidths, prices, power splits) are
   best-effort approximations from public material — treat them as editable
   spec sheets (`dataclasses.replace(...)`), not ground truth.
-- Roofline numbers are upper bounds: no kernel launch overhead, perfect
-  tiling, perfect load balance, bandwidth at 100% efficiency.
+- Roofline numbers are upper bounds: perfect tiling, perfect load balance,
+  bandwidth at 100% efficiency, bandwidth-optimal collectives, no kernel
+  launch overhead. That "speed of light" (`--efficiency sol`) is the default.
+  To derate toward measured reality, pass `--efficiency typical`, which scales
+  peak compute/memory/collective bandwidth and adds a per-op launch overhead
+  (an `Efficiency`); the same knobs are available piecemeal (`--eff-compute`,
+  `--eff-memory`, `--eff-collective`, `--op-overhead-s`). **The `typical`
+  numbers are provisional placeholders** awaiting a fit against measured
+  anchors (see below); until then they are round ballparks, not calibrated.
+
+  ```bash
+  inferencesim run --hardware gb300-nvl72 --model llama-3.1-70b \
+      --tp 8 --batch 64 --weight-dtype fp4 --kv-dtype fp8 --efficiency typical
+  ```
 
 ## Roadmap
 
@@ -289,6 +301,10 @@ serving numbers.
   edges with latencies, nesting for abstraction levels).
 - Multi-rack topologies (rail-optimized Ethernet/IB); prefill/decode
   disaggregation; MoE expert load imbalance.
-- Efficiency factors calibrated against measured benchmarks (MLPerf,
-  vendor numbers) to bracket roofline optimism.
+- **Efficiency factors calibrated against measured benchmarks** (MLPerf,
+  vendor numbers) to bracket roofline optimism — *in progress*: the mechanism
+  has landed (`Efficiency`, `--efficiency`, `inferencesim calibrate`, the
+  `calibration.py` anchor harness), and the measured anchors are being fitted
+  (research tracked in `CALIBRATION.md`); the `typical` profile ships with
+  provisional placeholders until then.
 - Richer attention variants (MLA, sliding window) and speculative decoding.

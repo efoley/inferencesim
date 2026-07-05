@@ -205,7 +205,9 @@ simulator for ONE replica (dp = arrival-rate / dp, per `simulate.py`).
 Every fidelity step must keep a **degenerate case that reproduces the
 simpler model**, tested:
 
-- pp=1 → DES == roofline (already tested).
+- pp=1 → DES == roofline (already tested; holds at *any* `Efficiency`, since
+  the derating threads identically through both engines — see `CALIBRATION.md`
+  and `tests/test_efficiency.py`).
 - single bank / single port / infinite SRAM → expanded DES == lumped DES.
 - closed-form ring == expanded-ring collective under no contention.
 

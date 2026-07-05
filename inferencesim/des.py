@@ -51,6 +51,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from . import collectives
+from .efficiency import Efficiency
 from .engine import CommContext, Engine, Phase, RooflineEngine
 from .graph import Graph
 from .graphdes import ChipModel, OpSchedule
@@ -135,12 +136,21 @@ class DESEngine(Engine):
 
     chip_graph (optional) switches per-op COMPUTE unit costs from the roofline
     formula to a tile schedule over the expanded chip graph; tile_fill is
-    forwarded to the ChipModel (fraction of per-core SRAM a tile uses)."""
+    forwarded to the ChipModel (fraction of per-core SRAM a tile uses).
+
+    efficiency derates every cost consistently with the roofline: it is
+    forwarded to the internal RooflineEngine (so unit costs match) AND to the
+    ChipModel (graph mode), and the collective-expansion ingredients are
+    scaled by efficiency.collective in `_comm_plan`, with a per-comm-op
+    overhead task charged on the stage unit -- so the pp=1 serial oracle holds
+    against the roofline at ANY efficiency.  The default is the identity."""
 
     def __init__(self, decode_rounds: int | None = None,
                  warmup: int | None = None, rtol: float = 1e-3,
                  max_rounds: int = 256, chip_graph: Graph | None = None,
-                 tile_fill: float = 0.5):
+                 tile_fill: float = 0.5,
+                 efficiency: Efficiency = Efficiency()):
+        self.efficiency = efficiency
         self._auto = decode_rounds is None
         if self._auto:
             if warmup is not None:
@@ -158,9 +168,10 @@ class DESEngine(Engine):
             self.warmup = warmup
         self.rtol = rtol
         self.max_rounds = max_rounds
-        self._roofline = RooflineEngine()
+        self._roofline = RooflineEngine(efficiency)
         self._chip_model = (
-            ChipModel(chip_graph, tile_fill) if chip_graph is not None else None
+            ChipModel(chip_graph, tile_fill, efficiency)
+            if chip_graph is not None else None
         )
         # (tasks, result) from the last run of each phase, for observability
         # (per-resource utilisation, Chrome-trace export).
@@ -245,11 +256,17 @@ class DESEngine(Engine):
     def _comm_plan(
         self, ops: list[Op], dep: Deployment, comm: CommContext
     ) -> _CommPlan:
-        """Recover the per-collective transfer ingredients from the op list."""
+        """Recover the per-collective transfer ingredients from the op list.
+
+        Link bandwidths are derated by `efficiency.collective` so the per-step
+        expansion's occupancy (`bytes/bw`) matches the roofline closed form at
+        the same efficiency; latency is physical flight time and stays
+        unscaled, so the isolated makespan still reproduces the closed form."""
         payload = {op.name: op.comm_bytes for op in ops if op.is_comm}
+        coll = self.efficiency.collective
 
         def bwlat(link) -> tuple[float, float]:
-            return (link.bandwidth, link.latency_s) if link else (0.0, 0.0)
+            return (link.bandwidth * coll, link.latency_s) if link else (0.0, 0.0)
 
         ar_bw, ar_lat = bwlat(comm.tp_link)
         a2a_bw, a2a_lat = bwlat(comm.a2a_link)
@@ -279,6 +296,11 @@ class DESEngine(Engine):
         if plan.hop_lat > 0.0:
             prev = collectives._add(
                 tasks, f"s{s}.prop_h{len(tasks)}", plan.hop_lat, [prev], label)
+        # per-op-instance launch/dispatch overhead on the sending stage's unit
+        # (one hop == one P2P op instance), matching the roofline's per-op cost.
+        if self.efficiency.op_overhead_s:
+            prev = collectives._add(
+                tasks, f"u{s}", self.efficiency.op_overhead_s, [prev], f"{label} oh")
         return prev
 
     # ---- task-graph construction ---------------------------------------------
@@ -295,6 +317,7 @@ class DESEngine(Engine):
         member 0 -- so collective/hop contention emerges here rather than
         being averaged into a lumped `c{s}` fabric."""
         prefix = f"s{s}"
+        oh = self.efficiency.op_overhead_s
 
         def add(resource: str, duration: float, label: str) -> None:
             nonlocal prev_key
@@ -308,12 +331,20 @@ class DESEngine(Engine):
             prev_key = collectives.allreduce(
                 tasks, prev_key, plan.ar_group, plan.ar_bytes, plan.ar_bw,
                 plan.ar_lat, plan.ar_topo, prefix, f"{tag} ar")
+            # one launch/dispatch overhead per collective op instance, on the
+            # stage unit -- so comm-op overhead lands exactly like compute-op
+            # overhead (folded into the unit tasks) and the pp=1 chain equals
+            # the roofline's per-op-instance sum at any efficiency.
+            if oh:
+                add(f"u{s}", oh, f"{tag} ar oh")
 
         def all_to_all(payload: float) -> None:
             nonlocal prev_key
             prev_key = collectives.all_to_all(
                 tasks, prev_key, plan.a2a_group, payload, plan.a2a_bw,
                 plan.a2a_lat, plan.a2a_topo, prefix, f"{tag} a2a")
+            if oh:
+                add(f"u{s}", oh, f"{tag} a2a oh")
 
         prev_key = prev
         if is_first and c.edge:
