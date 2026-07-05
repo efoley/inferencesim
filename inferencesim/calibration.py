@@ -201,6 +201,24 @@ ANCHORS: list[Anchor] = [
               "and ISL/OSL not published; tp1/ep8 (dp=9) fills the rack as a "
               "placeholder. Cross-check, NOT a fit driver. VERIFIED (MLCommons).",
     ),
+    # ---- DGX H100 x gpt-oss-120b, TRT-LLM DEP4 (attention-DP + expert-parallel)
+    Anchor(
+        name="dgxh100-gptoss-trtllm-dep4-1k1k",
+        hardware_key="dgx-h100", model_key="gpt-oss-120b",
+        tp=1, ep=4, weight_dtype=DType.FP4, kv_dtype=DType.FP8,
+        batch=256, prompt=1000, output=1000,
+        metric="output_tok_s", measured=37480.0, regime="mixed",
+        source="https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/docs/source/developer-guide/perf-overview.md",
+        notes="TRT-LLM DEP4 (attention data-parallel + expert-parallel) gpt-oss-120b "
+              "MXFP4, 1000/1000: 4,685 tok/s/GPU. DEP4 maps exactly to tp=1, ep=4 "
+              "here -- attention data-parallel over 4 (replicated attention, KV "
+              "batch-sharded), experts sharded over 4, dispatch/combine all-to-alls, "
+              "zero-cost tp=1 attention allreduce -- the mapping this PR "
+              "documents/validates (see README Parallelism, tests/test_dep.py). "
+              "Normalised x8 GPUs (dp=2 x ep4) = 37,480 system-total. [VERIFY] the "
+              "per-GPU figure against a pinned TRT-LLM commit; DEP4 also adds EPLB "
+              "redundant-expert load balancing that tp1/ep4 does not model. VENDOR.",
+    ),
     Anchor(
         name="gb300-llama8b-mlperf51-offline",
         hardware_key="gb300-nvl72", model_key="llama-3.1-8b",

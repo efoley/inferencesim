@@ -467,7 +467,7 @@ def serve(
     replica = deployment.replica_chips
     if replica > system.total_chips:
         raise ValueError(
-            f"replica needs tp*ep={replica} chips but {system.name} has "
+            f"replica needs tp*ep*adp={replica} chips but {system.name} has "
             f"{system.total_chips}"
         )
     dp = system.total_chips // replica
@@ -480,7 +480,7 @@ def serve(
 
     # ---- memory budget --------------------------------------------------
     weights = weight_bytes_per_chip(model, deployment)
-    microbatch = config.max_batch / (deployment.pp * deployment.ep)
+    microbatch = config.max_batch / (deployment.pp * deployment.ep * deployment.adp)
     activations = 4 * microbatch * model.d_model * deployment.act_dtype.bytes
     kv_budget = chip.dram.capacity_bytes - weights - activations
     kv_per_token = kv_cache_bytes_per_chip(model, 1, deployment)
@@ -846,7 +846,9 @@ def format_serve_report(r: ServeReport) -> str:
     add("=" * 72)
     add(f"inferencesim serve  |  {s.name}  x  {m.name}")
     add("=" * 72)
-    add(f"Parallelism  : TP={d.tp}  EP={d.ep}  DP={r.dp}  ({d.replica_chips} chips/replica)"
+    add(f"Parallelism  : TP={d.tp}  EP={d.ep}"
+        + (f"  ADP={d.adp}" if d.adp > 1 else "")
+        + f"  DP={r.dp}  ({d.replica_chips} chips/replica)"
         + (f"  ({r.idle_chips} chips idle)" if r.idle_chips else ""))
     if r.mixed_lengths:
         lengths = (f"prompt p50/p99 {r.prompt_p50}/{r.prompt_p99}, "

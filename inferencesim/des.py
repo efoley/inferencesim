@@ -77,6 +77,8 @@ class _LayerCosts:
     n_allreduce: int = 0
     dispatch: float = 0.0  # MoE all-to-alls (ep > 1)
     combine: float = 0.0
+    gather: float = 0.0  # dense attention-DP FFN allgather (adp > 1)
+    scatter: float = 0.0  # dense attention-DP FFN reduce-scatter (adp > 1)
     hop: float = 0.0  # pipeline p2p
     edge: float = 0.0  # embed + lm_head on the edge stages
     n_layers: int = 1
@@ -97,10 +99,13 @@ class _CommPlan:
     ar_bw: float = 0.0
     ar_lat: float = 0.0
     ar_topo: Topology = Topology.ALL_TO_ALL
-    # MoE dispatch/combine: all-to-all over the tp*ep array
+    # MoE dispatch/combine (ep) all-to-all, or dense attention-DP FFN
+    # gather/reduce-scatter (adp) halfring, over the tp*ep*adp array
     a2a_group: int = 1
     dispatch_bytes: float = 0.0
     combine_bytes: float = 0.0
+    ffn_gather_bytes: float = 0.0
+    ffn_scatter_bytes: float = 0.0
     a2a_bw: float = 0.0
     a2a_lat: float = 0.0
     a2a_topo: Topology = Topology.ALL_TO_ALL
@@ -238,6 +243,10 @@ class DESEngine(Engine):
                 c.dispatch = one(op)
             elif op.name == "moe_combine":
                 c.combine = one(op)
+            elif op.name == "ffn_gather":
+                c.gather = one(op)
+            elif op.name == "ffn_scatter":
+                c.scatter = one(op)
             elif op.name == "pp_hop":
                 c.hop = one(op)
             elif op.name in _EDGE_OPS:
@@ -275,9 +284,11 @@ class DESEngine(Engine):
             ar_group=comm.tp,
             ar_bytes=payload.get("allreduce", 0.0),
             ar_bw=ar_bw, ar_lat=ar_lat, ar_topo=comm.tp_topology,
-            a2a_group=dep.tp * dep.ep,
+            a2a_group=comm.a2a,
             dispatch_bytes=payload.get("moe_dispatch", 0.0),
             combine_bytes=payload.get("moe_combine", 0.0),
+            ffn_gather_bytes=payload.get("ffn_gather", 0.0),
+            ffn_scatter_bytes=payload.get("ffn_scatter", 0.0),
             a2a_bw=a2a_bw, a2a_lat=a2a_lat, a2a_topo=comm.a2a_topology,
             hop_bytes=payload.get("pp_hop", 0.0),
             hop_bw=hop_bw, hop_lat=hop_lat,
@@ -346,6 +357,14 @@ class DESEngine(Engine):
             if oh:
                 add(f"u{s}", oh, f"{tag} a2a oh")
 
+        def half_ring(payload: float, name: str) -> None:
+            nonlocal prev_key
+            prev_key = collectives.half_ring(
+                tasks, prev_key, plan.a2a_group, payload, plan.a2a_bw,
+                plan.a2a_lat, plan.a2a_topo, prefix, f"{tag} {name}")
+            if oh:
+                add(f"u{s}", oh, f"{tag} {name} oh")
+
         prev_key = prev
         if is_first and c.edge:
             add(f"u{s}", 0.0, f"{tag} embed")  # embed cost folded
@@ -355,7 +374,11 @@ class DESEngine(Engine):
                 allreduce()
             if c.dispatch:
                 all_to_all(plan.dispatch_bytes)
+            if c.gather:  # dense attention-DP: allgather the full batch in
+                half_ring(plan.ffn_gather_bytes, "ffn_gather")
             add(f"u{s}", c.ffn, f"{tag} ffn")
+            if c.scatter:  # ... and reduce-scatter it back out
+                half_ring(plan.ffn_scatter_bytes, "ffn_scatter")
             if c.combine:
                 all_to_all(plan.combine_bytes)
             if c.n_allreduce >= 1 and c.allreduce:

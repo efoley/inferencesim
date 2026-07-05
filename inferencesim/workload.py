@@ -133,12 +133,13 @@ class Scenario:
 class Deployment:
     """How the model is mapped onto the hardware.
 
-    A replica occupies tp * pp * ep chips:
+    A replica occupies tp * pp * ep * adp chips:
 
       tp -- tensor parallelism: every weight matrix sharded tp ways; adds
-            2 allreduces per layer (1 for MoE layers when ep > 1).
+            2 allreduces per layer (1 for MoE layers when ep > 1, or dense
+            layers when adp > 1).
       pp -- pipeline parallelism: layers split into pp stages; decode runs
-            pp microbatches of batch/(pp*ep) through the pipeline, so TPOT
+            pp microbatches of batch/(pp*ep*adp) through the pipeline, so TPOT
             is the pipeline round time and per-chip memory drops ~1/pp.
             Wins come from raising `batch` into the freed memory, not from
             faster weight streaming.
@@ -146,11 +147,21 @@ class Deployment:
             across ep groups (each tp-sharded, handling batch/ep sequences)
             while expert weights are sharded over the full tp*ep array;
             the FFN allreduce is replaced by dispatch/combine all-to-alls.
+      adp -- attention data parallelism (dense only): the DeepSeek-V3-style
+            "DP attention + TP FFN" pattern, and TRT-LLM's DEPn for dense.
+            Attention runs data-parallel across adp groups (each tp-sharded,
+            handling batch/adp sequences, with attention weights replicated
+            across groups) so per-chip KV divides by adp; the dense FFN weights
+            shard over the whole tp*adp array (better weight streaming), and the
+            FFN allreduce is replaced by a sequence-gather before the FFN and a
+            reduce-scatter after.  MoE attention-DP is what `ep` already
+            provides, so adp is dense-only (validated).
     """
 
     tp: int = 1
     pp: int = 1
     ep: int = 1
+    adp: int = 1
     weight_dtype: DType = DType.FP8
     kv_dtype: DType = DType.BF16
     act_dtype: DType = DType.BF16
@@ -161,4 +172,4 @@ class Deployment:
 
     @property
     def replica_chips(self) -> int:
-        return self.tp * self.pp * self.ep
+        return self.tp * self.pp * self.ep * self.adp

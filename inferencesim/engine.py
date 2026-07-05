@@ -34,6 +34,26 @@ def ring_allreduce_time(payload_bytes: float, group_size: int, link: Link) -> fl
     return bw_term + lat_term
 
 
+def ring_gather_time(payload_bytes: float, group_size: int, link: Link) -> float:
+    """Bandwidth-optimal one-pass ring allgather / reduce-scatter of a
+    `payload_bytes`-per-rank result over `group_size` ranks.
+
+    Exactly HALF a ring allreduce: g-1 barrier-separated steps (not 2(g-1)),
+    each rank forwarding a payload_bytes/g shard to its neighbour, so per-rank
+    egress is (g-1)/g * payload_bytes and the makespan is
+
+        (g-1)/g * payload_bytes/bw + (g-1)*lat.
+
+    Reduce-scatter has the identical closed form (the arithmetic dual of the
+    allgather with the same communication volume)."""
+    if group_size <= 1 or payload_bytes <= 0:
+        return 0.0
+    steps = group_size - 1
+    bw_term = (steps / group_size) * payload_bytes / link.bandwidth
+    lat_term = steps * link.latency_s
+    return bw_term + lat_term
+
+
 @dataclass(frozen=True)
 class OpTiming:
     op: Op
@@ -133,12 +153,18 @@ class Phase:
 @dataclass(frozen=True)
 class CommContext:
     """The link each kind of communication travels over, given how the
-    replica's chip groups map onto the machine (tp innermost, then ep,
-    then pp)."""
+    replica's chip groups map onto the machine (tp innermost, then ep/adp,
+    then pp).
+
+    The `a2a` group is the FFN array -- tp*ep*adp -- shared by the MoE
+    dispatch/combine all-to-alls (ep) and the dense attention-DP FFN
+    gather/reduce-scatter (adp).  ep and adp are mutually exclusive (MoE vs
+    dense), so tp*ep*adp is tp*ep for MoE and tp*adp for dense."""
 
     tp: int
     tp_link: Link | None  # allreduce: spans the tp group
-    a2a_link: Link | None  # MoE all-to-all: spans the tp*ep array
+    a2a: int  # FFN-array group size: tp*ep (MoE) or tp*adp (dense)
+    a2a_link: Link | None  # MoE all-to-all / dense FFN halfring: spans the a2a array
     p2p_link: Link | None  # pipeline hop: crosses stage boundaries
     # topology of each group's fabric (the discrete-event engine expands
     # collectives per-step over it; the roofline engine ignores it).
@@ -147,13 +173,15 @@ class CommContext:
 
     @classmethod
     def for_deployment(cls, system: System, dep: Deployment) -> "CommContext":
+        a2a_group = dep.tp * dep.ep * dep.adp
         return cls(
             tp=dep.tp,
             tp_link=system.link_for_group(dep.tp),
-            a2a_link=system.link_for_group(dep.tp * dep.ep),
+            a2a=a2a_group,
+            a2a_link=system.link_for_group(a2a_group),
             p2p_link=system.link_for_group(dep.replica_chips),
             tp_topology=system.topology_for_group(dep.tp),
-            a2a_topology=system.topology_for_group(dep.tp * dep.ep),
+            a2a_topology=system.topology_for_group(a2a_group),
         )
 
 
@@ -194,6 +222,21 @@ class RooflineEngine(Engine):
                     op.comm_bytes, comm.tp, _scaled_link(comm.tp_link, eff.collective)
                 )
                 if comm.tp > 1
+                else 0.0
+            )
+            one += eff.op_overhead_s
+            return OpTiming(op, op.count * one, 0.0, 0.0, op.count * one)
+        if op.kind is OpKind.HALFRING:
+            # dense attention-DP FFN allgather / reduce-scatter over the tp*adp
+            # array: one-pass ring (half an allreduce).  Collective efficiency
+            # scales the bandwidth (occupancy) term, never the flight latency.
+            if comm.a2a_link is None:
+                raise ValueError(f"{op.name}: no link available for {op.kind.value}")
+            one = (
+                ring_gather_time(
+                    op.comm_bytes, comm.a2a, _scaled_link(comm.a2a_link, eff.collective)
+                )
+                if comm.a2a > 1
                 else 0.0
             )
             one += eff.op_overhead_s

@@ -14,7 +14,7 @@ Parallelism mapping (a replica = tp * pp * ep chips):
   TP  every matrix is sharded tp ways; partial results are summed with ring
       allreduces over the tp group.
   PP  layers are split into pp equal stages.  Decode runs pp microbatches
-      (each batch/(pp*ep) sequences per attention group) round-robin through
+      (each batch/(pp*ep*adp) sequences per attention group) round-robin through
       the pipeline; because stages are balanced, the pipeline round time --
       which is what a request experiences as TPOT -- equals the whole-model
       op list evaluated at the microbatch size, plus pp P2P hops.  Prefill
@@ -25,6 +25,14 @@ Parallelism mapping (a replica = tp * pp * ep chips):
       expert weights are sharded across the full tp*ep array.  Tokens are
       shuffled to their experts' owners with dispatch/combine all-to-alls,
       and the FFN allreduce disappears.
+  ADP (dense) attention runs data-parallel across adp groups (each tp-sharded,
+      handling batch/adp sequences, attention weights replicated across the
+      groups) while the dense FFN weights shard over the full tp*adp array.
+      The FFN allreduce is replaced by an allgather that assembles each token's
+      full hidden state before the FFN and a reduce-scatter after it -- the
+      DeepSeek-V3 "DP attention + TP FFN" pattern, and TRT-LLM's dense DEPn.
+      Per-chip KV divides by adp (batch-sharded); the FFN streams 1/(tp*adp) of
+      the weights.  adp is dense-only (MoE attention-DP is exactly ep).
 """
 
 from __future__ import annotations
@@ -40,10 +48,16 @@ class OpKind(str, Enum):
     COMPUTE = "compute"  # math + DRAM traffic on one chip
     ALLREDUCE = "allreduce"  # ring collective across the tp group
     ALLTOALL = "alltoall"  # MoE dispatch/combine across the tp*ep array
+    # one-pass ring collective across the tp*adp array: the dense attention-DP
+    # FFN's allgather (assemble the full-batch hidden state) and reduce-scatter
+    # (reduce it back to sequence shards).  Both cost the same -- exactly HALF a
+    # ring allreduce (g-1 steps vs 2(g-1)) -- since reduce-scatter is the
+    # arithmetic dual of allgather with identical communication volume.
+    HALFRING = "halfring"
     P2P = "p2p"  # activation hop between adjacent pipeline stages
 
 
-COMM_KINDS = {OpKind.ALLREDUCE, OpKind.ALLTOALL, OpKind.P2P}
+COMM_KINDS = {OpKind.ALLREDUCE, OpKind.ALLTOALL, OpKind.HALFRING, OpKind.P2P}
 
 
 @dataclass(frozen=True)
@@ -64,11 +78,17 @@ class Op:
 
 
 def validate_deployment(model: ModelSpec, dep: Deployment) -> None:
-    if min(dep.tp, dep.pp, dep.ep) < 1:
-        raise ValueError("tp, pp and ep must all be >= 1")
+    if min(dep.tp, dep.pp, dep.ep, dep.adp) < 1:
+        raise ValueError("tp, pp, ep and adp must all be >= 1")
     if dep.ep > 1 and model.moe is None:
         raise ValueError(
             f"ep={dep.ep} but {model.name} is dense; expert parallelism needs a MoE model"
+        )
+    if dep.adp > 1 and model.moe is not None:
+        raise ValueError(
+            f"adp={dep.adp} but {model.name} is MoE; MoE attention data-parallelism "
+            f"is exactly what expert parallelism provides (use ep={dep.adp}, tp=1) -- "
+            f"adp is dense-only (DP attention + TP FFN)"
         )
 
 
@@ -82,10 +102,12 @@ def kv_cache_bytes_per_chip(model: ModelSpec, n_tokens: float, dep: Deployment) 
     """KV bytes per chip for n_tokens total cached tokens in the replica.
 
     A chip stores its pipeline stage's layers (1/pp) for its attention
-    group's sequences (1/ep), sharded across kv heads (up to n_kv ways).
+    group's sequences (1/ep for MoE, 1/adp for dense attention-DP), sharded
+    across kv heads (up to n_kv ways).  The batch-sharding by ep/adp is the
+    point of those patterns: it cuts per-chip KV by the group degree.
     """
     per_layer = 2 * _kv_heads_per_chip(model, dep.tp) * model.d_head * dep.kv_dtype.bytes
-    return model.n_layers * per_layer * n_tokens / (dep.pp * dep.ep)
+    return model.n_layers * per_layer * n_tokens / (dep.pp * dep.ep * dep.adp)
 
 
 def _linear(
@@ -143,20 +165,66 @@ def _attention(model: ModelSpec, n_seq: float, q_len: float, kv_len: float,
     )
 
 
+def _ffn_gather_scatter(model: ModelSpec, tokens_total: float,
+                        dep: Deployment, count: int) -> list[Op]:
+    """The two ring collectives that bracket a dense attention-DP FFN.
+
+    With adp > 1 the FFN is tensor-parallel over the whole g = tp*adp array,
+    but attention-DP leaves each token's hidden state sequence-sharded (one
+    B/g-row shard per chip).  So before the FFN an **allgather** assembles the
+    full [tokens_total, d_model] batch on every chip (the FFN's column-parallel
+    first GEMM needs the whole d_model row), and after it a **reduce-scatter**
+    sums the row-parallel output partials back to one B/g shard per chip.
+
+    Payload and closed form (derived from the ring send volumes):
+      Let D = tokens_total * d_model * act_bytes be the FULL-batch hidden state
+      each chip ends up holding after the allgather.  A ring allgather over g
+      chips runs g-1 steps; in each step every chip forwards one D/g-byte shard
+      to its neighbour, so per-chip egress is (g-1)*(D/g) and the makespan is
+
+          (g-1)/g * D/bw + (g-1)*lat.
+
+      The reduce-scatter is the arithmetic dual -- same g-1 steps, same D/g per
+      step -- so it has the identical closed form.  Together the two are exactly
+      one ring allreduce of D (2(g-1) steps), which is what a non-adp TP FFN
+      would pay: adp trades that single tp-group allreduce for an allgather +
+      reduce-scatter over the larger tp*adp group.
+
+    `comm_bytes` carries D (the per-rank result size); the engine's
+    `ring_gather_time` applies the (g-1)/g and (g-1) factors with g = tp*adp.
+    """
+    if dep.adp <= 1:
+        return []
+    payload = tokens_total * model.d_model * dep.act_dtype.bytes
+    return [
+        Op(name=name, kind=OpKind.HALFRING, dtype=dep.act_dtype,
+           category="comm", count=count, comm_bytes=payload)
+        for name in ("ffn_gather", "ffn_scatter")
+    ]
+
+
 def _ffn_ops(model: ModelSpec, tokens_per_group: float, tokens_total: float,
              dep: Deployment, count: int) -> list[Op]:
     """FFN for one layer.
 
     tokens_per_group: tokens seen by one attention/ep group (drives the
     dense/shared path and the all-to-all payload per chip).
-    tokens_total: tokens across all ep groups (drives expert traffic, since
-    expert weights are sharded over the whole tp*ep array).
+    tokens_total: tokens across all ep/adp groups (drives expert traffic and
+    the dense attention-DP FFN, since those weights are sharded over the whole
+    tp*ep / tp*adp array).
     """
     if model.moe is None:
-        return [
-            _linear("ffn", tokens_per_group, model.ffn_params_total,
-                    model.d_model, model.d_model, dep, count)
-        ]
+        # dense FFN shards over the whole tp*adp array and processes the full
+        # batch (all adp groups); with adp == 1 this is the historical tp-shard
+        # over one group's tokens (tokens_total == tokens_per_group).  The
+        # gather/scatter bracket vanishes at adp == 1.
+        gather_scatter = _ffn_gather_scatter(model, tokens_total, dep, count)
+        gather = gather_scatter[:1]  # allgather before the FFN (or nothing)
+        scatter = gather_scatter[1:]  # reduce-scatter after (or nothing)
+        ffn = _linear("ffn", tokens_total, model.ffn_params_total,
+                      model.d_model, model.d_model, dep, count,
+                      shard=dep.tp * dep.adp)
+        return [*gather, ffn, *scatter]
     moe = model.moe
     ops: list[Op] = []
     expert_shard = dep.tp * dep.ep
@@ -201,9 +269,15 @@ def _allreduce(tokens: float, model: ModelSpec, dep: Deployment, count: int) -> 
 
 
 def _allreduces_per_layer(model: ModelSpec, dep: Deployment) -> int:
-    """One reduction after attention and one after the FFN, except that with
-    EP the FFN result is combined by the all-to-all instead."""
-    return 1 if (model.moe is not None and dep.ep > 1) else 2
+    """One reduction after attention and one after the FFN, except that the FFN
+    reduction is subsumed by another collective -- the MoE dispatch/combine
+    all-to-all (ep > 1), or the dense attention-DP gather/reduce-scatter
+    (adp > 1) -- leaving only the within-group attention allreduce."""
+    if model.moe is not None and dep.ep > 1:
+        return 1
+    if model.moe is None and dep.adp > 1:
+        return 1
+    return 2
 
 
 def _pipeline_hops(tokens: float, model: ModelSpec, dep: Deployment, count: int) -> list[Op]:
@@ -255,8 +329,10 @@ def decode_ops(model: ModelSpec, dep: Deployment, batch: float, ctx: float) -> l
     validate_deployment(model, dep)
     B = batch
     L = model.n_layers
-    b_att = B / (dep.pp * dep.ep)  # sequences per attention group per microbatch
-    b_tok = B / dep.pp  # tokens per microbatch across all ep groups
+    # sequences per attention group per microbatch (batch-sharded by ep for MoE,
+    # by adp for dense attention-DP); tokens per microbatch across all groups
+    b_att = B / (dep.pp * dep.ep * dep.adp)
+    b_tok = B / dep.pp
 
     ops: list[Op] = [
         _linear("qkv_proj", b_att, model.attn_qkv_params, model.d_model,
@@ -280,7 +356,7 @@ def decode_attention_op(model: ModelSpec, dep: Deployment, batch: float, ctx: fl
     bytes are linear in `batch * ctx` (= the total context streamed this step),
     so a serving loop can recost just this op as the KV cache grows while the
     rest of the decode step stays fixed for a given batch size."""
-    b_att = batch / (dep.pp * dep.ep)  # sequences per attention group
+    b_att = batch / (dep.pp * dep.ep * dep.adp)  # sequences per attention group
     return _attention(model, n_seq=b_att, q_len=1, kv_len=ctx, causal_new=False,
                       dep=dep, count=model.n_layers)
 

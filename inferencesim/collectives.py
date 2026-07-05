@@ -89,32 +89,25 @@ def egress(prefix: str, i: int, topology: Topology) -> str:
     return _cw(prefix, i) if topology is Topology.RING else _out(prefix, i)
 
 
-def ring_allreduce(
+def _ring_pass(
     tasks: list[Task], entry: int | None, group: int, payload: float,
     bw: float, lat: float, topology: Topology, prefix: str, label: str,
-) -> int | None:
-    """Bandwidth-optimal ring allreduce as 2(g-1) barrier-separated steps.
-
-    In every step each member `i` sends `payload/g` bytes to `(i+1) % g` via
-    its egress link (the logical ring is bandwidth-optimal on a switched fabric
-    too; the send leaves the chip's one egress port, so the resource is named
-    `.out` on ALL_TO_ALL and `.cw` on RING) -- one task per member per step
-    carrying only the bandwidth occupancy `payload/(g*bw)`.  A barrier task
-    carrying the propagation latency `lat` joins each step to the next (the
-    next step's sends wait on *all* of this step's sends, then one flight
-    time).  Returns the final barrier key.  In isolation the makespan is
-    exactly
-
-        2(g-1) * (payload/(g*bw) + lat) == ring_allreduce_time(payload,g,link),
-
-    while each link's busy time is pure occupancy 2(g-1)*payload/(g*bw) with
-    no phantom latency.
-    """
-    if group <= 1 or payload <= 0.0:
-        return entry
+    steps: int,
+) -> int:
+    """`steps` barrier-separated ring steps: in every step each member `i` sends
+    `payload/g` bytes to `(i+1) % g` via its egress link (the logical ring is
+    bandwidth-optimal on a switched fabric too; the send leaves the chip's one
+    egress port, so the resource is named `.out` on ALL_TO_ALL and `.cw` on
+    RING) -- one task per member per step carrying only the bandwidth occupancy
+    `payload/(g*bw)`.  A barrier task carrying the propagation latency `lat`
+    joins each step to the next (the next step's sends wait on *all* of this
+    step's sends, then one flight time).  Returns the final barrier key.  In
+    isolation the makespan is exactly `steps * (payload/(g*bw) + lat)` while each
+    link's busy time is pure occupancy `steps*payload/(g*bw)` with no phantom
+    latency.  A full ring allreduce is 2(g-1) steps; an allgather / reduce-
+    scatter is g-1 (half)."""
     inst = len(tasks)
     bar = f"{prefix}.bar{inst}"
-    steps = 2 * (group - 1)
     occ = payload / (group * bw)
     send = [egress(prefix, i, topology) for i in range(group)]  # resolved once
     prev = entry
@@ -125,7 +118,54 @@ def ring_allreduce(
             for i in range(group)
         ]
         prev = _add(tasks, bar, lat, sends, label)
+    assert prev is not None
     return prev
+
+
+def ring_allreduce(
+    tasks: list[Task], entry: int | None, group: int, payload: float,
+    bw: float, lat: float, topology: Topology, prefix: str, label: str,
+) -> int | None:
+    """Bandwidth-optimal ring allreduce as 2(g-1) barrier-separated steps.  In
+    isolation the makespan is exactly
+
+        2(g-1) * (payload/(g*bw) + lat) == ring_allreduce_time(payload,g,link),
+
+    while each link's busy time is pure occupancy 2(g-1)*payload/(g*bw) with no
+    phantom latency (see `_ring_pass`)."""
+    if group <= 1 or payload <= 0.0:
+        return entry
+    return _ring_pass(tasks, entry, group, payload, bw, lat, topology, prefix,
+                      label, steps=2 * (group - 1))
+
+
+def half_ring(
+    tasks: list[Task], entry: int | None, group: int, payload: float,
+    bw: float, lat: float, topology: Topology, prefix: str, label: str,
+) -> int | None:
+    """Expand a one-pass ring collective over `group = tp*adp` chips -- the dense
+    attention-DP FFN's allgather (assemble the full-batch hidden state) or
+    reduce-scatter (reduce its output back to sequence shards).  It is exactly
+    HALF a ring allreduce: g-1 barrier-separated steps, so in isolation the
+    makespan is
+
+        (g-1) * (payload/(g*bw) + lat) == ring_gather_time(payload,g,link),
+
+    and each link's busy time is pure occupancy (g-1)*payload/(g*bw).  The ring
+    algorithm is bandwidth-optimal on RING and ALL_TO_ALL fabrics alike; MESH_2D
+    falls back to the same closed form (occupancy on the port, latency on a
+    barrier).  Reduce-scatter is the arithmetic dual of allgather with identical
+    communication volume, so both FFN-boundary collectives share this expansion."""
+    if group <= 1 or payload <= 0.0:
+        return entry
+    if topology is Topology.MESH_2D:
+        # TODO: expand a 2-D mesh allgather per-step; no preset uses MESH_2D yet.
+        steps = group - 1
+        deps = [entry] if entry is not None else []
+        occ = _add(tasks, _out(prefix, 0), steps / group * payload / bw, deps, label)
+        return _add(tasks, f"{prefix}.bar{len(tasks)}", steps * lat, [occ], label)
+    return _ring_pass(tasks, entry, group, payload, bw, lat, topology, prefix,
+                      label, steps=group - 1)
 
 
 def _a2a_switched(

@@ -17,23 +17,26 @@ from .workload import Deployment, ModelSpec, Scenario
 
 
 def weight_bytes_per_chip(model: ModelSpec, dep: Deployment) -> float:
-    """Per-chip weight footprint under the tp/pp/ep mapping.
+    """Per-chip weight footprint under the tp/pp/ep/adp mapping.
 
-    Layers are split across pp stages and tp-sharded; expert weights are
-    additionally spread over the ep groups, while attention/dense/shared
-    weights are replicated across them.  Embedding + LM head live on the
-    edge stages, tp-sharded.
+    Layers are split across pp stages and tp-sharded.  The FFN sub-array
+    additionally spreads over its extra groups -- MoE expert weights over ep,
+    the dense FFN over adp (attention-DP + TP FFN) -- while attention (and MoE
+    shared-expert) weights are replicated across those groups.  Embedding + LM
+    head live on the edge stages, tp-sharded.
     """
     if model.moe is None:
-        layer_replicated = model.attn_params + model.ffn_params_total
-        layer_expert = 0.0
+        layer_replicated = model.attn_params  # replicated across adp groups
+        layer_ffn = model.ffn_params_total  # dense FFN shards over tp*adp
+        ffn_denom = dep.tp * dep.adp * dep.pp
     else:
         layer_replicated = model.attn_params + model.shared_expert_params
-        layer_expert = model.moe.n_experts * model.expert_params
+        layer_ffn = model.moe.n_experts * model.expert_params  # shards over tp*ep
+        ffn_denom = dep.tp * dep.ep * dep.pp
     params = (
         model.embedding_params / dep.tp
         + model.n_layers * layer_replicated / (dep.tp * dep.pp)
-        + model.n_layers * layer_expert / (dep.tp * dep.ep * dep.pp)
+        + model.n_layers * layer_ffn / ffn_denom
     )
     return params * dep.weight_dtype.bytes
 
@@ -124,7 +127,7 @@ def simulate(
     replica = deployment.replica_chips
     if replica > system.total_chips:
         raise ValueError(
-            f"replica needs tp*pp*ep={replica} chips but {system.name} has "
+            f"replica needs tp*pp*ep*adp={replica} chips but {system.name} has "
             f"{system.total_chips}"
         )
 
@@ -133,18 +136,19 @@ def simulate(
     warnings: list[str] = []
     if idle_chips:
         warnings.append(
-            f"{idle_chips} chip(s) idle: total chips not divisible by tp*pp*ep={replica}"
+            f"{idle_chips} chip(s) idle: total chips not divisible by tp*pp*ep*adp={replica}"
         )
     if deployment.pp > 1 and model.n_layers % deployment.pp:
         warnings.append(
             f"pp={deployment.pp} does not divide {model.n_layers} layers; "
             f"stages assumed balanced anyway"
         )
-    microbatch = scenario.batch / (deployment.pp * deployment.ep)
+    groups = deployment.pp * deployment.ep * deployment.adp
+    microbatch = scenario.batch / groups
     if microbatch < 1:
         warnings.append(
-            f"batch={scenario.batch} < pp*ep={deployment.pp * deployment.ep}: "
-            f"pipeline/expert groups are starved (raise batch)"
+            f"batch={scenario.batch} < pp*ep*adp={groups}: "
+            f"pipeline/expert/attention groups are starved (raise batch)"
         )
 
     chip = system.node.chip

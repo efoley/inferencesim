@@ -7,7 +7,7 @@ make such comparisons honest, the published derating ranges, and the transparent
 fit that produced `PROFILES["typical"]`.
 
 **Status (2026-07-05):** mechanism landed; `calibration.ANCHORS` is populated
-with 11 sourced anchors; `PROFILES["typical"]` is **fitted (coarse)** from them
+with 12 sourced anchors; `PROFILES["typical"]` is **fitted (coarse)** from them
 (§8). Every measured figure carries a source, a retrieval/publication date, and
 a provenance tag:
 
@@ -190,6 +190,18 @@ widely cited **~24,525 system tok/s** ([MLCommons](https://mlcommons.org/benchma
 (MXFP4, ep8, disagg/parallelism unknown), `gb300-llama8b-mlperf51` (NVFP4,
 disaggregated → unmodeled, so wide).
 
+**DEP4 (attention-DP + expert-parallel) on DGX H100.** TRT-LLM benchmarks
+gpt-oss-120b in a `DEPn` layout — attention data-parallel, experts sharded over
+the same ranks. `DEPn` maps **exactly** to `tp=1, ep=n` in this simulator
+(attention replicated, batch/KV sharded by `ep`, experts over `ep`,
+dispatch/combine all-to-alls, zero-cost tp=1 attention allreduce — validated in
+`tests/test_dep.py` and documented in the README Parallelism section). Encoded
+as `dgxh100-gptoss-trtllm-dep4-1k1k`: MXFP4, 1000/1000, **4,685 tok/s/GPU** ×8
+GPUs (dp=2 × ep4) = **37,480 system-total**, sol **1.64×** / typical **0.95×**
+(a clean mixed cross-check). **[VERIFY]** the per-GPU figure against a pinned
+TRT-LLM commit; DEP4 additionally uses EPLB redundant-expert load balancing that
+`tp=1, ep=4` does not model.
+
 ### 6.4 DGX Spark (GB10) × Llama-3.1-8B — bandwidth-bound decode
 
 | stack | dtype | batch | decode tok/s/user | prefill tok/s | tag | source |
@@ -240,10 +252,11 @@ NVIDIA published **no Hopper** gpt-oss number. Best independent:
 [SemiAnalysis InferenceMAX v1](https://inferencex.semianalysis.com/compare/gptoss-120b-h100-vs-h200)
 (Oct 2025), 1K/1K @ 117 tok/s/user: H100 **2,621.5**/GPU, H200 **2,812.2**/GPU.
 vLLM 0.10.1.1 ([Simplismart](https://simplismart.ai/blog/deploy-gpt-oss-120b-h100-vllm)):
-1× H100 5,233.56 tok/s (TPOT 16.70 ms), 2× H100 12,690.75. Not encoded (our
-gpt-oss anchor is the GB300 MLPerf rack point); listed for the future H100/gpt-oss
-pair. `qwen3-32b` best secondary: GPUStack 1× H100 vLLM BF16 ShareGPT ~2,352.82;
-TRT-LLM FP8 2000/100 → 5,902.
+1× H100 5,233.56 tok/s (TPOT 16.70 ms), 2× H100 12,690.75. These single/dual-GPU
+dense-ish points are not encoded; the encoded DGX-H100 gpt-oss anchor is the
+**DEP4** rack point (`dgxh100-gptoss-trtllm-dep4-1k1k`, §6.3), plus the GB300
+MLPerf rack point. `qwen3-32b` best secondary: GPUStack 1× H100 vLLM BF16
+ShareGPT ~2,352.82; TRT-LLM FP8 2000/100 → 5,902.
 
 ---
 
@@ -261,7 +274,7 @@ TRT-LLM FP8 2000/100 → 5,902.
 
 ## 8. The encoded anchor set + the fit
 
-`calibration.ANCHORS` holds 11 anchors. Scored under `sol` (must be optimistic,
+`calibration.ANCHORS` holds 12 anchors. Scored under `sol` (must be optimistic,
 `>= 1`) and the fitted `typical`:
 
 | anchor | regime | metric | measured | sol | typical | role |
@@ -271,6 +284,7 @@ TRT-LLM FP8 2000/100 → 5,902.
 | dgxh100-llama70b-trtllm-tp2-1k1k | mixed | output_tok_s | 17,672 | 1.34 | 0.77 | cross-check |
 | dgxh100-llama70b-trtllm-tp2-8k1k | prefill | output_tok_s | 3,184 | 1.66 | 0.97 | **compute** |
 | dgxh100-llama70b-mlperf41-offline | mixed | decode_ceil_tok_s | 24,525 | 1.09 | 0.73 | cross-check |
+| dgxh100-gptoss-trtllm-dep4-1k1k | mixed | output_tok_s | 37,480 | 1.64 | 0.95 | cross-check (DEP4 mapping) |
 | gb300-gptoss-mlperf60-offline | mixed | output_tok_s | 1,046,150 | 1.01 | 0.56 | coarse (excl.) |
 | gb300-llama8b-mlperf51-offline | mixed | output_tok_s | 1,322,640 | 3.39 | 1.79 | coarse (excl.) |
 | qb2-qwen32b-ttmetal-b32 | mixed | output_tok_s | 691 | 1.57 | 0.96 | cross-check |
@@ -278,9 +292,10 @@ TRT-LLM FP8 2000/100 → 5,902.
 | spark-llama8b-lmsys-decode | decode | tpot_ms | 48.78 | 1.76 | 1.00 | **memory** |
 | spark-llama8b-lmsys-b32 | mixed | output_tok_s | 368 | 1.16 | 0.66 | cross-check |
 
-**sol:** median **1.57×**, range [1.01×, 3.39×] — every anchor optimistic (the
+**sol:** median **1.60×**, range [1.01×, 3.39×] — every anchor optimistic (the
 invariant holds; a test enforces it). **typical:** median **0.96×**, range
-[0.56×, 1.79×] — brackets 1.
+[0.56×, 1.79×] — brackets 1. The DEP4 point (added with the attention-DP PR) is a
+clean mixed cross-check; the fit knobs are unchanged (it is not a fit driver).
 
 **The fit (simple + transparent):**
 - **memory = 0.57** = 1 / 1.76, the clean tp=1 batch-1 decode probe
@@ -331,9 +346,14 @@ Refit when anchors change (`inferencesim calibrate --efficiency sol`, then fit p
       per-GPU/per-rack conversions into `measured` with the raw value in `notes`.
 - [ ] Consider a **per-vendor `Efficiency`** (Tenstorrent memory ~0.40) once more
       vendor anchors exist — one global `typical` under-serves them today.
-- [ ] Explicit **attention-DP + expert-parallel (TRT-LLM DEPn)** deployments are a
-      later PR; today DEPn anchors are compared against `tp=1, ep=n` as an
-      approximation (flagged per-row).
+- [x] Explicit **attention-DP + expert-parallel (TRT-LLM DEPn)** deployments
+      landed: dense attention-DP is `Deployment.adp` (DP attention + TP FFN), and
+      MoE `DEPn ≡ tp=1, ep=n` is documented/validated (README Parallelism,
+      `tests/test_dep.py`); the `dgxh100-gptoss-trtllm-dep4-1k1k` anchor encodes a
+      DEP4 point (sol 1.64×). Remaining honest deltas: **[VERIFY]** the DEP4
+      per-GPU figure against a pinned TRT-LLM commit, and model **EPLB
+      redundant-expert load balancing** + **mixed ADP+TP MoE attention** (TRT-LLM
+      does both; `tp=1, ep=n` does neither).
 
 _All retrieval dates: 2026-07-05. **[VERIFY]** cells and any GB200→GB300 uplift
 are unconfirmed/interpolated and flagged in-anchor `notes`._
