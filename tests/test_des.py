@@ -118,18 +118,98 @@ def test_des_ring_fabric_moe_free_is_sane():
     no MoE all-to-all.  The DES stays finite and positive and in the same
     ballpark as the analytic engine.
 
-    The DES sits ~1.65x above the perfect-overlap roofline here; that gap is
-    the pp>1 pipeline/contention model (unchanged), not the collective
-    expansion, which for a g=2 allreduce reproduces the old closed-form
-    timing exactly -- this run is numerically identical to the pre-expansion
-    engine."""
+    This pp=2 pipeline fills slowly: convergence control grows the measurement
+    out to ~256 rounds, where the steady-state period settles at ~roofline (a
+    hair below it -- microbatch overlap lets the DES beat the serial roofline
+    sum slightly).  A fixed 16-round run instead reads ~1.65x higher purely
+    because the fill transient has not yet decayed -- exactly the artefact
+    convergence control removes.  The g=2 allreduce expansion itself still
+    reproduces the old closed-form timing exactly, so the collective model is
+    unchanged here."""
     from inferencesim.presets import TT_QUIETBOX
     dep = Deployment(tp=2, pp=2, weight_dtype=DType.FP8, kv_dtype=DType.FP8)
     scen = Scenario(batch=32, prompt_len=2048, output_len=512)
     d = simulate(TT_QUIETBOX, LLAMA_3_1_70B, scen, dep, engine=DESEngine())
     a = simulate(TT_QUIETBOX, LLAMA_3_1_70B, scen, dep, engine=RooflineEngine())
     assert d.tpot_s > 0 and d.ttft_s > 0
-    assert a.tpot_s <= d.tpot_s <= 3 * a.tpot_s
+    assert 0.9 * a.tpot_s <= d.tpot_s <= 3 * a.tpot_s
+
+
+# ---- convergence control ----------------------------------------------------
+
+
+def test_auto_convergence_pp1_serial_is_exact_and_immediate():
+    """Auto mode (the new default) on a serial pp=1 chain: the round period is
+    exact from the first round, so successive estimates agree immediately, the
+    engine reports converged, and TPOT equals roofline to full precision."""
+    dep = Deployment(tp=8, weight_dtype=DType.FP8)
+    scen = Scenario(batch=32, prompt_len=2048, output_len=512)
+    a = _run(dep, scen, RooflineEngine())
+    engine = DESEngine()
+    d = _run(dep, scen, engine)
+    assert d.tpot_s == pytest.approx(a.tpot_s, rel=1e-9)
+    assert engine.last_convergence["converged"] is True
+    assert engine.last_convergence["rel_delta"] < 1e-9  # exact from round 1
+
+
+def test_auto_convergence_unbalanced_pipeline_matches_long_fixed_run():
+    """Auto mode on an unbalanced pp=4 pipeline (10 layers -> 3/3/2/2) grows
+    the round count past the small start, reports converged, and lands within
+    rtol of a long fixed 128-round run."""
+    from inferencesim.workload import ModelSpec
+
+    model = ModelSpec(name="tiny", n_layers=10, d_model=4096, n_heads=32,
+                      n_kv_heads=8, d_head=128, d_ff=16384, vocab_size=1000)
+    dep = Deployment(tp=1, pp=4, weight_dtype=DType.FP8)
+    scen = Scenario(batch=8, prompt_len=512, output_len=128)
+    engine = DESEngine()  # auto, rtol=1e-3
+    auto = _run(dep, scen, engine, model=model)
+    fixed = _run(dep, scen, DESEngine(decode_rounds=128), model=model)
+    assert engine.last_convergence["converged"] is True
+    assert 8 < engine.last_convergence["rounds"] <= 128  # actually grew
+    assert auto.tpot_s == pytest.approx(fixed.tpot_s, rel=engine.rtol)
+
+
+def test_explicit_rounds_preserve_historical_fixed_behaviour():
+    """Explicit decode_rounds/warmup pins a fixed run: warmup left unset
+    defaults to decode_rounds // 2 (the historical 16/8 ratio) and gives a
+    byte-identical result, the convergence bookkeeping stays empty, and the
+    fixed-16 value is distinct from the new auto default -- which is the
+    behaviour change this guards."""
+    dep = Deployment(tp=1, pp=4, weight_dtype=DType.FP8)
+    scen = Scenario(batch=8, prompt_len=512, output_len=128)
+    explicit = DESEngine(decode_rounds=16, warmup=8)
+    r_explicit = _run(dep, scen, explicit, model=_tiny_model())
+    r_implicit = _run(dep, scen, DESEngine(decode_rounds=16), model=_tiny_model())
+    assert r_explicit.tpot_s == r_implicit.tpot_s   # byte-identical fixed path
+    assert explicit.last_convergence is None         # nothing auto-grown
+    # the new default (auto) genuinely differs from the old fixed-16 default
+    r_auto = _run(dep, scen, DESEngine(), model=_tiny_model())
+    assert abs(r_auto.tpot_s - r_explicit.tpot_s) / r_explicit.tpot_s > 1e-4
+
+
+def test_auto_convergence_reports_cap_hit_without_converging():
+    """A slow-filling pipeline capped below its settling point reports
+    converged=False and the round count it stopped at, rather than printing or
+    raising (the engine has no channel to the report's warnings list)."""
+    from inferencesim.presets import TT_QUIETBOX
+    dep = Deployment(tp=2, pp=2, weight_dtype=DType.FP8, kv_dtype=DType.FP8)
+    scen = Scenario(batch=32, prompt_len=2048, output_len=512)
+    engine = DESEngine(max_rounds=32)  # far below where this pp=2 ring settles
+    simulate(TT_QUIETBOX, LLAMA_3_1_70B, scen, dep, engine=engine)
+    assert engine.last_convergence["converged"] is False
+    assert engine.last_convergence["rounds"] == 32
+    assert engine.last_convergence["rel_delta"] > engine.rtol
+
+
+def test_explicit_path_validation_still_enforced():
+    """The historical guard survives on the explicit path: decode_rounds must
+    exceed warmup, and warmup is meaningless without an explicit decode_rounds
+    (auto mode chooses it per iteration)."""
+    with pytest.raises(ValueError):
+        DESEngine(decode_rounds=8, warmup=8)
+    with pytest.raises(ValueError):
+        DESEngine(warmup=4)
 
 
 # ---- observability: per-resource utilisation --------------------------------

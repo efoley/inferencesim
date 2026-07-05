@@ -122,16 +122,42 @@ class DESEngine(Engine):
     is simulated for `decode_rounds` full rounds and TPOT is the mean round
     period after discarding `warmup` rounds (fill transient).
 
+    Both default to None, which selects *convergence control*: the round
+    count is grown automatically (start small, then double, rebuilding the
+    task graph each time) until two successive period estimates agree within
+    `rtol`, or `max_rounds` is hit.  Passing an explicit `decode_rounds`
+    pins a fixed run instead (byte-identical to the historical engine); with
+    `warmup` left None it defaults to `decode_rounds // 2` (the historical
+    16/8 ratio).  The auto-mode outcome (rounds used, whether it converged,
+    the final relative delta) is recorded on `self.last_convergence` -- the
+    engine has no channel to the report's warnings list, so a cap hit without
+    convergence is surfaced there rather than printed.
+
     chip_graph (optional) switches per-op COMPUTE unit costs from the roofline
     formula to a tile schedule over the expanded chip graph; tile_fill is
     forwarded to the ChipModel (fraction of per-core SRAM a tile uses)."""
 
-    def __init__(self, decode_rounds: int = 16, warmup: int = 8,
-                 chip_graph: Graph | None = None, tile_fill: float = 0.5):
-        if decode_rounds <= warmup:
-            raise ValueError("decode_rounds must exceed warmup")
-        self.decode_rounds = decode_rounds
-        self.warmup = warmup
+    def __init__(self, decode_rounds: int | None = None,
+                 warmup: int | None = None, rtol: float = 1e-3,
+                 max_rounds: int = 256, chip_graph: Graph | None = None,
+                 tile_fill: float = 0.5):
+        self._auto = decode_rounds is None
+        if self._auto:
+            if warmup is not None:
+                raise ValueError("warmup requires an explicit decode_rounds")
+            # decode_rounds/warmup are chosen per-iteration by the convergence
+            # loop in _decode_wall; they are unset in auto mode.
+            self.decode_rounds: int | None = None
+            self.warmup: int | None = None
+        else:
+            if warmup is None:
+                warmup = decode_rounds // 2  # historical ratio
+            if decode_rounds <= warmup:
+                raise ValueError("decode_rounds must exceed warmup")
+            self.decode_rounds = decode_rounds
+            self.warmup = warmup
+        self.rtol = rtol
+        self.max_rounds = max_rounds
         self._roofline = RooflineEngine()
         self._chip_model = (
             ChipModel(chip_graph, tile_fill) if chip_graph is not None else None
@@ -142,6 +168,9 @@ class DESEngine(Engine):
         # per distinct COMPUTE op, its chip-level tile schedule (graph mode
         # only), keyed by phase then op name -- for chip utilisation and trace.
         self.last_op_runs: dict[str, dict[str, OpSchedule]] = {}
+        # convergence outcome of the last auto-mode decode measurement
+        # ({"rounds", "converged", "rel_delta"}); None after a fixed run.
+        self.last_convergence: dict | None = None
 
     # ---- costs from the lowered ops -----------------------------------------
 
@@ -288,17 +317,19 @@ class DESEngine(Engine):
         assert prev_key is not None
         return prev_key
 
-    def _decode_wall(
-        self, c: _LayerCosts, plan: _CommPlan, dep: Deployment
+    def _round_period(
+        self, c: _LayerCosts, plan: _CommPlan, dep: Deployment,
+        decode_rounds: int, warmup: int,
     ) -> tuple[float, list[Task], ScheduleResult]:
-        """Steady-state pipeline round period: every microbatch advances one
-        token per round."""
+        """Build and schedule `decode_rounds` pipeline rounds and return the
+        mean steady-state round period after discarding `warmup` fill rounds,
+        with the tasks and schedule (for observability)."""
         pp = dep.pp
         layers = _split_layers(c.n_layers, pp)
         tasks: list[Task] = []
-        token_done: list[list[int]] = [[] for _ in range(self.decode_rounds)]
+        token_done: list[list[int]] = [[] for _ in range(decode_rounds)]
         tail: dict[int, int] = {}  # microbatch -> last task key of prev round
-        for r in range(self.decode_rounds):
+        for r in range(decode_rounds):
             for m in range(pp):
                 prev = tail.get(m)
                 for s in range(pp):
@@ -317,9 +348,45 @@ class DESEngine(Engine):
                 tail[m] = prev
         result = schedule(tasks)
         round_end = [max(result.finish[k] for k in keys) for keys in token_done]
-        w = self.warmup
-        wall = (round_end[-1] - round_end[w - 1]) / (self.decode_rounds - w)
+        wall = (round_end[-1] - round_end[warmup - 1]) / (decode_rounds - warmup)
         return wall, tasks, result
+
+    def _decode_wall(
+        self, c: _LayerCosts, plan: _CommPlan, dep: Deployment
+    ) -> tuple[float, list[Task], ScheduleResult]:
+        """Steady-state pipeline round period: every microbatch advances one
+        token per round.
+
+        Fixed mode (explicit `decode_rounds`) measures once over the requested
+        rounds -- byte-identical to the historical engine.  Auto mode (the
+        default) grows the round count until the estimate stabilises: start at
+        max(8, 2*pp) rounds with half warmup, then double and re-measure
+        (rebuilding the graph, cheap relative to getting the period wrong)
+        until two successive estimates agree within `rtol` or `max_rounds` is
+        reached.  The outcome is recorded on `self.last_convergence`."""
+        if not self._auto:
+            self.last_convergence = None
+            return self._round_period(
+                c, plan, dep, self.decode_rounds, self.warmup)
+
+        rounds = min(max(8, 2 * dep.pp), self.max_rounds)
+        prev_est: float | None = None
+        rel = float("inf")
+        while True:
+            wall, tasks, result = self._round_period(
+                c, plan, dep, rounds, rounds // 2)
+            if prev_est is not None:
+                rel = abs(wall - prev_est) / (abs(wall) or 1.0)
+            converged = rel <= self.rtol
+            if converged or rounds >= self.max_rounds:
+                self.last_convergence = {
+                    "rounds": rounds,
+                    "converged": converged,
+                    "rel_delta": rel,
+                }
+                return wall, tasks, result
+            prev_est = wall
+            rounds = min(rounds * 2, self.max_rounds)
 
     def _prefill_wall(
         self, c: _LayerCosts, plan: _CommPlan, dep: Deployment

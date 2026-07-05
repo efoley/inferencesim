@@ -144,9 +144,14 @@ Drive per-chip work against `chip_graph.expand()` resources instead of one
 
 ### 5. Engine plumbing & ergonomics
 
-- [ ] **Convergence control**: auto-grow `decode_rounds` until the measured
-      round period stabilises within a tolerance, instead of fixed
-      `decode_rounds/warmup`.
+- [x] **Convergence control**: `DESEngine(decode_rounds=None)` (the new
+      default) auto-grows the round count -- starting at `max(8, 2*pp)`,
+      doubling and rebuilding the graph -- until two successive round-period
+      estimates agree within `rtol` (default 1e-3) or `max_rounds` (default
+      256) is hit; the outcome (rounds, converged, rel delta) lands on
+      `engine.last_convergence`.  Passing explicit `decode_rounds`/`warmup`
+      still pins the old fixed run byte-for-byte (`warmup` defaults to
+      `decode_rounds // 2`).
 - [x] **Event-driven core**: moved to `sched.py`, a proper event loop with
       a ready heap plus lazy-invalidated (epoch-tagged) departure events for
       shared resources. All-FIFO graphs still schedule identically to the
