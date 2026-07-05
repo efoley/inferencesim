@@ -147,23 +147,32 @@ simulator for ONE replica (dp = arrival-rate / dp, per `simulate.py`).
 
 - [x] **Continuous batching**: prefill and decode iterations are interleaved
       on a single event clock (`serve.py`), so prefill/decode interference
-      falls out (a prefill stalls the decoding batch → the inter-token-gap
-      p99 spikes ~10x the mean). Granularity: iteration-level on one replica,
-      pp=1, *exclusive* whole-prompt prefill; the per-iteration cost is the
-      serial op sum (exact at pp=1) with a per-batch table + per-step
-      attention recost (`_DecodeCost`).
+      falls out (an exclusive prefill stalls the decoding batch → the
+      inter-token-gap p99 spikes ~10x the mean). Granularity: iteration-level
+      on one replica, pp=1; the per-iteration cost is the serial op sum (exact
+      at pp=1) with a per-batch table + per-step attention recost
+      (`_DecodeCost`).
 - [x] **Request-level arrival process**: Poisson (seeded) or trace-driven
-      (`arrivals=`) arrivals → real queueing percentiles (TTFT p50/p95/p99 +
-      mean, per-request TPOT, inter-token gaps), not steady-state averages.
-      TTFT includes admission/queue waiting; p99 TTFT blows up past the
-      achieved-throughput ceiling.
+      (`arrivals=`) arrivals, with per-request prompt/output lengths (explicit
+      lists or a seeded `LengthDist`) → real queueing percentiles (TTFT
+      p50/p95/p99 + mean, per-request TPOT, inter-token gaps, prompt/output
+      length percentiles), not steady-state averages.
 - [x] **KV-cache growth over a request**: decode attention is recost each
       iteration at the batch's actual Σ per-request context (context steps +1
-      per token), so long-sequence tails show up; admission reserves the
-      conservative prompt+output KV footprint against the per-chip budget.
-- [ ] **Chunked prefill**: prefill is exclusive/whole-prompt today; splitting a
-      long prompt into decode-sized chunks (to cap the interference stall)
-      remains future work.
+      per token), so long-sequence tails show up. Two admission policies:
+      `on_demand` (default) charges only the prompt KV up to a watermark and
+      PREEMPTS the newest decoder (vLLM recompute) on overflow; `reserve`
+      charges the full prompt+output footprint and never preempts.
+- [x] **Chunked prefill**: `prefill_chunk=K` mixes a K-token prefill chunk into
+      each decode iteration (Sarathi-style), so the exclusive-prefill stall
+      collapses into per-iteration bumps at the cost of a longer prefill TTFT
+      (chunk attention re-reads the growing KV; `prefill_chunk_ops`). Honest
+      limits: one request prefills at a time (vLLM default); the chunk's
+      intra-chunk attention triangle is costed as a full block (over-count
+      ~chunk²/2, negligible for chunk ≪ context).
+- [ ] **KV swap / disk offload preemption**: preemption is recompute-only —
+      a preempted request rebuilds its KV from scratch on re-admission. Swapping
+      KV to host/NVMe and restoring it (vLLM's other policy) is future work.
 - [ ] **Task-level pp>1 serving**: `serve()` restricts to pp=1 (at pp=1 an
       iteration is a serial chain, so its cost is a closed-form sum and needs
       no scheduler). pp>1 needs pipeline fill/drain across stages per

@@ -10,9 +10,11 @@ from .des import DESEngine
 from .simulate import CostModel, MemoryUsage, Report, simulate, weight_bytes_per_chip
 from .report import format_report
 from .serve import (
+    LengthDist,
     RequestRecord,
     ServeConfig,
     ServeReport,
+    chunked_prefill_ttft,
     decode_iteration_time,
     format_serve_report,
     prefill_iteration_time,
@@ -38,8 +40,9 @@ __all__ = [
     "ChipModel", "OpSchedule",
     "CostModel", "MemoryUsage", "Report", "simulate", "weight_bytes_per_chip",
     "format_report",
-    "ServeConfig", "ServeReport", "RequestRecord", "serve", "format_serve_report",
-    "decode_iteration_time", "prefill_iteration_time",
+    "ServeConfig", "ServeReport", "RequestRecord", "LengthDist", "serve",
+    "format_serve_report", "decode_iteration_time", "prefill_iteration_time",
+    "chunked_prefill_ttft",
     "Graph", "GraphNode", "GraphEdge", "NodeKind",
     "chip_to_graph", "chip_from_graph", "system_to_graph", "system_from_graph",
     "swap_chip_model",
