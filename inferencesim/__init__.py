@@ -12,6 +12,7 @@ from .simulate import CostModel, MemoryUsage, Report, simulate, weight_bytes_per
 from .calibration import ANCHORS, Anchor, calibrate_report, run_anchor
 from .report import format_report
 from .serve import (
+    DisaggConfig,
     LengthDist,
     RequestRecord,
     ServeConfig,
@@ -19,8 +20,11 @@ from .serve import (
     chunked_prefill_ttft,
     decode_iteration_time,
     format_serve_report,
+    kv_transfer_bytes,
+    kv_transfer_time,
     prefill_iteration_time,
     serve,
+    serve_disagg,
 )
 from .graph import Edge as GraphEdge, Graph, Node as GraphNode, NodeKind
 from .bridge import (
@@ -47,6 +51,7 @@ __all__ = [
     "ServeConfig", "ServeReport", "RequestRecord", "LengthDist", "serve",
     "format_serve_report", "decode_iteration_time", "prefill_iteration_time",
     "chunked_prefill_ttft",
+    "DisaggConfig", "serve_disagg", "kv_transfer_bytes", "kv_transfer_time",
     "Graph", "GraphNode", "GraphEdge", "NodeKind",
     "chip_to_graph", "chip_from_graph", "system_to_graph", "system_from_graph",
     "swap_chip_model",

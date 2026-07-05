@@ -26,7 +26,14 @@ from .presets import HARDWARE, MODELS
 from .presets_fine import GRAPH_PRESETS
 from .report import format_report
 from .sched import chrome_trace
-from .serve import LengthDist, ServeConfig, format_serve_report, serve
+from .serve import (
+    DisaggConfig,
+    LengthDist,
+    ServeConfig,
+    format_serve_report,
+    serve,
+    serve_disagg,
+)
 from .simulate import CostModel, simulate
 from .units import fmt_bytes, fmt_si
 from .workload import Deployment, Scenario
@@ -295,8 +302,27 @@ def _cmd_serve(args: argparse.Namespace) -> int:
             **common,
         )
     efficiency = _efficiency_from_args(args, args.hardware or "")
-    report = serve(system, model, scen, dep, cfg,
-                   engine=RooflineEngine(efficiency))
+    if args.disagg:
+        shared = dict(weight_dtype=DType(args.weight_dtype),
+                      kv_dtype=DType(args.kv_dtype), act_dtype=DType(args.act_dtype))
+        dcfg = DisaggConfig(
+            prefill_deployment=Deployment(tp=args.prefill_tp, ep=args.prefill_ep,
+                                          adp=args.prefill_adp, **shared),
+            decode_deployment=Deployment(tp=args.decode_tp, ep=args.decode_ep,
+                                         adp=args.decode_adp, **shared),
+            n_prefill_replicas=args.prefill_replicas,
+            n_decode_replicas=args.decode_replicas,
+            transfer_bw=args.transfer_bw, transfer_latency=args.transfer_latency,
+        )
+        try:
+            report = serve_disagg(system, model, scen, cfg, dcfg,
+                                  engine=RooflineEngine(efficiency))
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            return 2
+    else:
+        report = serve(system, model, scen, dep, cfg,
+                       engine=RooflineEngine(efficiency))
     print(format_serve_report(report))
     return 0
 
@@ -424,6 +450,29 @@ def main(argv: list[str] | None = None) -> int:
     srv.add_argument("--weight-dtype", default="fp8", choices=[d.value for d in DType])
     srv.add_argument("--kv-dtype", default="bf16", choices=[d.value for d in DType])
     srv.add_argument("--act-dtype", default="bf16", choices=[d.value for d in DType])
+    # ---- prefill/decode disaggregation (two chip pools) ----
+    srv.add_argument("--disagg", action="store_true",
+                     help="prefill/decode disaggregated serving: partition the "
+                          "chips into a prefill pool and a decode pool, streaming "
+                          "the KV cache between them (DistServe/Dynamo). Uses the "
+                          "--prefill-*/--decode-* pool flags plus the shared "
+                          "arrival/length/--kv-policy knobs; --tp/--pp/--ep/--adp, "
+                          "prefill_first and --prefill-chunk (rejected) do not apply.")
+    srv.add_argument("--prefill-tp", type=int, default=1, help="prefill pool TP")
+    srv.add_argument("--prefill-ep", type=int, default=1, help="prefill pool EP (MoE)")
+    srv.add_argument("--prefill-adp", type=int, default=1, help="prefill pool ADP (dense)")
+    srv.add_argument("--prefill-replicas", type=int, default=1,
+                     help="number of prefill replicas")
+    srv.add_argument("--decode-tp", type=int, default=1, help="decode pool TP")
+    srv.add_argument("--decode-ep", type=int, default=1, help="decode pool EP (MoE)")
+    srv.add_argument("--decode-adp", type=int, default=1, help="decode pool ADP (dense)")
+    srv.add_argument("--decode-replicas", type=int, default=1,
+                     help="number of decode replicas")
+    srv.add_argument("--transfer-bw", type=float, default=None,
+                     help="override the prefill<->decode link bandwidth (bytes/s); "
+                          "default resolves the system's node/network link")
+    srv.add_argument("--transfer-latency", type=float, default=None,
+                     help="override the prefill<->decode link latency (s)")
     _add_efficiency_args(srv)
     srv.set_defaults(fn=_cmd_serve)
 
