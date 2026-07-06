@@ -530,9 +530,30 @@ function edgeCurve(a, b) {
   const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
   const dx = b.x - a.x, dy = b.y - a.y;
   const len = Math.hypot(dx, dy) || 1;
-  // perpendicular bow, gentle
-  const bow = clamp(len * 0.12, 8, 60) * (Math.abs(dx) > Math.abs(dy) ? 1 : -1) * 0.6;
+  // bow always to the right of the travel direction, so the two directions of
+  // a link separate into distinct lanes instead of overlapping into a lens
+  const bow = clamp(len * 0.10, 8, 44);
   return { cx: mx - dy/len*bow, cy: my + dx/len*bow };
+}
+
+// move an endpoint from a cell's centre to its border along the line to
+// `other`, so edges attach at box boundaries instead of cutting through
+function clipToRect(pt, other) {
+  const rc = pt.cell && curRect(pt.cell);
+  if (!rc) return pt;
+  const dx = other.x - pt.x, dy = other.y - pt.y;
+  let t = 1;
+  if (dx) { const tx = ((dx > 0 ? rc.x + rc.w : rc.x) - pt.x) / dx; if (tx > 0) t = Math.min(t, tx); }
+  if (dy) { const ty = ((dy > 0 ? rc.y + rc.h : rc.y) - pt.y) / dy; if (ty > 0) t = Math.min(t, ty); }
+  return { ...pt, x: pt.x + dx * clamp(t, 0, 1), y: pt.y + dy * clamp(t, 0, 1) };
+}
+
+// shared geometry for a directed edge: border-clipped endpoints + lane curve.
+// Used by both the edge renderer and the particle paths so payloads visibly
+// ride the drawn lanes.
+function edgeGeom(a, b) {
+  const a2 = clipToRect(a, b), b2 = clipToRect(b, a);
+  return { a: a2, b: b2, c: edgeCurve(a2, b2) };
 }
 function bez(a, c, b, t) {
   const u = 1 - t;
@@ -549,12 +570,27 @@ function drawEdges(model, scan) {
     if (!ra || !rb) continue;
     const key = ra.cell.id + "|" + rb.cell.id;
     if (drawn.has(key)) continue; drawn.add(key);
-    const c = edgeCurve(ra, rb);
+    const g = edgeGeom(ra, rb);
     const bw = e.bandwidth || 0;
     const width = clamp(bw ? Math.log10(bw) - 8 : 1.2, 1, 6);
-    ctx.strokeStyle = "rgba(120,150,220,0.16)";
+    // a backward stage edge is the decode ring's wrap-around: draw it dashed
+    const si = /^stage(\d+)/, ma = si.exec(ra.cell.id), mb = si.exec(rb.cell.id);
+    const wrap = ma && mb && (+mb[1] < +ma[1]);
+    ctx.strokeStyle = wrap ? "rgba(150,130,220,0.20)" : "rgba(120,150,220,0.18)";
     ctx.lineWidth = width;
-    ctx.beginPath(); ctx.moveTo(ra.x, ra.y); ctx.quadraticCurveTo(c.cx, c.cy, rb.x, rb.y); ctx.stroke();
+    if (wrap) ctx.setLineDash([7, 6]);
+    ctx.beginPath(); ctx.moveTo(g.a.x, g.a.y); ctx.quadraticCurveTo(g.c.cx, g.c.cy, g.b.x, g.b.y); ctx.stroke();
+    ctx.setLineDash([]);
+    // arrowhead at the destination, along the curve's end tangent
+    const tanx = g.b.x - g.c.cx, tany = g.b.y - g.c.cy;
+    const tl = Math.hypot(tanx, tany) || 1, ux = tanx / tl, uy = tany / tl;
+    const s = clamp(width * 2.4, 5, 9);
+    ctx.fillStyle = wrap ? "rgba(150,130,220,0.45)" : "rgba(120,150,220,0.45)";
+    ctx.beginPath();
+    ctx.moveTo(g.b.x, g.b.y);
+    ctx.lineTo(g.b.x - ux*s*1.8 - uy*s*0.7, g.b.y - uy*s*1.8 + ux*s*0.7);
+    ctx.lineTo(g.b.x - ux*s*1.8 + uy*s*0.7, g.b.y - uy*s*1.8 - ux*s*0.7);
+    ctx.closePath(); ctx.fill();
   }
 }
 
@@ -711,6 +747,8 @@ function queueStack(rc, p) {
   }
   ctx.fillStyle = "#cbd4ea"; ctx.font = "600 9px var(--mono)"; ctx.textAlign = "right";
   ctx.fillText(String(p), bx - 8, rc.y + rc.h - 4);
+  ctx.fillStyle = "rgba(154,166,189,0.75)"; ctx.font = "500 8px var(--font)";
+  ctx.fillText("queued", bx - 8, rc.y + rc.h + 7);
   ctx.textAlign = "left"; ctx.restore();
 }
 
@@ -752,20 +790,20 @@ function particlePath(model, pt) {
     const e = model.edges[ref.id]; if (!e) return null;
     const a = refAnchor(model, { id: e.src }), b = refAnchor(model, { id: e.dst });
     if (!a || !b) return null;
-    return { a, b, c: edgeCurve(a, b) };
+    return edgeGeom(a, b);
   }
   // node-mapped: hop -> follow outgoing hop edge; collective -> egress edge
   const here = refAnchor(model, ref); if (!here) return null;
   if (pt.k === 4) { // hop: find hop edge leaving this stage
     const stage = model.cellFor(ref)?.cell;
     const he = findHopEdge(model, ref.id);
-    if (he) { const b = refAnchor(model, { id: he.dst }); if (b) return { a: here, b, c: edgeCurve(here, b) }; }
+    if (he) { const b = refAnchor(model, { id: he.dst }); if (b) return edgeGeom(here, b); }
   }
   // collective / fallback: shimmer along the nearest incident edge
   const inc = model.edges.find(e => e.src === ref.id || e.dst === ref.id);
   if (inc) {
     const other = inc.src === ref.id ? inc.dst : inc.src;
-    const b = refAnchor(model, { id: other }); if (b) return { a: b, b: here, c: edgeCurve(b, here) };
+    const b = refAnchor(model, { id: other }); if (b) return edgeGeom(b, here);
   }
   return { a: here, b: { x: here.x, y: here.y - 24 }, c: { cx: here.x + 12, cy: here.y - 12 } };
 }
@@ -934,7 +972,10 @@ function buildBar() {
 
   // legend
   document.getElementById("legend").innerHTML = KIND_NAMES.map(k =>
-    `<div class="row"><span class="dot" style="color:${COL[k]}"></span>${k}</div>`).join("");
+    `<div class="row"><span class="dot" style="color:${COL[k]}"></span>${k}</div>`).join("") +
+    `<div class="row" style="margin-top:5px"><svg width="26" height="10"><path d="M1 7 Q13 1 22 5" stroke="rgba(120,150,220,.7)" fill="none"/><path d="M25 5 L19 3 L20 7 Z" fill="rgba(120,150,220,.7)"/></svg>link (width ~ bandwidth)</div>` +
+    `<div class="row"><svg width="26" height="10"><path d="M1 6 Q13 1 25 5" stroke="rgba(150,130,220,.8)" stroke-dasharray="4 3" fill="none"/></svg>ring wrap (next round)</div>` +
+    `<div class="row"><svg width="26" height="12"><rect x="9" y="8" width="8" height="3" fill="rgba(140,150,190,.9)"/><rect x="9" y="4" width="8" height="3" fill="rgba(140,150,190,.65)"/><rect x="9" y="0" width="8" height="3" fill="rgba(140,150,190,.4)"/></svg>tasks queued (waiting)</div>`;
   // header meta
   const m = DOC.meta;
   document.getElementById("sub-title").textContent = `${m.hardware_name || m.hardware || ""}  ·  ${m.model_name || m.model || ""}`;
