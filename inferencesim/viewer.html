@@ -1,3 +1,6 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>inferencesim replay</title>
 <style>
   /* ---- inferencesim replay viewer: dark live-telemetry scene ------------- */
   :root {
@@ -389,8 +392,8 @@ function layoutStages(model, W, H, pad) {
   const n = cells.length;
   const gap = 34;
   const bw = Math.max(150, (W - pad*2 - gap*(n-1)) / n);
-  const bh = Math.min(H * 0.66, 360);
-  const y0 = (H - bh) / 2;
+  const bh = Math.max(240, H - pad*2);  // fill the panel
+  const y0 = pad;
   cells.forEach((c, i) => {
     const x = pad + i * (bw + gap);
     setRect(c, x, y0, bw, bh);
@@ -433,10 +436,10 @@ function layoutChip(model, W, H, pad) {
     const cellH = totalH / list.length;
     list.forEach((c, i) => {
       // size grows a touch with instance count; expanded groups take more room
-      const n = c.insts ? c.insts.length : 1;
-      const baseW = Math.min(colW - 26, 168);
-      const w = c.collapsed ? Math.min(baseW, 96 + Math.log2(n+1)*16) : colW - 24;
-      const h = c.collapsed ? Math.min(cellH - 22, 72 + Math.log2(n+1)*10) : cellH - 20;
+      // scale with the panel: collapsed glyphs take most of their cell rather
+      // than capping at a fixed pixel size (small strips on large monitors)
+      const w = c.collapsed ? Math.max(110, (colW - 26) * 0.8) : colW - 24;
+      const h = c.collapsed ? Math.max(64, (cellH - 22) * 0.72) : cellH - 20;
       const x = cx - w/2, y = pad + i*cellH + (cellH - h)/2;
       placeGroup(c, x, y, w, h);
     });
