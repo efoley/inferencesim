@@ -81,6 +81,27 @@ Drive per-chip work against `chip_graph.expand()` resources instead of one
 
 ### 2. Contention & queueing fidelity
 
+- [x] **Per-router 2D-mesh NoC**: `presets_fine.blackhole_p150_mesh` /
+      `tt-quietbox-mesh` model Blackhole's NoC as its real 12×17 grid of router
+      SWITCH nodes (one per tile, wired to its four neighbours with selector
+      edges), rather than one lumped 3.2 TB/s switch. A tile store-and-forwards
+      hop-by-hop along a deterministic **XY (column-then-row) path** matching
+      NOC0, so per-link and per-router contention become emergent; the grouped
+      `router` node collapses under `flatten()`, so the mesh aggregates to the
+      *exact* lumped chip (banks are the 512 GB/s min-cut, mesh non-binding) and
+      the roofline is unchanged. Per-link bandwidth is solved from the published
+      3.2 TB/s aggregate as the mesh min-bisection (12·B_link = 3.2 TB/s →
+      B_link = 266.7 GB/s). Routing uses an explicit coordinate hook (the router
+      instance index encodes its grid position `i → (i//C, i%C)`), because plain
+      BFS gives *emergent* dimension-order that isn't guaranteed XY for every
+      placement. This also extended `graph.py`: intra-group selector edges
+      (`router[0:R(C-1)] ~ router[C:RC]`) now validate and flatten. **Remaining
+      NoC refinements**: the second NoC plane (NOC1 for writes — this model
+      shares one plane, so reads/writes contend where silicon would not), the
+      torus wrap-around links (modelled here as a plain mesh), and Wormhole-style
+      flit pipelining (per-tile fill grows with hop count under pure
+      store-and-forward). `MESH_2D` *stage-collective* expansion (§2 collectives)
+      is separate and still falls back to the closed form — untouched here.
 - [x] **k-server resources**: `Resource(servers=k)` in `sched.py` serves k
       tasks concurrently from a k-slot pool (k=1 reproduces the old single
       `free[resource]` behaviour exactly). The stage-level engine still

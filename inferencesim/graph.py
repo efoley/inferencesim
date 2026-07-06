@@ -294,7 +294,20 @@ class Graph:
                     )
                 _selector_indices(sel, n.count)  # range check
             if self._endpoint_base(e.src) == self._endpoint_base(e.dst):
-                raise ValueError(f"{self.name}: self-edge on '{e.src}'")
+                # An edge whose endpoints resolve to the same node is normally a
+                # mistake (a loop on one node).  The exception is an *intra-group*
+                # wiring: a counted group joined to itself through two DISTINCT
+                # selectors -- e.g. a 2D-mesh NoC wiring router[0:R*(C-1)] ~
+                # router[C:R*C] for the column links, or router[j:j+C-1] ~
+                # router[j+1:j+C] per row.  INTERLEAVE pairs offset selectors
+                # instance-wise, so no instance is ever wired to itself; the
+                # concrete edges expand() emits are between distinct instances
+                # (and re-validated then).  Reject only a true self-loop: a bare
+                # group (no selector) on either side, or byte-identical endpoints.
+                _, src_sel = split_endpoint(e.src)
+                _, dst_sel = split_endpoint(e.dst)
+                if src_sel is None or dst_sel is None or e.src == e.dst:
+                    raise ValueError(f"{self.name}: self-edge on '{e.src}'")
             if e.count < 1:
                 raise ValueError(f"{self.name}: edge {e.src}--{e.dst} count must be >= 1")
 
@@ -327,11 +340,19 @@ class Graph:
             if n.ports:
                 port = inner_ports.get(n.ports[0], n.ports[0])
                 port_map[n.name] = f"{n.name}{sep}{port}"
+        names = {x.name for x in nodes}
+
+        def resolves(end: str) -> bool:
+            # a literal node name, or a selector into a counted group that
+            # survived flattening (e.g. 'gddr6-bank[0]' or 'router[17:204]' from
+            # a per-router mesh, whose base group 'gddr6-bank'/'router' is a node)
+            return end in names or split_endpoint(end)[0] in names
+
         for e in self.edges:
             src = port_map.get(e.src, e.src)
             dst = port_map.get(e.dst, e.dst)
             for end, orig in ((src, e.src), (dst, e.dst)):
-                if not any(x.name == end for x in nodes):
+                if not resolves(end):
                     raise ValueError(
                         f"{self.name}: edge touches composite '{orig}' with no ports"
                     )
