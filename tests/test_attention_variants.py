@@ -235,6 +235,20 @@ def test_serve_mla_tiny_kv_fits_huge_batch():
 # ---- 7. DES == roofline serial oracle for MLA and SWA -----------------------
 
 
+def _switched_a2a_fill(system, model, dep, ops):
+    """The one-message store-and-forward fill the DES adds over the roofline on a
+    pp=1 serial chain, once per switched all-to-all op instance (see
+    collectives.py).  Identity efficiency here, so bw is the raw link rate."""
+    from inferencesim.engine import CommContext
+    from inferencesim.hardware import Topology
+    from inferencesim.ops import OpKind
+    comm = CommContext.for_deployment(system, dep)
+    if comm.a2a <= 1 or comm.a2a_link is None or comm.a2a_topology is Topology.RING:
+        return 0.0
+    return sum(op.count * op.comm_bytes / ((comm.a2a - 1) * comm.a2a_link.bandwidth)
+               for op in ops if op.kind is OpKind.ALLTOALL)
+
+
 @pytest.mark.parametrize("model,dep", [
     (DEEPSEEK_V3, Deployment(tp=8, ep=8, weight_dtype=DType.FP8, kv_dtype=DType.BF16)),
     (GPT_OSS_120B, Deployment(tp=4, ep=8, weight_dtype=DType.FP4, kv_dtype=DType.FP8)),
@@ -242,12 +256,20 @@ def test_serve_mla_tiny_kv_fits_huge_batch():
 def test_des_matches_roofline_serial_mla_and_swa(model, dep):
     """pp=1 is one serial op chain, so the DES must equal the analytic sum to
     full precision -- including the split (SWA) or compressed (MLA) attention
-    ops routed through the count-weighted per-layer cost."""
+    ops routed through the count-weighted per-layer cost -- up to the deliberate
+    one-message store-and-forward fill each switched MoE all-to-all now adds to
+    BOTH phases (dispatch/combine in prefill and decode).  That fill is computed
+    exactly from the lowered ops, so the equality holds to full precision."""
+    from inferencesim.ops import decode_step_ops
     scen = Scenario(batch=64, prompt_len=2048, output_len=512)
     a = simulate(GB300_NVL72, model, scen, dep, engine=RooflineEngine())
     d = simulate(GB300_NVL72, model, scen, dep, engine=DESEngine())
-    assert d.tpot_s == pytest.approx(a.tpot_s, rel=1e-9)
-    assert d.ttft_s == pytest.approx(a.ttft_s, rel=1e-9)
+    fill_d = _switched_a2a_fill(GB300_NVL72, model, dep,
+                                decode_step_ops(model, scen, dep))
+    fill_p = _switched_a2a_fill(GB300_NVL72, model, dep,
+                                prefill_ops(model, scen.prompt_len, dep))
+    assert d.tpot_s == pytest.approx(a.tpot_s + fill_d, rel=1e-9)
+    assert d.ttft_s == pytest.approx(a.ttft_s + fill_p, rel=1e-9)
 
 
 def test_des_matches_roofline_dense_swa():

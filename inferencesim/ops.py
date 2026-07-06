@@ -71,6 +71,12 @@ class Op:
     dram_read: float = 0.0
     dram_write: float = 0.0
     comm_bytes: float = 0.0  # payload per chip for communication ops
+    # MoE dispatch/combine only: the per-member routing-popularity vector over
+    # the tp*ep array (sum == 1), so the discrete-event engine can size the
+    # all-to-all's per-member messages under expert-load skew (incast onto the
+    # hot owners).  None everywhere else (including uniform MoE), so non-MoE and
+    # roofline paths are untouched -- `comm_bytes` stays the per-chip average.
+    member_weights: tuple[float, ...] | None = None
 
     @property
     def is_comm(self) -> bool:
@@ -349,28 +355,50 @@ def _ffn_ops(model: ModelSpec, tokens_per_group: float, tokens_total: float,
         return [*gather, ffn, *scatter]
     moe = model.moe
     ops: list[Op] = []
-    expert_shard = dep.tp * dep.ep
-    active = moe.expected_active_experts(int(tokens_total))
+    expert_shard = dep.tp * dep.ep  # the expert-placement array (a2a group)
+    # moe_routed is *per chip = the pacing chip*.  Uniform routing (skew=0) paces
+    # by the average member -- the historical smeared per-chip share, kept
+    # bit-identical.  Under skew the layer is paced by the HOTTEST member: its
+    # activation flops/bytes scale by `hot_member_factor` (it processes
+    # `tokens_to_member(hot)` routings) and its weight-byte read is the
+    # `expected_active_on_member(hot)` distinct experts of its block.  This is
+    # the roofline of an unbalanced layer (max-member); the DES recovers true
+    # per-member costs via the dispatch/combine payload vector below.
+    if moe.skew > 0.0:
+        hot = moe.hot_member_factor(expert_shard)
+        active_hot = moe.expected_active_on_member(0, int(tokens_total), expert_shard)
+        routed_tokens = tokens_total * hot
+        wread = active_hot * expert_shard * model.expert_params
+        member_w: tuple[float, ...] | None = tuple(moe.member_popularity(expert_shard))
+    else:
+        routed_tokens = tokens_total
+        wread = moe.expected_active_experts(int(tokens_total)) * model.expert_params
+        member_w = None
     ops.append(
         _linear(
             "moe_routed",
-            tokens_total,
+            routed_tokens,
             moe.top_k * model.expert_params,
             model.d_model,
             model.d_model,
             dep,
             count,
             category="moe",
-            weight_read_params=active * model.expert_params,
+            weight_read_params=wread,
             shard=expert_shard,
         )
     )
     if dep.ep > 1:
-        # dispatch tokens to expert owners and combine the results back
+        # dispatch tokens to expert owners and combine the results back.
+        # comm_bytes stays the per-chip *average* payload; member_weights carries
+        # the per-member routing-popularity vector so the DES can size the
+        # non-uniform per-member messages (dispatch incasts onto the hot owner's
+        # ingress, combine egresses the most from it).  None on the uniform path.
         payload = tokens_per_group * moe.top_k * model.d_model * dep.act_dtype.bytes / dep.tp
         for name in ("moe_dispatch", "moe_combine"):
             ops.append(Op(name=name, kind=OpKind.ALLTOALL, dtype=dep.act_dtype,
-                          category="comm", count=count, comm_bytes=payload))
+                          category="comm", count=count, comm_bytes=payload,
+                          member_weights=member_w))
     if model.shared_expert_params:
         ops.append(
             _linear("moe_shared", tokens_per_group, model.shared_expert_params,

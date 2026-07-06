@@ -95,21 +95,82 @@ def test_des_prefill_walks_stages_serially():
 
 
 def test_des_with_moe_and_ep():
-    """MoE + EP, pp=1 -> a serial chain.  The all-to-all expands to g-1
-    per-member messages whose bandwidth occupancies serialise on the outbound
-    link (total comm_bytes/bw) with one propagation latency on the exit
-    barrier, reproducing the closed form comm_bytes/bw + lat exactly in
-    isolation.  With no pipeline overlap or contention (pp=1) the DES must
-    still agree with the analytic engine to full precision -- uniformly with
-    the tp-only allreduce case above."""
+    """MoE + EP, pp=1 -> a serial chain.  The switched all-to-all is now
+    store-and-forward (egress `.out` then ingress `.in`), so each dispatch and
+    combine costs the closed form the roofline charges PLUS exactly one message
+    of fill (comm_bytes/((g-1)*bw)); everything else costs identically.  With no
+    pipeline overlap or contention (pp=1), the DES decode round therefore equals
+    the roofline round plus 2*L such fills (dispatch + combine per layer) -- the
+    documented, bounded a2a gap, asserted here to full precision as the new
+    exact anchor (skew=0 -> uniform messages, no incast)."""
+    from inferencesim.engine import CommContext
+    from inferencesim.ops import decode_step_ops
     from inferencesim.presets import GPT_OSS_120B
     dep = Deployment(tp=4, ep=8, weight_dtype=DType.FP4, kv_dtype=DType.FP8)
     scen = Scenario(batch=128, prompt_len=2048, output_len=512)
     d = simulate(GB300_NVL72, GPT_OSS_120B, scen, dep, engine=DESEngine())
     a = simulate(GB300_NVL72, GPT_OSS_120B, scen, dep, engine=RooflineEngine())
-    # serial chain again (pp=1): must agree
-    assert d.tpot_s == pytest.approx(a.tpot_s, rel=1e-9)
+    comm = CommContext.for_deployment(GB300_NVL72, dep)
+    disp = next(o for o in decode_step_ops(GPT_OSS_120B, scen, dep)
+                if o.name == "moe_dispatch")
+    occ = (disp.comm_bytes / (comm.a2a - 1)) / comm.a2a_link.bandwidth  # one-message fill
+    fill = 2 * GPT_OSS_120B.n_layers * occ  # dispatch + combine, once per layer
+    assert d.tpot_s == pytest.approx(a.tpot_s + fill, rel=1e-9)  # the new exact value
+    assert a.tpot_s < d.tpot_s <= a.tpot_s + fill * (1 + 1e-9)  # bounded by the fill
     assert d.output_tokens_per_s > 0
+
+
+def _gpt_oss_skew(skew):
+    from dataclasses import replace
+
+    from inferencesim.presets import GPT_OSS_120B
+    return replace(GPT_OSS_120B, moe=replace(GPT_OSS_120B.moe, skew=skew))
+
+
+def _des2():
+    # pp=1 is a serial chain, so 2 rounds measure the exact period (fast).
+    return DESEngine(decode_rounds=2, warmup=1)
+
+
+def test_moe_skew0_is_bit_identical_anchor():
+    """Explicit skew=0 reproduces the historical numbers exactly on BOTH engines:
+    the analytic roofline takes the uniform lowering branch (bit-identical), and
+    the DES builds the identical task graph as the base preset (uniform a2a, no
+    incast) -- the degenerate anchor."""
+    from inferencesim.presets import GPT_OSS_120B
+    dep = Deployment(tp=1, ep=8, weight_dtype=DType.FP4, kv_dtype=DType.FP8)
+    scen = Scenario(batch=128, prompt_len=2048, output_len=512)
+    base_a = simulate(GB300_NVL72, GPT_OSS_120B, scen, dep, engine=RooflineEngine())
+    skew0_a = simulate(GB300_NVL72, _gpt_oss_skew(0.0), scen, dep, engine=RooflineEngine())
+    assert skew0_a.tpot_s == base_a.tpot_s  # bit-identical analytic anchor
+    base_d = simulate(GB300_NVL72, GPT_OSS_120B, scen, dep, engine=_des2())
+    skew0_d = simulate(GB300_NVL72, _gpt_oss_skew(0.0), scen, dep, engine=_des2())
+    assert skew0_d.tpot_s == base_d.tpot_s
+
+
+def test_moe_hot_expert_worsens_tpot_and_lights_ingress():
+    """gpt-oss DEP8 at skew=1.0: the hot experts cost real TPOT (weight-streaming
+    pacing + all-to-all incast), and the hottest member's ingress port `.in`
+    tops the fabric ingress utilisation -- the observable of the incast."""
+    dep = Deployment(tp=1, ep=8, weight_dtype=DType.FP4, kv_dtype=DType.FP8)
+    scen = Scenario(batch=128, prompt_len=2048, output_len=512)
+    d0 = simulate(GB300_NVL72, _gpt_oss_skew(0.0), scen, dep, engine=_des2())
+    d1 = simulate(GB300_NVL72, _gpt_oss_skew(1.0), scen, dep, engine=_des2())
+    assert d1.tpot_s > d0.tpot_s  # hot experts cost real TPOT
+    util = d1.resource_util["decode"]
+    ins = {k: v for k, v in util.items() if k.endswith(".in")}
+    assert ins  # switched a2a -> ingress ports present, surfaced (not sync-filtered)
+    assert max(ins, key=ins.get) == "s0.l0.in"  # hot member (block 0) tops ingress
+    assert util["s0.l0.in"] > util["s0.l7.in"]  # coldest member's ingress lighter
+
+
+def test_moe_tpot_monotone_in_skew():
+    """TPOT increases monotonically with skew (two interior points suffice)."""
+    dep = Deployment(tp=1, ep=8, weight_dtype=DType.FP4, kv_dtype=DType.FP8)
+    scen = Scenario(batch=128, prompt_len=2048, output_len=512)
+    tpots = [simulate(GB300_NVL72, _gpt_oss_skew(s), scen, dep, engine=_des2()).tpot_s
+             for s in (0.0, 0.6, 1.2)]
+    assert tpots[0] < tpots[1] < tpots[2]
 
 
 def test_des_ring_fabric_moe_free_is_sane():
