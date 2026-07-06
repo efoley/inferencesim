@@ -249,6 +249,14 @@ HARDWARE: dict[str, System] = {
     "tt-quietbox-2": TT_QUIETBOX_2,
 }
 
+# Speculative, low-cost (no-HBM / CXL-disaggregated) research machines live in
+# a sibling module; merge them into the catalogue so `list`, `run`, `serve` and
+# the graph tools see them like any other preset.  presets_spec imports only
+# from .hardware/.units, so this bottom-of-file import introduces no cycle.
+from .presets_spec import SPEC_HARDWARE  # noqa: E402
+
+HARDWARE.update(SPEC_HARDWARE)
+
 # =============================================================================
 # Models
 # =============================================================================
