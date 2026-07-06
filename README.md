@@ -153,8 +153,12 @@ a composition/constraint map, and a decision guide. In brief:
   allreduce becomes dispatch/combine all-to-alls, and the full batch amortizes
   expert weight reads. **This is exactly TRT-LLM's `DEPn` for MoE**:
   `DEPn ≡ tp=1, ep=n` here, so `DEP4` is simulated as `--tp 1 --ep 4` (validated
-  in `tests/test_dep.py`). Unmodeled: EPLB redundant-expert load balancing and
-  mixed ADP+TP MoE attention.
+  in `tests/test_dep.py`). Expert-load imbalance is a knob: `--moe-skew`
+  (`MoEConfig.skew`, a Zipf exponent, 0 = uniform) concentrates routing onto the
+  hot experts, so `moe_routed` is paced by the hottest `tp*ep` member and — under
+  `--engine des` — the switched all-to-all incasts onto that member's ingress
+  port (its `.l{i}.in` tops the utilisation report). Unmodeled: EPLB
+  redundant-expert *mitigation* of that imbalance, and mixed ADP+TP MoE attention.
 - **ADP (attention data-parallel, dense only)**: the DeepSeek-V3-style "DP
   attention + TP FFN" pattern, and TRT-LLM's dense `DEPn`. Attention runs
   data-parallel across `adp` groups (weights replicated across them) so
@@ -185,11 +189,13 @@ engine only warns), LM-head/hop overlap with other stages' work, and
 serial fill/drain for single-request prefill. Collectives are expanded to
 their actual per-step transfers over the declared fabric topology
 (`collectives.py`): a ring allreduce becomes 2(g-1) barrier-separated steps
-on per-member directional links, and a MoE all-to-all becomes g-1 per-member
-messages on a switched (all-to-all) fabric or shortest-way store-and-forward
-routing on a ring — so ring vs all-to-all fabrics genuinely differ, and
-collectives contend with pipeline hops (which ride the boundary chip's link)
-instead of on a lumped fabric. Link resources carry only bandwidth occupancy
+on per-member directional links, and a MoE all-to-all becomes per-member
+store-and-forward messages — each an egress-port occupancy then the receiver's
+ingress-port occupancy — on a switched (all-to-all) fabric, so a skewed expert
+load (`--moe-skew`) incasts onto the hot owners' ingress ports, or shortest-way
+store-and-forward routing on a ring — so ring vs all-to-all fabrics genuinely
+differ, and collectives contend with pipeline hops (which ride the boundary
+chip's link) instead of on a lumped fabric. Link resources carry only bandwidth occupancy
 (`bytes/bw`); propagation latency rides the dependency chain, never a link —
 so each collective reproduces its closed form exactly in isolation and
 diverges only under genuine bandwidth contention. The report adds a
@@ -383,8 +389,11 @@ prefill). See `DES_todo.md` §4.
   prefill and pp>1 is next — see `DES_todo.md` §4.)
 - **Graph editor UI** over the JSON graph format (nodes with constraints,
   edges with latencies, nesting for abstraction levels).
-- Multi-rack topologies (rail-optimized Ethernet/IB); MoE expert load
-  imbalance. (**Prefill/decode disaggregation landed**: `serve --disagg`, a
+- Multi-rack topologies (rail-optimized Ethernet/IB); EPLB redundant-expert
+  *mitigation* of MoE hot-expert load imbalance. (**Hot-expert imbalance itself
+  landed**: `--moe-skew` skews expert popularity, pacing `moe_routed` by the hot
+  `tp*ep` member and incasting the all-to-all onto its ingress port under the
+  DES. **Prefill/decode disaggregation landed**: `serve --disagg`, a
   prefill pool + decode pool with KV streamed between them — DistServe/Dynamo;
   see the Serving subsection. Remaining: transfer-link contention,
   chunked+disagg, context-parallel prefill.)

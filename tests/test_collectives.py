@@ -73,21 +73,60 @@ def test_allreduce_topology_aware_link_naming():
 
 @pytest.mark.parametrize("g", [2, 4, 32])
 @pytest.mark.parametrize("lat", [0.0, 2e-6])
-def test_a2a_switched_matches_closed_form(g, lat):
-    """On an ALL_TO_ALL fabric every member serialises the g-1 messages'
-    bandwidth occupancies on its single egress port (`.out`, total
-    comm_bytes/bw), and a single exit barrier carries one propagation latency
-    (flight time overlaps across the injected messages).  So the isolation
-    makespan is exactly the closed form comm_bytes/bw + lat -- for every g,
-    including the 32-way MoE case -- and the link busy-time is pure
-    occupancy."""
+def test_a2a_switched_uniform_oracle_with_fill(g, lat):
+    """Store-and-forward switched all-to-all, uniform payloads: each message is
+    an egress-occupancy task on the sender's `.out` port THEN an ingress task on
+    the receiver's `.in` port.  The staggered rotation is a perfect permutation
+    each step, so no ingress ever queues, and the isolation makespan is EXACTLY
+    the closed form plus one message of store-and-forward fill:
+
+        g*occ + lat == comm_bytes/bw + (comm_bytes/(g-1))/bw + lat,
+
+    with occ = comm_bytes/((g-1)*bw).  The one-message gap over the switched
+    closed form (comm_bytes/bw + lat) is deliberate and bounded -- the analytic
+    engine does not charge it (mirroring graphdes' fill/drain).  Egress and
+    ingress link busy-times are each pure occupancy comm_bytes/bw."""
     comm_bytes, bw = 3.1e6, 100e9
     tasks: list[Task] = []
     collectives.all_to_all(tasks, None, g, comm_bytes, bw, lat,
                            Topology.ALL_TO_ALL, "s0", "a2a")
     r = schedule(tasks)
-    assert r.makespan == pytest.approx(comm_bytes / bw + lat, rel=1e-9)
-    assert r.busy["s0.l0.out"] == pytest.approx(comm_bytes / bw, rel=1e-9)
+    occ = (comm_bytes / (g - 1)) / bw
+    closed_form = comm_bytes / bw + lat
+    assert r.makespan == pytest.approx(g * occ + lat, rel=1e-9)  # the new exact oracle
+    assert r.makespan == pytest.approx(comm_bytes / bw + occ + lat, rel=1e-9)
+    # within exactly one message of store-and-forward fill of the closed form
+    assert closed_form < r.makespan <= closed_form + occ * (1 + 1e-9)
+    assert r.busy["s0.l0.out"] == pytest.approx(comm_bytes / bw, rel=1e-9)  # egress occupancy
+    assert r.busy["s0.l0.in"] == pytest.approx(comm_bytes / bw, rel=1e-9)  # ingress occupancy
+
+
+def test_a2a_switched_skewed_incast_g4():
+    """Skewed switched all-to-all, g = 4, member 0 twice as popular as the rest
+    (popularity vector w = [2/5, 1/5, 1/5, 1/5]).  Dispatch (weight_on='dest')
+    sizes s->r by w[r], so every sender's message to the hot member 0 is
+    size 4/3*P*2/5 = 8P/15 while its cold messages are 4/3*P*1/5 = 4P/15
+    (occ = size/bw).  With rotation order s->s+1,s+2,s+3, the three hot messages
+    aimed at member 0 finish egress at 8P/15, 12P/15, 16P/15 (from senders 3, 2,
+    1 respectively), and member 0's INGRESS port serialises them:
+
+        [8/15,16/15], [16/15,24/15], [24/15,32/15]  (units of P/bw)
+
+    -- an incast.  So the makespan is 32/15*P/bw + lat, strictly above the
+    uniform g*occ+lat = 4/3*P/bw+lat, and member 0's ingress carries 3*8P/15 of
+    occupancy versus a cold member's 3*4P/15."""
+    g, P, bw, lat = 4, 3.0e6, 100e9, 1e-6
+    weights = [2 / 5, 1 / 5, 1 / 5, 1 / 5]
+    tasks: list[Task] = []
+    collectives.all_to_all(tasks, None, g, P, bw, lat, Topology.ALL_TO_ALL,
+                           "s0", "a2a", weights=weights, weight_on="dest")
+    r = schedule(tasks)
+    uniform = g * (P / (g - 1) / bw) + lat  # = 4/3 P/bw + lat
+    assert r.makespan == pytest.approx(32 / 15 * P / bw + lat, rel=1e-9)
+    assert r.makespan > uniform  # incast onto the hot owner
+    assert r.busy["s0.l0.in"] == pytest.approx(3 * (8 / 15) * P / bw, rel=1e-9)
+    assert r.busy["s0.l1.in"] == pytest.approx(3 * (4 / 15) * P / bw, rel=1e-9)
+    assert r.busy["s0.l1.in"] < r.busy["s0.l0.in"]
 
 
 def test_a2a_group_one_is_noop():
@@ -132,6 +171,36 @@ def test_ring_a2a_g4_hand_computed():
     for m in range(g):
         assert r.busy[f"s0.l{m}.cw"] == pytest.approx(3 * occ, rel=1e-9)
         assert r.busy[f"s0.l{m}.ccw"] == pytest.approx(occ, rel=1e-9)
+
+
+def test_ring_a2a_skewed_payloads_route_and_conserve():
+    """Skewed ring all-to-all: message sizes follow the popularity vector (a
+    dispatch sizes s->r by w[r]) while the routing -- short way round, cw on
+    ties -- is UNCHANGED, and ring forwarding needs no separate ingress port.
+    Payload is conserved, just concentrated onto the hot owner's messages: the
+    total cw+ccw link occupancy equals the injected bytes times each message's
+    hop count.  (The independent oracle re-derives that sum from the same
+    routing rule.)"""
+    g, P, bw, lat = 4, 3.0e6, 100e9, 0.0
+    weights = [0.4, 0.2, 0.2, 0.2]  # member 0 hottest
+    tasks: list[Task] = []
+    collectives.all_to_all(tasks, None, g, P, bw, lat, Topology.RING,
+                           "s0", "a2a", weights=weights, weight_on="dest")
+    r = schedule(tasks)
+    assert r.makespan > 0
+    scale = g / (g - 1) * P
+    expected = 0.0
+    for i in range(g):
+        for j in range(g):
+            if i == j:
+                continue
+            size = scale * weights[j]  # weight_on='dest'
+            cw_dist, ccw_dist = (j - i) % g, (i - j) % g
+            dist = cw_dist if cw_dist <= ccw_dist else ccw_dist
+            expected += size * dist / bw
+    link_busy = sum(b for k, b in r.busy.items()
+                    if k.endswith(".cw") or k.endswith(".ccw"))
+    assert link_busy == pytest.approx(expected, rel=1e-9)
 
 
 # ---- contention: hop occupancy shares member 0's link with the allreduce ----

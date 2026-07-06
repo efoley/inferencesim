@@ -19,22 +19,113 @@ class MoEConfig:
     layers are ~33 B of the 671 B).  It is applied to parameter counting and
     the per-chip weight footprint; the *op lowering* still costs every layer as
     MoE (a documented ~n_dense/n_layers over-count of expert streaming --
-    negligible at 3/61 layers)."""
+    negligible at 3/61 layers).
+
+    `skew` is a single interpretable knob for *expert-load imbalance*: expert
+    popularity follows a Zipf law `pop_e ∝ 1/(e+1)^skew`, normalised over the
+    `n_experts` experts.  `skew=0` is uniform routing (`pop_e = 1/n_experts`) --
+    the degenerate anchor, bit-identical to the historical model.  Under EP the
+    experts are placed on the `tp*ep` array in contiguous blocks (member 0 holds
+    the lowest-indexed = most popular experts), so a positive skew concentrates
+    routing traffic and expert-weight streaming onto the low-numbered members:
+    the hot-expert imbalance.  The model shows the *unmitigated* imbalance --
+    EPLB / redundant-expert placement that real large-scale EP uses to rebalance
+    hot experts is future work (see `DES_todo.md`).  The marginal probability a
+    token routes to expert e is `min(1, top_k*pop_e)` (a token picks top_k
+    distinct experts), so `skew=0` gives the historical `top_k/n_experts`."""
 
     n_experts: int
     top_k: int
     d_ff_expert: int
     d_ff_shared: int = 0
     n_dense_layers: int = 0
+    skew: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.skew < 0.0:
+            raise ValueError(
+                f"MoEConfig.skew must be >= 0 (got {self.skew}); 0 = uniform, "
+                "larger = more concentrated expert popularity"
+            )
 
     def expected_active_experts(self, n_tokens: int) -> float:
         """Expected number of *distinct* routed experts touched by n_tokens,
         assuming uniform routing.  Governs how many expert weights must be
-        streamed from DRAM in a decode step."""
+        streamed from DRAM in a decode step.  This is the `skew=0` special case
+        of the per-member `expected_active_on_member` derivation (proven equal
+        in the tests); the lowering keeps calling it on the uniform path so the
+        anchor stays bit-identical."""
         if n_tokens <= 0:
             return 0.0
         p_untouched = (1.0 - self.top_k / self.n_experts) ** n_tokens
         return self.n_experts * (1.0 - p_untouched)
+
+    # ---- expert-load skew (EP hot-expert imbalance) ---------------------
+
+    def _popularity(self) -> list[float]:
+        """Per-expert routing popularity `pop_e ∝ 1/(e+1)^skew`, normalised so
+        `sum_e pop_e == 1`.  Monotonically decreasing in e, so expert 0 is the
+        hottest.  `skew=0` returns the uniform `1/n_experts` exactly."""
+        if self.skew == 0.0:
+            return [1.0 / self.n_experts] * self.n_experts
+        w = [1.0 / (e + 1) ** self.skew for e in range(self.n_experts)]
+        z = sum(w)
+        return [x / z for x in w]
+
+    def _member_blocks(self, n_members: int) -> list[tuple[int, int]]:
+        """Contiguous [start, end) expert block owned by each of `n_members`
+        (the standard EP placement: experts partitioned in order over the
+        `tp*ep` array, remainder onto the first members).  Member 0 holds the
+        lowest expert indices -- the most popular under any skew -- so it is
+        always the hot member."""
+        base, extra = divmod(self.n_experts, n_members)
+        blocks: list[tuple[int, int]] = []
+        start = 0
+        for i in range(n_members):
+            size = base + (1 if i < extra else 0)
+            blocks.append((start, start + size))
+            start += size
+        return blocks
+
+    def member_popularity(self, n_members: int) -> list[float]:
+        """Fraction of the batch's top_k routings that lands on each member's
+        expert block (`sum == 1`).  Uniform routing gives `1/n_members` each;
+        skew concentrates it on member 0.  Drives the dispatch/combine per-member
+        payload vector and the hot-member pacing of `moe_routed`."""
+        pop = self._popularity()
+        return [sum(pop[a:b]) for a, b in self._member_blocks(n_members)]
+
+    def tokens_to_member(self, m: int, n_tokens: int, n_members: int) -> float:
+        """Expected number of the batch's `n_tokens * top_k` routings that land
+        on member m's expert block = `member_popularity(m) * n_tokens * top_k`."""
+        return self.member_popularity(n_members)[m] * n_tokens * self.top_k
+
+    def expected_active_on_member(
+        self, m: int, n_tokens: int, n_members: int
+    ) -> float:
+        """Expected number of *distinct* experts active within member m's block
+        when `n_tokens` each route to top_k experts (marginal per-expert prob
+        `min(1, top_k*pop_e)`).  Generalises `expected_active_experts` per block:
+        `sum_m expected_active_on_member(m) == sum_e [1-(1-min(1,top_k*pop_e))^n]`
+        (the global skewed expected-active), and at `skew=0` each member equals
+        `expected_active_experts(n)/n_members` and the sum reproduces
+        `expected_active_experts(n)` exactly (proven in the tests)."""
+        if n_tokens <= 0:
+            return 0.0
+        pop = self._popularity()
+        a, b = self._member_blocks(n_members)[m]
+        return sum(
+            1.0 - (1.0 - min(1.0, self.top_k * pop[e])) ** n_tokens
+            for e in range(a, b)
+        )
+
+    def hot_member_factor(self, n_members: int) -> float:
+        """The pacing ratio `max_m tokens_to_member(m) / mean` -- how much more
+        routing traffic (and expert-weight streaming and dispatch/combine
+        payload) the hottest member carries than the average one.  Independent
+        of the batch: `== n_members * max_m member_popularity(m)`.  `1.0` at
+        `skew=0` (perfectly balanced), `> 1` once skew concentrates load."""
+        return max(self.member_popularity(n_members)) * n_members
 
 
 @dataclass(frozen=True)

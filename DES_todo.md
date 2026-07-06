@@ -112,11 +112,29 @@ Drive per-chip work against `chip_graph.expand()` resources instead of one
       the fabric switch's meta but read from the chip composite's, so a RING
       system silently round-tripped to ALL_TO_ALL; the switch node's meta is now
       its single home.
-    - Ingress/incast is unmodeled: each member has an *egress* resource, but
-      simultaneous *arrivals* at a member are unbounded -- harmless for uniform
-      collectives (per-member ingress load equals egress load), but a hot-expert
-      MoE all-to-all would incast onto the busy owners and needs a per-member
-      ingress resource before that imbalance is faithful.
+    - [x] **Ingress / incast + MoE hot-expert load imbalance**: each switched-
+      fabric member now has a per-member *ingress* resource (`{prefix}.l{i}.in`)
+      as well as its egress port, and the switched all-to-all is store-and-forward
+      (egress `.out` then ingress `.in`) with a staggered rotation send order.
+      `MoEConfig.skew` (a single Zipf knob, `pop_e ∝ 1/(e+1)^skew`, 0 = uniform =
+      bit-identical) places experts on the `tp*ep` array in contiguous blocks, so
+      a positive skew concentrates routing traffic onto the low-numbered members:
+      the lowering paces `moe_routed` by the hottest member (`hot_member_factor`
+      × the activation flops/bytes, `expected_active_on_member` for its weight
+      streaming -- the roofline of an unbalanced layer), and the DES sizes the
+      dispatch/combine per-member messages by the popularity vector so the hot
+      owner's ingress serialises its incast (dispatch) and egress its combine.
+      The hot member's `.in` lights up in `resource_util` -- the observable.
+      With uniform payloads the rotation is a perfect permutation so nothing
+      queues and the makespan is the switched closed form plus exactly one message
+      of store-and-forward fill (`comm_bytes/bw + comm_bytes/((g-1)bw) + lat`); the
+      analytic engine's closed form is unchanged, so the DES==roofline MoE oracles
+      moved by that deliberate, bounded fill (asserted exactly, not loosened). A
+      RING has no separate ingress port (arrivals ride the cw/ccw cables), so ring
+      a2a only re-sizes its messages by the vector. **EPLB / redundant-expert
+      placement** (real large-scale EP rebalances hot experts with redundant
+      copies) is the remaining mitigation follow-up -- the model here shows the
+      *unmitigated* imbalance.
 
 ### 3. Heterogeneity (lift the homogeneous-chip restriction)
 

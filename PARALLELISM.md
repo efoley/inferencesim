@@ -174,6 +174,20 @@ roofline engine costs it as a single `payload/bw + lat` and does not see the
 hops. What stays unmodeled: EPLB redundant-expert load balancing and mixed ADP+TP
 MoE attention (`--adp` is rejected for MoE — §3).
 
+**Expert-load skew (`MoEConfig.skew` / `--moe-skew`).** By default routing is
+uniform, but real MoE traffic is skewed — a few experts are much more popular. A
+single Zipf knob `pop_e ∝ 1/(e+1)^skew` (0 = uniform, the bit-identical anchor)
+places experts on the `tp*ep` array in contiguous blocks, so a positive skew
+concentrates load onto the low-numbered members. The lowering then paces
+`moe_routed` by the *hottest* member (its `hot_member_factor` more activation
+work and its block's `expected_active_on_member` expert-weight streaming — the
+roofline of an unbalanced layer, so TPOT rises with skew on both engines), and
+under `--engine des` the switched all-to-all is store-and-forward with per-member
+ingress ports: the hot owners **incast** (every sender dispatches a large message
+to them, and they egress the most on combine), so their `.l{i}.in` ingress
+utilisation tops the `resource_util` report — the observable of the imbalance.
+This is the *unmitigated* skew; EPLB / redundant-expert placement is future work.
+
 **Real use.** gpt-oss-120B: DEP2 (B200) / DEP4 (H100); Qwen3-235B-A22B: DEP4
 (B200/GB200/H200) / DEP8 (H100); DeepSeek-R1/V3: DEP4 (FP4) / DEP8 (FP8) — all
 [TRT-LLM perf-overview](https://nvidia.github.io/TensorRT-LLM/latest/developer-guide/perf-overview.html).
@@ -339,14 +353,16 @@ tables report `tps/gpu`; the `× GPUs` system-total conversions live per-anchor 
   prefill: a very long prompt is not split across a replica's chips. `serve_disagg`
   prefills one whole prompt on one replica (`DES_todo.md` §4, "context-parallel
   prefill").
-- **EPLB / redundant experts** — DEP additionally load-balances hot experts with
-  redundant copies; `tp=1, ep=n` models neither (`CALIBRATION.md` §6.3, §8.1;
-  README Parallelism).
+- **EPLB / redundant experts** — the `MoEConfig.skew` knob models the
+  *unmitigated* hot-expert imbalance (skewed streaming + all-to-all incast onto
+  hot owners, §EP above); DEP's redundant-expert load balancing that rebalances
+  it is not modeled (`CALIBRATION.md` §6.3, §8.1; README Parallelism).
 - **Mixed ADP+TP MoE attention** — real DEP composes TP inside the DP-attention
   groups; here MoE attention-DP is exactly `ep` (`CALIBRATION.md` §8.1).
 - **KV-transfer / collective contention** — concurrent disagg KV transfers each
-  pay their own `bytes/bw + lat` with no shared-link occupancy; a MoE all-to-all's
-  ingress incast onto hot experts is unmodeled (`DES_todo.md` §2, §4).
+  pay their own `bytes/bw + lat` with no shared-link occupancy (`DES_todo.md` §4).
+  (A MoE all-to-all's ingress incast onto hot experts *is* now modeled under
+  `MoEConfig.skew` — §EP above, `DES_todo.md` §2.)
 - **Task-level pp>1 serving** — `serve`/`serve_disagg` are pp=1 (pipeline
   fill/drain across stages is future work — `DES_todo.md` §4).
 

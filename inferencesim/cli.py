@@ -157,6 +157,17 @@ def _cmd_graph(args: argparse.Namespace) -> int:
     return 0
 
 
+def _apply_moe_skew(model, skew: float | None):
+    """Override a MoE model's expert-load `skew` from the CLI (no-op for None or
+    a dense model, with a friendly error if --moe-skew is given for a dense one)."""
+    if skew is None:
+        return model
+    if model.moe is None:
+        print(f"--moe-skew is MoE-only; {model.name} is dense", file=sys.stderr)
+        raise SystemExit(2)
+    return replace(model, moe=replace(model.moe, skew=skew))
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     if args.model not in MODELS:
         print(f"unknown model '{args.model}' (try: inferencesim list)", file=sys.stderr)
@@ -172,7 +183,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(f"unknown hardware '{args.hardware}' (try: inferencesim list)",
               file=sys.stderr)
         return 2
-    model = MODELS[args.model]
+    model = _apply_moe_skew(MODELS[args.model], args.moe_skew)
     dep = Deployment(
         tp=args.tp,
         pp=args.pp,
@@ -257,7 +268,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         print(f"unknown hardware '{args.hardware}' (try: inferencesim list)",
               file=sys.stderr)
         return 2
-    model = MODELS[args.model]
+    model = _apply_moe_skew(MODELS[args.model], args.moe_skew)
     dep = Deployment(
         tp=args.tp, pp=args.pp, ep=args.ep, adp=args.adp,
         weight_dtype=DType(args.weight_dtype),
@@ -368,6 +379,12 @@ def main(argv: list[str] | None = None) -> int:
                      help="attention-data-parallel groups (dense models only): "
                           "DP attention + TP FFN, TRT-LLM DEPn -- cuts per-chip "
                           "KV by adp, streams the FFN over the tp*adp array")
+    run.add_argument("--moe-skew", type=float, default=None,
+                     help="MoE expert-load imbalance (Zipf exponent over expert "
+                          "popularity; 0 = uniform, larger = hotter experts). "
+                          "Paces moe_routed by the hottest tp*ep member and, "
+                          "under --engine des, incasts the dispatch/combine "
+                          "all-to-all onto the hot owner's ingress port")
     run.add_argument("--batch", default="32",
                      help="concurrent sequences per replica (comma list sweeps)")
     run.add_argument("--prompt", type=int, default=2048, help="prompt tokens per request")
@@ -416,6 +433,10 @@ def main(argv: list[str] | None = None) -> int:
     srv.add_argument("--adp", type=int, default=1,
                      help="attention-data-parallel groups (dense models only): "
                           "DP attention + TP FFN, TRT-LLM DEPn")
+    srv.add_argument("--moe-skew", type=float, default=None,
+                     help="MoE expert-load imbalance (Zipf exponent; 0 = uniform). "
+                          "Paces moe_routed by the hottest tp*ep member, so serve "
+                          "throughput drops as hot experts stream more weight")
     srv.add_argument("--rate", type=float, default=5.0,
                      help="whole-system arrival rate (requests/s, Poisson); "
                           "divided by DP for one replica")

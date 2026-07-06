@@ -30,6 +30,12 @@ named for the fabric it egresses onto:
     being per-direction).  The ring *algorithm* over a switched fabric is a
     logical ring whose sends still leave via the one egress port, so it names
     `.out` on ALL_TO_ALL and `.cw` on RING.
+  * `{prefix}.l{i}.in` -- member i's *ingress* port on a switched fabric.  The
+    all-to-all is store-and-forward: each message occupies the sender's `.out`
+    then the receiver's `.in`, so simultaneous arrivals at one member serialise
+    on its ingress port -- the incast a hot-expert MoE all-to-all creates onto
+    the busy owners.  A RING has no separate ingress port (arrivals ride the
+    same directional cables they are forwarded on), so it reuses `.cw`/`.ccw`.
   Either way the link resource carries bandwidth occupancy only.
   * `{prefix}.bar{inst}` -- the sync/barrier resource of one collective
     *instance* (`inst` uniquifies it so concurrent instances on a stage do
@@ -81,12 +87,53 @@ def _out(prefix: str, i: int) -> str:
     return f"{prefix}.l{i}.out"
 
 
+def _in(prefix: str, i: int) -> str:
+    return f"{prefix}.l{i}.in"
+
+
 def egress(prefix: str, i: int, topology: Topology) -> str:
     """Member i's outbound link resource, named for the fabric it egresses
     onto: a RING has two distinct cables (this is the clockwise one), a
     switched / mesh fabric a single egress port.  Used for ring-algorithm
     sends and (in des.py) for the pipeline hop off the boundary chip."""
     return _cw(prefix, i) if topology is Topology.RING else _out(prefix, i)
+
+
+def ingress(prefix: str, i: int, topology: Topology) -> str:
+    """Member i's inbound link resource.  A switched / mesh fabric has a
+    distinct ingress port (`.in`) so simultaneous arrivals at a member serialise
+    -- the incast a skewed all-to-all creates onto hot owners.  A RING has no
+    separate ingress port; a forwarded message arrives on the same directional
+    cable it travelled, so ring ingress reuses the clockwise cable (arrivals are
+    already accounted on the cw/ccw link occupancy)."""
+    return _cw(prefix, i) if topology is Topology.RING else _in(prefix, i)
+
+
+def _msg_sizes(group: int, comm_bytes: float, weights: list[float] | None,
+               weight_on: str):
+    """Return a `size(s, r) -> bytes` for the message from sender s to receiver
+    r of an all-to-all.
+
+    Uniform (`weights is None`): every message is `comm_bytes/(group-1)` -- the
+    per-member payload split evenly over the g-1 peers, the historical sizing.
+
+    Skewed (`weights` = the per-member routing-popularity vector, `sum == 1`):
+    `size(s, r) = group/(group-1) * comm_bytes * w[k]`, where k is the receiver
+    r for a dispatch (`weight_on='dest'`: the message carries the fraction of
+    s's tokens routed to r's experts, so a hot receiver INCASTS) or the sender s
+    for a combine (`weight_on='src'`: the hot expert-owner combines and egresses
+    the most).  The `group/(group-1)` factor makes it reduce to the uniform
+    `comm_bytes/(group-1)` when `w == 1/group`, and preserves the per-member
+    average payload (`comm_bytes`): mean sender egress and mean receiver ingress
+    both stay `comm_bytes`, while the hot member's ingress (dispatch) / egress
+    (combine) load is `hot_member_factor * comm_bytes`."""
+    if weights is None:
+        uniform = comm_bytes / (group - 1)
+        return lambda s, r: uniform
+    scale = group / (group - 1) * comm_bytes
+    if weight_on == "src":
+        return lambda s, r: scale * weights[s]
+    return lambda s, r: scale * weights[r]
 
 
 def _ring_pass(
@@ -171,51 +218,79 @@ def half_ring(
 def _a2a_switched(
     tasks: list[Task], entry: int | None, group: int, comm_bytes: float,
     bw: float, lat: float, prefix: str, label: str,
+    weights: list[float] | None = None, weight_on: str = "dest",
 ) -> int:
-    """All-to-all on a switched / full-mesh fabric: every member sends g-1
-    messages of `comm_bytes/(g-1)` bytes, one to each peer, whose *bandwidth
-    occupancies* serialise on its single outbound link (total `comm_bytes/bw`).
-    A single exit barrier carries one propagation latency (flight time
-    overlaps across the injected messages).  Isolation makespan
+    """All-to-all on a switched / full-mesh fabric, store-and-forward: every
+    member sends g-1 messages, one to each peer, in a STAGGERED rotation (sender
+    s sends to s+1, s+2, ... s+(g-1) mod g in that order).  Each message is an
+    egress-occupancy task on the sender's `.out` port THEN an ingress-occupancy
+    task on the receiver's `.in` port (both carry the message's `bytes/bw`); a
+    single exit barrier carries one propagation latency (flight time overlaps).
 
-        comm_bytes/bw + lat,
+    **Uniform oracle (exact).**  With uniform payloads (`weights is None`,
+    message occ = `comm_bytes/((g-1)*bw)`) the rotation is a perfect permutation
+    each step: in step t every sender pushes to a distinct receiver, and receiver
+    r takes from sender s exactly the message whose egress finished at
+    `t*occ` where `t = (r-s) mod g` -- so as s ranges over the g-1 senders, r's
+    ingress port receives exactly one message in each slot [t*occ, (t+1)*occ],
+    t = 1..g-1, and NEVER queues.  The last message (t = g-1) egresses over
+    [(g-2)occ, (g-1)occ] then ingresses over [(g-1)occ, g*occ], so the isolation
+    makespan is
 
-    exactly the closed form -- the expansion diverges from it only when the
-    link is genuinely contended by other traffic."""
+        g*occ + lat == comm_bytes/bw + (comm_bytes/(g-1))/bw + lat,
+
+    the switched closed form (`comm_bytes/bw + lat`) plus EXACTLY ONE message of
+    store-and-forward fill -- a deliberate, bounded gap the analytic engine does
+    not charge (mirroring graphdes' fill/drain).  Egress and ingress busy times
+    are each pure occupancy `comm_bytes/bw`.
+
+    **Skewed case (incast).**  With a per-member popularity vector the message
+    sizes are non-uniform (see `_msg_sizes`): for a dispatch the hot receiver
+    takes a large message from every sender, so its ingress port serialises the
+    extra arrivals and the makespan exceeds the uniform one -- the incast made
+    visible.  A small g=4 case is hand-derived in the tests."""
     inst = len(tasks)
-    occ = (comm_bytes / (group - 1)) / bw
+    size = _msg_sizes(group, comm_bytes, weights, weight_on)
     base = [entry] if entry is not None else []
     finals: list[int] = []
-    for i in range(group):
-        out = _out(prefix, i)  # the member's single egress port
+    for s in range(group):
+        out = _out(prefix, s)  # the sender's single egress port
         prev: int | None = None
-        for _ in range(group - 1):
+        for step in range(1, group):  # staggered rotation: s -> s+step
+            r = (s + step) % group
+            occ = size(s, r) / bw
             deps = [prev] if prev is not None else list(base)
+            # the sender's egress port serialises its sends in rotation order;
+            # the message then occupies the receiver's ingress port
             prev = _add(tasks, out, occ, deps, label)
-        assert prev is not None
-        finals.append(prev)
+            finals.append(_add(tasks, _in(prefix, r), occ, [prev], label))
     return _add(tasks, f"{prefix}.bar{inst}", lat, finals, label)
 
 
 def _a2a_ring(
     tasks: list[Task], entry: int | None, group: int, comm_bytes: float,
     bw: float, lat: float, prefix: str, label: str,
+    weights: list[float] | None = None, weight_on: str = "dest",
 ) -> int:
     """All-to-all on a ring: each of the g(g-1) messages routes the short way
     round and is forwarded hop by hop (store-and-forward).  Each hop is a link
     task carrying bandwidth occupancy `msg/bw`, followed by a propagation task
     carrying `lat` on a per-message resource (so a message's own flight time
     never contends, and different messages contend only on the shared links).
-    Ties (a message exactly halfway round) go clockwise.  No closed form
-    exists; a small case is hand-derived in the tests."""
+    Ties (a message exactly halfway round) go clockwise.  Message sizes may be
+    non-uniform under expert-load skew (`weights`); the routing is unchanged, and
+    ingress is inherent in ring forwarding (arrivals ride the cw/ccw cables, no
+    separate ingress resource).  No closed form exists; small cases (uniform and
+    skewed) are hand-derived in the tests."""
     inst = len(tasks)
-    occ = (comm_bytes / (group - 1)) / bw
+    size = _msg_sizes(group, comm_bytes, weights, weight_on)
     base = [entry] if entry is not None else []
     finals: list[int] = []
     for i in range(group):
         for j in range(group):
             if i == j:
                 continue
+            occ = size(i, j) / bw
             cw_dist = (j - i) % group
             ccw_dist = (i - j) % group
             cw = cw_dist <= ccw_dist  # tie -> clockwise
@@ -236,23 +311,32 @@ def _a2a_ring(
 def all_to_all(
     tasks: list[Task], entry: int | None, group: int, comm_bytes: float,
     bw: float, lat: float, topology: Topology, prefix: str, label: str,
+    weights: list[float] | None = None, weight_on: str = "dest",
 ) -> int | None:
     """Expand a MoE dispatch/combine all-to-all over `group = tp*ep` chips,
-    dispatching on the group's fabric topology."""
+    dispatching on the group's fabric topology.
+
+    `weights` (the per-member routing-popularity vector, `sum == 1`) sizes the
+    per-member messages under expert-load skew: `weight_on='dest'` for a dispatch
+    (incast onto the hot receiver's ingress), `'src'` for a combine (the hot
+    owner egresses the most).  `None` (uniform, `skew=0`) recovers even
+    `comm_bytes/(g-1)` messages -- bit-identical routing to before."""
     if group <= 1 or comm_bytes <= 0.0:
         return entry
     if topology is Topology.RING:
-        return _a2a_ring(tasks, entry, group, comm_bytes, bw, lat, prefix, label)
+        return _a2a_ring(tasks, entry, group, comm_bytes, bw, lat, prefix, label,
+                         weights, weight_on)
     if topology is Topology.MESH_2D:
         # TODO: expand a 2-D mesh all-to-all per-step; no preset uses MESH_2D
         # yet, so fall back to the closed form (occupancy on the egress port,
         # latency on a barrier -- same latency/occupancy split as the real
-        # expansions).
+        # expansions).  Skew weights are ignored here (documented; no preset).
         deps = [entry] if entry is not None else []
         occ = _add(tasks, _out(prefix, 0), comm_bytes / bw, deps, label)
         return _add(tasks, f"{prefix}.bar{len(tasks)}", lat, [occ], label)
     # ALL_TO_ALL: switched (NVSwitch) or full mesh.
-    return _a2a_switched(tasks, entry, group, comm_bytes, bw, lat, prefix, label)
+    return _a2a_switched(tasks, entry, group, comm_bytes, bw, lat, prefix, label,
+                         weights, weight_on)
 
 
 def allreduce(

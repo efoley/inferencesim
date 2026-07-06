@@ -352,3 +352,26 @@ def test_decode_cost_table_matches_direct_lowering():
     for n, mean_ctx in [(1, 3000.0), (7, 1500.0), (32, 5000.0)]:
         direct = decode_iteration_time(GB300, LLAMA_3_1_70B, DEP, n, n * mean_ctx)
         assert table.iter_time(n, n * mean_ctx) == pytest.approx(direct, rel=1e-9)
+
+
+# ---- MoE expert-load skew ---------------------------------------------------
+
+
+def test_moe_serve_skew_lowers_throughput():
+    """A MoE serve run under expert-load skew completes, but with lower
+    throughput than the uniform (skew=0) run: the hot member paces moe_routed's
+    weight streaming, so every decode iteration is slower.  The skew flows in
+    automatically through the per-batch decode cost table (which re-lowers the
+    MoE ops), no serve-loop change needed."""
+    from dataclasses import replace
+
+    dep = Deployment(tp=1, ep=8, weight_dtype=DType.FP4, kv_dtype=DType.FP8)
+    scen = Scenario(batch=64, prompt_len=1024, output_len=256)
+    base = GPT_OSS_120B
+    skewed = replace(base, moe=replace(base.moe, skew=1.0))
+    cfg = ServeConfig(arrivals=[0.0] * 120, max_batch=64, seed=0)  # firehose -> saturated
+    r0 = serve(GB300, base, scen, dep, cfg)
+    r1 = serve(GB300, skewed, scen, dep, cfg)
+    assert r1.n_completed == r0.n_completed == 120  # both complete
+    assert r1.output_tokens_per_s_system < r0.output_tokens_per_s_system
+    assert r1.tpot_mean > r0.tpot_mean  # slower per-token under skew

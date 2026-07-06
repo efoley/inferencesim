@@ -143,15 +143,37 @@ def test_des_matches_roofline_serial_dense_at_any_efficiency(eff):
     assert d.ttft_s == pytest.approx(a.ttft_s, rel=1e-9)
 
 
+def _switched_a2a_fill(system, model, dep, ops, eff):
+    """The store-and-forward fill the DES adds over the roofline on a pp=1 serial
+    chain: one message (comm_bytes/((g-1)*bw)) per switched all-to-all op
+    instance (dispatch/combine).  Ring a2a and non-MoE phases add nothing.  The
+    per-op overhead is charged identically by both engines and cancels."""
+    from inferencesim.hardware import Topology
+    comm = CommContext.for_deployment(system, dep)
+    if comm.a2a <= 1 or comm.a2a_link is None or comm.a2a_topology is Topology.RING:
+        return 0.0
+    bw = comm.a2a_link.bandwidth * eff.collective
+    return sum(op.count * op.comm_bytes / ((comm.a2a - 1) * bw)
+               for op in ops if op.kind is OpKind.ALLTOALL)
+
+
 @pytest.mark.parametrize("eff", _EFFS)
 def test_des_matches_roofline_serial_moe_ep_at_any_efficiency(eff):
     """MoE + EP, pp=1: the all-to-all dispatch/combine expansions plus their
-    per-op overhead must also match the roofline exactly on the serial chain."""
+    per-op overhead match the roofline exactly on the serial chain, up to the
+    deliberate one-message store-and-forward fill each switched a2a now adds
+    (ingress modelling).  That fill is computed exactly from the lowered ops and
+    scales with the collective efficiency, so the equality still holds to full
+    precision -- it is not silently loosened."""
+    from inferencesim.ops import decode_step_ops
     dep = Deployment(tp=4, ep=8, weight_dtype=DType.FP4, kv_dtype=DType.FP8)
     scen = Scenario(batch=128, prompt_len=2048, output_len=512)
     a = simulate(GB300_NVL72, GPT_OSS_120B, scen, dep, engine=RooflineEngine(eff))
     d = simulate(GB300_NVL72, GPT_OSS_120B, scen, dep, engine=DESEngine(efficiency=eff))
-    assert d.tpot_s == pytest.approx(a.tpot_s, rel=1e-9)
+    fill_d = _switched_a2a_fill(GB300_NVL72, GPT_OSS_120B, dep,
+                                decode_step_ops(GPT_OSS_120B, scen, dep), eff)
+    assert fill_d > 0.0
+    assert d.tpot_s == pytest.approx(a.tpot_s + fill_d, rel=1e-9)
 
 
 # ---- graph mode -------------------------------------------------------------

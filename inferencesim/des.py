@@ -109,6 +109,10 @@ class _CommPlan:
     a2a_bw: float = 0.0
     a2a_lat: float = 0.0
     a2a_topo: Topology = Topology.ALL_TO_ALL
+    # per-member routing-popularity vector over the tp*ep array (sum == 1) for a
+    # skewed MoE dispatch/combine; None on the uniform path (skew=0) and for
+    # non-MoE collectives, so those keep even per-member messages.
+    a2a_weights: list[float] | None = None
     # pipeline p2p hop: split into bandwidth occupancy (on the link) and flight
     # time (on the dependency chain), so hop latency does not occupy the link.
     hop_bytes: float = 0.0
@@ -281,6 +285,13 @@ class DESEngine(Engine):
         unscaled, so the isolated makespan still reproduces the closed form."""
         payload = {op.name: op.comm_bytes for op in ops if op.is_comm}
         coll = self.efficiency.collective
+        # the MoE dispatch/combine carry the per-member popularity vector under
+        # skew (both share it); None on the uniform path -> even messages.
+        a2a_weights = next(
+            (list(op.member_weights) for op in ops
+             if op.name == "moe_dispatch" and op.member_weights is not None),
+            None,
+        )
 
         def bwlat(link) -> tuple[float, float]:
             return (link.bandwidth * coll, link.latency_s) if link else (0.0, 0.0)
@@ -298,6 +309,7 @@ class DESEngine(Engine):
             ffn_gather_bytes=payload.get("ffn_gather", 0.0),
             ffn_scatter_bytes=payload.get("ffn_scatter", 0.0),
             a2a_bw=a2a_bw, a2a_lat=a2a_lat, a2a_topo=comm.a2a_topology,
+            a2a_weights=a2a_weights,
             hop_bytes=payload.get("pp_hop", 0.0),
             hop_bw=hop_bw, hop_lat=hop_lat,
         )
@@ -357,11 +369,16 @@ class DESEngine(Engine):
             if oh:
                 add(f"u{s}", oh, f"{tag} ar oh")
 
-        def all_to_all(payload: float) -> None:
+        def all_to_all(payload: float, weight_on: str) -> None:
             nonlocal prev_key
+            # dispatch sizes messages by the receiver's expert popularity
+            # ('dest' -> incast onto the hot owner's ingress); combine by the
+            # sender's ('src' -> the hot owner egresses the most).  weights are
+            # None on the uniform path, recovering even messages.
             prev_key = collectives.all_to_all(
                 tasks, prev_key, plan.a2a_group, payload, plan.a2a_bw,
-                plan.a2a_lat, plan.a2a_topo, prefix, f"{tag} a2a")
+                plan.a2a_lat, plan.a2a_topo, prefix, f"{tag} a2a",
+                weights=plan.a2a_weights, weight_on=weight_on)
             if oh:
                 add(f"u{s}", oh, f"{tag} a2a oh")
 
@@ -381,14 +398,14 @@ class DESEngine(Engine):
             if c.n_allreduce >= 2 and c.allreduce:
                 allreduce()
             if c.dispatch:
-                all_to_all(plan.dispatch_bytes)
+                all_to_all(plan.dispatch_bytes, "dest")
             if c.gather:  # dense attention-DP: allgather the full batch in
                 half_ring(plan.ffn_gather_bytes, "ffn_gather")
             add(f"u{s}", c.ffn, f"{tag} ffn")
             if c.scatter:  # ... and reduce-scatter it back out
                 half_ring(plan.ffn_scatter_bytes, "ffn_scatter")
             if c.combine:
-                all_to_all(plan.combine_bytes)
+                all_to_all(plan.combine_bytes, "src")
             if c.n_allreduce >= 1 and c.allreduce:
                 allreduce()
         if is_last and c.edge:
