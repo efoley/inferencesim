@@ -449,17 +449,31 @@ function layoutChip(model, W, H, pad) {
 function placeGroup(cell, x, y, w, h) {
   setRect(cell, x, y, w, h);
   if (cell.kind === "group" && !cell.collapsed) {
+    // store the grid RELATIVE to the cell (column/row counts + insets only);
+    // absolute instance rects derive from the cell's *current* rect on demand
+    // via gridCellRect(), so drawing, hit-testing and refAnchor always agree
+    // and instances never spill outside the (possibly animating) group box.
     const n = cell.insts.length;
     const ncol = Math.ceil(Math.sqrt(n * (w / Math.max(h, 1)) ));
-    const nrow = Math.ceil(n / ncol);
-    const gpad = 8, hh = 20;
-    const iw = (w - gpad*2) / ncol, ih = (h - gpad*2 - hh) / nrow;
-    cell.grid = { ncol, nrow, gpad, hh, iw, ih, x, y };
+    cell.grid = { ncol, nrow: Math.ceil(n / ncol), gpad: 8, hh: 20 };
   } else cell.grid = null;
 }
 
 // current (animated) rect for a cell
 function curRect(cell) { return cell.cur || cell.rect; }
+
+// absolute rect of instance `i` of an expanded group, computed from the
+// group's CURRENT rect every call -- the single source of instance geometry
+// shared by the renderer, refAnchor (particles) and hit-testing.
+function gridCellRect(cell, i) {
+  const rc = curRect(cell), gd = cell.grid;
+  const iw = (rc.w - gd.gpad * 2) / gd.ncol;
+  const ih = (rc.h - gd.gpad * 2 - gd.hh) / gd.nrow;
+  const col = i % gd.ncol, row = (i / gd.ncol) | 0;
+  return { x: rc.x + gd.gpad + col * iw, y: rc.y + gd.gpad + gd.hh + row * ih,
+           w: iw, h: ih };
+}
+
 // current anchor for a resolved ref (cell + instance)
 function refAnchor(model, ref) {
   const hit = model.cellFor(ref);
@@ -468,9 +482,8 @@ function refAnchor(model, ref) {
   const rc = curRect(c);
   if (!rc) return null;
   if (c.kind === "group" && !c.collapsed && c.grid && hit.inst != null) {
-    const gd = c.grid, i = hit.inst;
-    const col = i % gd.ncol, row = (i / gd.ncol) | 0;
-    return { x: gd.x + gd.gpad + col*gd.iw + gd.iw/2, y: gd.y + gd.gpad + gd.hh + row*gd.ih + gd.ih/2, cell: c };
+    const gr = gridCellRect(c, hit.inst);
+    return { x: gr.x + gr.w / 2, y: gr.y + gr.h / 2, cell: c };
   }
   return { x: rc.x + rc.w/2, y: rc.y + rc.h/2, cell: c };
 }
@@ -508,6 +521,10 @@ function resize() {
   VW = wrap.clientWidth; VH = wrap.clientHeight;
   cv.width = Math.round(VW * DPR); cv.height = Math.round(VH * DPR);
   cv.style.width = VW + "px"; cv.style.height = VH + "px";
+  // draw in CSS px (the space layout + hit-testing use) into the DPR-scaled
+  // backing store, so the scene fills the canvas crisply and pointer picks
+  // land on what is drawn. setTransform is absolute, so this is idempotent.
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   relayout();
 }
 
@@ -597,8 +614,8 @@ function drawEdges(model, scan) {
 function activityOf(scan, cell) {
   // sum active over the backing resources of a cell
   let a = 0, p = 0;
-  for (const name in scan.active) if (nameCellId(name) === cell.id) a += scan.active[name];
-  for (const name in scan.pending) if (nameCellId(name) === cell.id) p += scan.pending[name];
+  for (const name in scan.active) if (cellMatches(name, cell)) a += scan.active[name];
+  for (const name in scan.pending) if (cellMatches(name, cell)) p += scan.pending[name];
   return { a, p };
 }
 // cache resource-name -> cell.id
@@ -608,6 +625,16 @@ function nameCellId(name) {
   const ref = MODEL.lvl.resource_map[name];
   const hit = ref ? MODEL.cellFor(ref) : null;
   return _nameCell[name] = hit ? hit.cell.id : null;
+}
+// does resource `name` belong to `cell`? -- group/leaf/composite match by cell
+// id; an instance cell matches only its own (group, instance) resource.
+function cellMatches(name, cell) {
+  if (cell.kind === "instance") {
+    const ref = MODEL.lvl.resource_map[name]; if (!ref) return false;
+    const hit = MODEL.cellFor(ref);
+    return !!hit && hit.cell.id === cell.group.id && hit.inst === cell.inst;
+  }
+  return nameCellId(name) === cell.id;
 }
 
 function drawCells(model, scan, cells, depth) {
@@ -651,7 +678,7 @@ function drawComposite(c, rc, color, scan) {
 function heatTint(cell, scan) {
   if (!showHeat) return 0;
   let busy = 0;
-  for (const name in scan.busy) if (nameCellId(name) === cell.id) busy = Math.max(busy, scan.busy[name]);
+  for (const name in scan.busy) if (cellMatches(name, cell)) busy = Math.max(busy, scan.busy[name]);
   return clamp(busy / (CLOCK.t || 1e-9), 0, 1);
 }
 
@@ -689,12 +716,9 @@ function drawExpandedGroup(c, rc, color, scan) {
   }
   const cap = capacityOf(c) / Math.max(1, c.insts.length);
   for (let i = 0; i < c.insts.length; i++) {
-    const col = i % gd.ncol, row = (i / gd.ncol) | 0;
-    const x = gd.x + gd.gpad + col*gd.iw, y = gd.y + gd.gpad + gd.hh + row*gd.ih;
-    const w = gd.iw - 3, h = gd.ih - 3;
+    const gr = gridCellRect(c, i);  // same geometry hit-testing uses
     const act = clamp((perInst[i] || 0) / Math.max(cap, 1), 0, 1);
-    const cell = { x, y, w, h };
-    glowNode(cell, color, act, null, 0, 4);
+    glowNode({ x: gr.x, y: gr.y, w: gr.w - 3, h: gr.h - 3 }, color, act, null, 0, 4);
   }
 }
 
@@ -886,26 +910,30 @@ function rebuildModel() {
   _nameCell = {};
   relayout(true);
 }
-function relayout(snap=false) {
-  if (!MODEL || !VW) return;
-  layout(MODEL, VW, VH);
-  for (const c of MODEL.allCells) {
+// snapshot layout targets (and, on snap or first layout, the current rects)
+function commitLayout(model, snap) {
+  for (const c of model.allCells) {
     if (!c.rect) continue;
     if (snap || !c.cur) c.cur = { ...c.rect };
     c.tgt = { ...c.rect };
   }
+}
+function relayout(snap=false) {
+  if (!MODEL || !VW) return;
+  layout(MODEL, VW, VH);
+  commitLayout(MODEL, snap);
   _nameCell = {};
 }
 
-// smooth cell transitions
-function animateCells(dt) {
-  if (!MODEL) return;
+// smooth cell transitions; instance grids follow because gridCellRect() reads
+// the animated `cur` rect -- no separate grid coordinates to keep in sync.
+function animateCells(dt, model = MODEL) {
+  if (!model) return;
   const k = 1 - Math.pow(0.001, dt); // time-based ease toward target
-  for (const c of MODEL.allCells) {
+  for (const c of model.allCells) {
     if (!c.cur || !c.tgt) continue;
     c.cur.x = lerp(c.cur.x, c.tgt.x, k); c.cur.y = lerp(c.cur.y, c.tgt.y, k);
     c.cur.w = lerp(c.cur.w, c.tgt.w, k); c.cur.h = lerp(c.cur.h, c.tgt.h, k);
-    if (c.grid) { c.grid.x = c.cur.x; c.grid.y = c.cur.y; }
   }
 }
 
@@ -1019,15 +1047,46 @@ function updatePlayhead() {
 }
 
 // hit-testing + hover/click
+const pointIn = (x, y, rc) => x >= rc.x && x <= rc.x + rc.w && y >= rc.y && y <= rc.y + rc.h;
+
+// a stable, lightweight cell for one instance of an expanded group (cached per
+// group so pins/identity survive across frames and relayouts).
+function instanceCell(group, i) {
+  const cache = group._inst || (group._inst = {});
+  if (!cache[i]) {
+    const it = group.insts[i];
+    cache[i] = { id: `${group.id}#i${i}`, kind: "instance", base: group.base,
+                 name: it.name, gnode: it.gnode, group, inst: i };
+  }
+  return cache[i];
+}
+function findCellById(id) {
+  if (!MODEL) return null;
+  for (const c of MODEL.allCells) {
+    if (c.id === id) return c;
+    if (c._inst) for (const k in c._inst) if (c._inst[k].id === id) return c._inst[k];
+  }
+  return null;
+}
+
+// innermost-match hit test: descend into composites, and let an instance of an
+// expanded group win over the group box; later siblings win ties (z-order).
+// Uses exactly the geometry the renderer draws (curRect / gridCellRect).
 function pickCell(x, y) {
   if (!MODEL) return null;
   let found = null;
   (function rec(cells) {
     for (const c of cells) {
       const rc = curRect(c); if (!rc) continue;
-      const inside = x >= rc.x && x <= rc.x + rc.w && y >= rc.y && y <= rc.y + rc.h;
-      if (c.kind === "composite") { if (inside) found = c; if (!c.collapsed && c.children) rec(c.children); }
-      else if (inside) found = c;
+      const inside = pointIn(x, y, rc);
+      if (c.kind === "composite") {
+        if (inside) found = c;
+        if (!c.collapsed && c.children) rec(c.children);
+      } else if (c.kind === "group" && !c.collapsed && c.grid) {
+        if (inside) found = c;  // the group's header / padding
+        for (let i = 0; i < c.insts.length; i++)  // instances win (innermost)
+          if (pointIn(x, y, gridCellRect(c, i))) found = instanceCell(c, i);
+      } else if (inside) found = c;
     }
   })(MODEL.topCells);
   return found;
@@ -1036,12 +1095,12 @@ function cellStats(cell) {
   // aggregate live active/pending/busy over this cell's resources
   let a = 0, p = 0, busy = 0; const labels = [];
   if (LAST_SCAN) {
-    for (const name in LAST_SCAN.active) if (nameCellId(name) === cell.id) a += LAST_SCAN.active[name];
-    for (const name in LAST_SCAN.pending) if (nameCellId(name) === cell.id) p += LAST_SCAN.pending[name];
-    for (const name in LAST_SCAN.busy) if (nameCellId(name) === cell.id) busy = Math.max(busy, LAST_SCAN.busy[name]);
+    for (const name in LAST_SCAN.active) if (cellMatches(name, cell)) a += LAST_SCAN.active[name];
+    for (const name in LAST_SCAN.pending) if (cellMatches(name, cell)) p += LAST_SCAN.pending[name];
+    for (const name in LAST_SCAN.busy) if (cellMatches(name, cell)) busy = Math.max(busy, LAST_SCAN.busy[name]);
     const tr = currentTrack();
     if (tr) for (const r of tr.rows) {
-      if (r[1] <= CLOCK.t && CLOCK.t < r[2] && nameCellId(tr.res[r[0]]) === cell.id) {
+      if (r[1] <= CLOCK.t && CLOCK.t < r[2] && cellMatches(tr.res[r[0]], cell)) {
         if (labels.length < 6) labels.push({ label: tr.labels[r[4]], kind: r[3], s: r[1], e: r[2] });
       }
     }
@@ -1059,9 +1118,13 @@ function nodeInfoRows(g) {
   if (g.meta && g.meta.topology) rows.push(["topology", g.meta.topology]);
   return rows;
 }
+function cellTitle(cell) {
+  if (cell.kind === "group") return `${cell.base} ×${cell.insts.length}`;
+  return cell.name || cell.gnode.name;  // instance -> its own name (e.g. gddr6-bank[3])
+}
 function tipHTML(cell) {
   const g = cell.gnode, st = cellStats(cell);
-  const name = cell.kind === "group" ? `${cell.base} ×${cell.insts.length}` : g.name;
+  const name = cellTitle(cell);
   let h = `<h4>${name}</h4>`;
   h += `<div class="mono">` + nodeInfoRows(g).map(([k,v]) => `<span class="k">${k}</span> ${v}`).join("<br>") + `</div>`;
   h += `<div style="margin-top:6px" class="mono"><span class="k">active</span> ${st.a}  <span class="k">queued</span> ${st.p}  <span class="k">busy</span> ${(st.util*100).toFixed(0)}%</div>`;
@@ -1070,12 +1133,12 @@ function tipHTML(cell) {
 function refreshPanel() {
   const pinned = document.getElementById("panel").dataset.cell;
   if (!pinned || !MODEL) return;
-  const cell = MODEL.allCells.find(c => c.id === pinned);
+  const cell = findCellById(pinned);
   if (cell) fillPanel(cell);
 }
 function fillPanel(cell) {
   const g = cell.gnode, st = cellStats(cell);
-  const name = cell.kind === "group" ? `${cell.base} ×${cell.insts.length}` : g.name;
+  const name = cellTitle(cell);
   let h = `<h3>${name}</h3><div class="sub">${cell.kind}${g.role ? " · " + g.role : ""}</div>`;
   h += `<div class="kv">` + nodeInfoRows(g).map(([k,v]) => `<div class="k">${k}</div><div class="v">${v}</div>`).join("") + `</div>`;
   h += `<div class="k" style="font-size:11px;text-transform:uppercase;letter-spacing:.6px;margin-bottom:4px">live state</div>`;
@@ -1130,12 +1193,73 @@ function bindKeys() {
 }
 
 // =====================================================================
+// [self-check] geometry: pick(center(cell)) === cell, instances inside their
+// box, nothing drawn outside the frame -- swept over every level in three
+// states (default, expanded, and expanded mid-animation), so a regression in
+// the draw/hit-test geometry agreement surfaces on load in dev.
+// =====================================================================
+function geometrySelfCheck() {
+  const savedModel = MODEL, savedNameCell = _nameCell;
+  let fails = 0, checks = 0;
+  const eps = 1.5;
+  const within = (r, W, H) => r.x >= -eps && r.y >= -eps &&
+    r.x + r.w <= W + eps && r.y + r.h <= H + eps;
+  const contains = (o, r) => r.x >= o.x - eps && r.y >= o.y - eps &&
+    r.x + r.w <= o.x + o.w + eps && r.y + r.h <= o.y + o.h + eps;
+  const expect = (ok, msg) => { checks++; if (!ok) { fails++; console.assert(false, "[geometry] " + msg); } };
+
+  function sweepPicksAndBounds(m, W, H, tag) {
+    for (const c of m.allCells) {
+      const rc = curRect(c); if (!rc) continue;
+      expect(within(rc, W, H), `${tag}: cell ${c.id} outside [0,${W}]x[0,${H}]`);
+      if (c.kind === "leaf" || (c.kind === "group" && c.collapsed)) {
+        const p = pickCell(rc.x + rc.w / 2, rc.y + rc.h / 2);
+        expect(p === c, `${tag}: pick(center ${c.base}) -> ${p && (p.name || p.base || p.id)}`);
+      } else if (c.kind === "group" && !c.collapsed && c.grid) {
+        expect(pickCell(rc.x + rc.w / 2, rc.y + 3) === c,
+               `${tag}: pick(header ${c.base}) mispicked`);
+        for (let i = 0; i < c.insts.length; i++) {
+          const gr = gridCellRect(c, i);
+          expect(within(gr, W, H) && contains(rc, gr),
+                 `${tag}: instance ${c.base}[${i}] escapes box/frame`);
+          const p = pickCell(gr.x + gr.w / 2, gr.y + gr.h / 2);
+          expect(p && p.kind === "instance" && p.group === c && p.inst === i,
+                 `${tag}: pick(center ${c.base}[${i}]) -> ${p && (p.name || p.base || p.id)}`);
+        }
+      }
+    }
+  }
+
+  for (const lvl of DOC.levels) {
+    for (const [W, H] of [[1280, 720], [820, 520]]) {  // initial + a resize
+      const m = buildLevel(lvl); MODEL = m; _nameCell = {};
+      layout(m, W, H); commitLayout(m, true);
+      sweepPicksAndBounds(m, W, H, `${lvl.id} ${W}x${H} default`);
+      // expand every group (covers gddr6-bank) -> mid-animation, then converged
+      for (const c of m.allCells) if (c.kind === "group") c.collapsed = false;
+      layout(m, W, H); commitLayout(m, false);        // cur = old, tgt = new
+      animateCells(0.05, m); animateCells(0.05, m);    // partway through
+      for (const c of m.allCells) if (c.kind === "group" && !c.collapsed && c.grid)
+        for (let i = 0; i < c.insts.length; i++)
+          expect(contains(curRect(c), gridCellRect(c, i)),
+                 `${lvl.id} ${W}x${H}: ${c.base}[${i}] escapes its box mid-animation`);
+      for (const c of m.allCells) if (c.cur && c.tgt) c.cur = { ...c.tgt };  // converge
+      sweepPicksAndBounds(m, W, H, `${lvl.id} ${W}x${H} expanded`);
+    }
+  }
+  MODEL = savedModel; _nameCell = savedNameCell;
+  if (fails) console.warn(`[inferencesim] geometry self-check: ${fails}/${checks} FAILED`);
+  else console.info(`[inferencesim] geometry self-check ok — ${checks} pick/bounds assertions across all levels & states`);
+}
+
+// =====================================================================
 // boot
 // =====================================================================
 buildBar();
 resize();
 rebuildModel();
 onTrackChange();
+geometrySelfCheck();
 bindPointer();
 bindKeys();
 window.addEventListener("resize", () => { resize(); drawActivityStrip(); });
