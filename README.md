@@ -96,7 +96,8 @@ chips or per-core:
 
 ```
 inferencesim graph --hardware tt-quietbox        # GDDR6 -> NoC -> SRAM -> compute (lumped)
-inferencesim graph --hardware tt-quietbox-fine   # 8 GDDR6 banks, 140 Tensix cores
+inferencesim graph --hardware tt-quietbox-fine   # 8 GDDR6 banks, 140 Tensix cores, one lumped NoC
+inferencesim graph --hardware tt-quietbox-mesh   # ...NoC as a 12x17 grid of per-router links
 inferencesim graph --hardware dgx-h100-fine      # 5 HBM stacks, L2 crossbar, 132 SMs
 inferencesim graph --hardware tt-quietbox --json > machine.json   # edit it...
 inferencesim run --graph machine.json --model llama-3.1-8b        # ...and simulate it
@@ -225,6 +226,17 @@ and `--trace` gain the chip resources (`chip:gddr6-bank[3]`, per-op
 `op:ffn/…` tracks). Collectives are expanded per-step over the fabric
 topology in both modes (see above); modelling an op too serial to fill the
 chip (few-head attention) needs op structure `ops.py` doesn't carry yet.
+
+The NoC itself can be modelled at two levels. `tt-quietbox-fine` lumps it
+into one 3.2 TB/s processor-shared switch; `tt-quietbox-mesh` unfolds it into
+the real **12×17 grid of NoC routers** (`presets_fine.blackhole_p150_mesh`),
+each Tensix and GDDR6 controller attached to its own router. A tile then
+streams DRAM → edge router → **per-hop store-and-forward along a deterministic
+XY (column-then-row) path**, matching Blackhole's NOC0, → local router → L1 →
+matrix engine, so *per-link* contention (a hot column link) and per-router
+pressure become emergent — not just per-bank. The mesh aggregates to the exact
+same lumped chip (the 8 banks are the 512 GB/s DRAM min-cut, the mesh is
+non-binding), so the roofline is unchanged; only the graph-DES sees the grid.
 
 ### Serving simulation
 

@@ -286,7 +286,7 @@ def test_profile_for_auto_maps_vendor():
     """'auto' routes tt-* keys (and the explicit fine-preset set) to typical-tt,
     everything else to typical-nv."""
     for tt_key in ("tt-quietbox-2", "tt-quietbox", "tt-quietbox-fine",
-                   "blackhole-p150-fine"):
+                   "tt-quietbox-mesh", "blackhole-p150-fine", "blackhole-p150-mesh"):
         assert profile_for(tt_key) is PROFILES["typical-tt"], tt_key
         assert vendor_profile_name(tt_key) == "typical-tt", tt_key
     for nv_key in ("h100", "dgx-h100", "gb300-nvl72", "dgx-spark", "dgx-h100-fine"):

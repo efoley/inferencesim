@@ -171,17 +171,69 @@ class ChipModel:
         )
         self.n_buffers = max(1, floor(1.0 / tile_fill))
 
+        # 2D-mesh NoC routing: if the graph declares a mesh (meta["mesh"] =
+        # {"rows", "cols", "router"}), route bank->core with deterministic XY
+        # (dimension-ordered) paths that match Blackhole's NOC0 (East-then-South
+        # == column-then-row) instead of an emergent BFS shortest path.  The
+        # router group's instance index encodes its grid position (i -> (i//C,
+        # i%C)), so coordinates survive expand()/JSON without per-instance meta.
+        self._router_at: dict[tuple[int, int], str] = {}
+        self._router_of: dict[str, str] = {}
+        self._mesh_cols = 0
+        mesh = g.meta.get("mesh")
+        if mesh:
+            router_base = str(mesh["router"])
+            cols = int(mesh["cols"])
+            self._mesh_cols = cols
+            for n in g.nodes:
+                if split_endpoint(n.name)[0] == router_base and "[" in n.name:
+                    i = int(n.name[n.name.index("[") + 1:-1])
+                    self._router_at[(i // cols, i % cols)] = n.name
+            # each bank / L1 attaches to exactly one router
+            for host in list(self.dram_instances) + list(self.core_to_sram.values()):
+                for nb, _e in self._adj[host]:
+                    if split_endpoint(nb)[0] == router_base and "[" in nb:
+                        self._router_of[host] = nb
+                        break
+
         self._chain_cache: dict[tuple[str, str], list[_Element]] = {}
 
     # ---- transfer path -------------------------------------------------------
 
-    def _chain(self, bank: str, core: str) -> list[_Element]:
-        """Ordered bandwidth-constrained elements a tile crosses from `bank`
-        to `core`, excluding the terminal compute node.  BFS shortest path
-        over the undirected expanded graph; memoised per (bank, core)."""
-        cached = self._chain_cache.get((bank, core))
-        if cached is not None:
-            return cached
+    def _router_pos(self, router: str) -> tuple[int, int]:
+        i = int(router[router.index("[") + 1:-1])
+        return (i // self._mesh_cols, i % self._mesh_cols)
+
+    def _xy_routers(self, entry: str, exit_: str) -> list[str]:
+        """The router names on the XY (column-first, then row) path from `entry`
+        to `exit_`, inclusive.  Matches Blackhole NOC0: move along the column
+        axis to the destination column, then along the row axis -- a single
+        turn, so it is A minimal path using only existing neighbour links."""
+        (r0, c0), (r1, c1) = self._router_pos(entry), self._router_pos(exit_)
+        routers = [entry]
+        c = c0
+        while c != c1:  # X first (change column)
+            c += 1 if c1 > c else -1
+            routers.append(self._router_at[(r0, c)])
+        r = r0
+        while r != r1:  # then Y (change row)
+            r += 1 if r1 > r else -1
+            routers.append(self._router_at[(r, c1)])
+        return routers
+
+    def _path_nodes(self, bank: str, core: str) -> list[str]:
+        """Ordered node names a tile crosses from `bank` to `core` inclusive.
+
+        On a declared mesh this is bank -> entry router -> XY router hops ->
+        exit router -> L1 -> core; elsewhere it is a BFS shortest path over the
+        undirected expanded graph (unchanged for the lumped-NoC fine presets)."""
+        if (self._router_at and bank in self._router_of
+                and core in self.core_to_sram
+                and self.core_to_sram[core] in self._router_of):
+            sram = self.core_to_sram[core]
+            routers = self._xy_routers(self._router_of[bank], self._router_of[sram])
+            return [bank, *routers, sram, core]
+        # BFS shortest path (deterministic in adjacency order)
         parent: dict[str, tuple[str, Edge]] = {}
         seen = {bank}
         q = deque([bank])
@@ -197,15 +249,31 @@ class ChipModel:
         if core != bank and core not in parent:
             raise ValueError(f"{self.graph.name}: no path from {bank} to {core}")
         nodes = [core]
-        edges: list[Edge] = []
         cur = core
         while cur != bank:
-            p, e = parent[cur]
-            edges.append(e)
+            p, _e = parent[cur]
             nodes.append(p)
             cur = p
         nodes.reverse()
-        edges.reverse()
+        return nodes
+
+    def _edge_between(self, u: str, v: str) -> Edge:
+        for w, e in self._adj[u]:
+            if w == v:
+                return e
+        raise ValueError(f"{self.graph.name}: no edge between {u} and {v}")
+
+    def _chain(self, bank: str, core: str) -> list[_Element]:
+        """Ordered bandwidth-constrained elements a tile crosses from `bank`
+        to `core`, excluding the terminal compute node.  XY mesh routing when
+        the graph declares a mesh, else BFS shortest path; memoised per
+        (bank, core)."""
+        cached = self._chain_cache.get((bank, core))
+        if cached is not None:
+            return cached
+        nodes = self._path_nodes(bank, core)
+        edges = [self._edge_between(nodes[i], nodes[i + 1])
+                 for i in range(len(nodes) - 1)]
         elements: list[_Element] = []
         for i, name in enumerate(nodes[:-1]):  # skip the terminal compute core
             nd = self._node[name]

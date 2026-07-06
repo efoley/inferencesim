@@ -78,6 +78,35 @@ def test_selectors_wire_irregular_topologies():
         Graph(name="bad", nodes=g.nodes, edges=[Edge("sram[40]", "fpu[0]")]).validate()
 
 
+def test_intra_group_selector_edges_wire_a_mesh():
+    """A counted group joined to itself through two DISTINCT selectors (a 2D
+    mesh's neighbour links) validates, flattens and expands: INTERLEAVE offsets
+    the endpoints so no instance is ever wired to itself.  A bare group self-edge
+    (or byte-identical endpoints) is still rejected."""
+    R, C = 2, 3  # 6 routers
+    g = Graph(
+        name="mesh",
+        nodes=[Node("router", NodeKind.SWITCH, count=R * C, bandwidth=1e12)],
+        edges=[
+            # per-row horizontal links (no row wrap) + one strided vertical edge
+            Edge("router[0:2]", "router[1:3]", bandwidth=1e11),
+            Edge("router[3:5]", "router[4:6]", bandwidth=1e11),
+            Edge(f"router[0:{(R - 1) * C}]", f"router[{C}:{R * C}]", bandwidth=1e11),
+        ],
+    )
+    g.validate()             # intra-group selector edges are allowed
+    g.flatten().validate()   # ...and survive flattening
+    ex = g.expand()
+    ex.validate()            # concrete edges are between distinct instances
+    pairs = {(e.src, e.dst) for e in ex.edges}
+    assert ("router[0]", "router[1]") in pairs   # horizontal
+    assert ("router[0]", "router[3]") in pairs   # vertical (stride C=3)
+    assert not any(e.src == e.dst for e in ex.edges)
+    # a true self-loop (bare group) is still a mistake
+    with pytest.raises(ValueError, match="self-edge"):
+        Graph(name="bad", nodes=g.nodes, edges=[Edge("router", "router")]).validate()
+
+
 def test_max_flow_credits_parallel_routes():
     g = Graph(
         name="two-routes",

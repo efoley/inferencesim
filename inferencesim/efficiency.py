@@ -123,7 +123,7 @@ PROFILES: dict[str, Efficiency] = {
 # graph presets whose key is chip-derived (no "tt-" prefix) are listed explicitly.
 # ANY NEW Tenstorrent preset whose key does not start with "tt-" MUST be added to
 # `_TT_KEYS` (e.g. a future "blackhole-*"/"wormhole-*" graph preset).
-_TT_KEYS: frozenset[str] = frozenset({"blackhole-p150-fine"})
+_TT_KEYS: frozenset[str] = frozenset({"blackhole-p150-fine", "blackhole-p150-mesh"})
 
 
 def vendor_profile_name(hardware_key: str) -> str:

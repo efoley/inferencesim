@@ -271,6 +271,31 @@ dense-ish points are not encoded; the encoded DGX-H100 gpt-oss anchor is the
 MLPerf rack point. `qwen3-32b` best secondary: GPUStack 1× H100 vLLM BF16
 ShareGPT ~2,352.82; TRT-LLM FP8 2000/100 → 5,902.
 
+### 6.7 Blackhole NoC topology (for the per-router mesh preset)
+
+Facts backing `presets_fine.blackhole_p150_mesh` / `tt-quietbox-mesh` (the NoC
+modelled as its real router grid, not one lumped switch):
+
+| fact | value | tag | source |
+|---|---|---|---|
+| NoC grid | **12 rows × 17 columns** (204 tiles) | VERIFIED | [tt-npe Blackhole impl (DeepWiki)](https://deepwiki.com/tenstorrent/tt-npe/5.3-blackhole-implementation); [Blackhole arch guide](https://anuraagw.me/blog/blackhole-architecture) |
+| Tensix cores | **140** (interior positions; some cards firmware-cut to 120) | VERIFIED count | [docs.tenstorrent.com](https://docs.tenstorrent.com/aibs/blackhole/specifications.html); [Tom's Hardware](https://www.tomshardware.com/tech-industry/semiconductors/jim-kellers-tenstorrent-is-downgrading-blackhole-p150-cards-from-140-to-120-tensor-cores-via-firmware-update-will-ship-cards-with-120-tensor-cores-going-forward-company-claims-existing-users-should-expect-1-2-percent-performance-drop) |
+| GDDR6 controllers | **8**, in **columns 0 and 9** | VERIFIED cols | tt-npe (DRAM at cols 0/9); arch guide (col 0/9, ~7–8 controllers) |
+| NoCs | **two**: NOC0 East-then-South (**X-then-Y = column-first / row-first**), NOC1 North-then-West; both **tori** (wrap-around) | VERIFIED | tt-npe; arch guide (NOC0 reads, NOC1 writes) |
+| per-link BW | **~60.9 bytes/cycle** (~82 GB/s/dir at 1.35 GHz), per NoC | VERIFIED | tt-npe (vs Wormhole 30 B/cycle) |
+| GDDR6 | 32 GB, **512 GB/s** aggregate | VERIFIED | docs.tenstorrent.com |
+
+**Modelling choices (best-effort, flagged in the preset docstring):** (a) exact
+Tensix/bank *row* positions aren't public — the preset uses a documented
+convention (Tensix rows 1–10 × cols {1–7,10–16} = 140; banks at cols 0/9, rows
+{1,4,7,10}); (b) a plain **mesh, not the torus** (wrap links omitted → a
+future refinement); (c) **one NoC plane** carrying reads+writes (real HW splits
+NOC0/NOC1, so our model is *conservative* on read/write contention); (d)
+per-link bandwidth **derived from the published 3.2 TB/s aggregate** as the mesh
+min-bisection (12·B_link = 3.2 TB/s → **266.7 GB/s**), not the ~82 GB/s/wire
+spec, so aggregation reproduces the lumped chip *exactly*. The XY routing
+matches NOC0's dimension order; that is the one routing fact we lean on.
+
 ---
 
 ## 7. Caution list — do NOT encode as measurements
