@@ -192,6 +192,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         weight_dtype=DType(args.weight_dtype),
         kv_dtype=DType(args.kv_dtype),
         act_dtype=DType(args.act_dtype),
+        cp_prefill=args.cp_prefill,
         overlap_comm=args.overlap_comm,
     )
     cost = CostModel(
@@ -274,6 +275,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         weight_dtype=DType(args.weight_dtype),
         kv_dtype=DType(args.kv_dtype),
         act_dtype=DType(args.act_dtype),
+        cp_prefill=args.cp_prefill,
     )
     scen = Scenario(batch=args.max_batch, prompt_len=args.prompt, output_len=args.output)
     common = dict(
@@ -315,7 +317,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     efficiency = _efficiency_from_args(args, args.hardware or "")
     if args.disagg:
         shared = dict(weight_dtype=DType(args.weight_dtype),
-                      kv_dtype=DType(args.kv_dtype), act_dtype=DType(args.act_dtype))
+                      kv_dtype=DType(args.kv_dtype), act_dtype=DType(args.act_dtype),
+                      cp_prefill=args.cp_prefill)
         dcfg = DisaggConfig(
             prefill_deployment=Deployment(tp=args.prefill_tp, ep=args.prefill_ep,
                                           adp=args.prefill_adp, **shared),
@@ -379,6 +382,11 @@ def main(argv: list[str] | None = None) -> int:
                      help="attention-data-parallel groups (dense models only): "
                           "DP attention + TP FFN, TRT-LLM DEPn -- cuts per-chip "
                           "KV by adp, streams the FFN over the tp*adp array")
+    run.add_argument("--no-cp-prefill", dest="cp_prefill", action="store_false",
+                     help="disable context-parallel prefill: run the old single-"
+                          "group-per-request prefill (attention on one adp group) "
+                          "instead of splitting the prompt across the tp*adp array")
+    run.set_defaults(cp_prefill=True)
     run.add_argument("--moe-skew", type=float, default=None,
                      help="MoE expert-load imbalance (Zipf exponent over expert "
                           "popularity; 0 = uniform, larger = hotter experts). "
@@ -433,6 +441,9 @@ def main(argv: list[str] | None = None) -> int:
     srv.add_argument("--adp", type=int, default=1,
                      help="attention-data-parallel groups (dense models only): "
                           "DP attention + TP FFN, TRT-LLM DEPn")
+    srv.add_argument("--no-cp-prefill", dest="cp_prefill", action="store_false",
+                     help="disable context-parallel prefill (see `run --no-cp-prefill`)")
+    srv.set_defaults(cp_prefill=True)
     srv.add_argument("--moe-skew", type=float, default=None,
                      help="MoE expert-load imbalance (Zipf exponent; 0 = uniform). "
                           "Paces moe_routed by the hottest tp*ep member, so serve "

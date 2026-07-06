@@ -166,6 +166,10 @@ class CommContext:
     a2a: int  # FFN-array group size: tp*ep (MoE) or tp*adp (dense)
     a2a_link: Link | None  # MoE all-to-all / dense FFN halfring: spans the a2a array
     p2p_link: Link | None  # pipeline hop: crosses stage boundaries
+    # context-parallel prefill K/V ring width (= adp): the ring is over the adp
+    # dimension (cp-1 steps) but its members span the tp*adp array with stride
+    # tp, so it rides the a2a fabric (a2a_link / a2a_topology).  1 == no CP.
+    cp: int = 1
     # topology of each group's fabric (the discrete-event engine expands
     # collectives per-step over it; the roofline engine ignores it).
     tp_topology: Topology = Topology.ALL_TO_ALL
@@ -180,6 +184,7 @@ class CommContext:
             a2a=a2a_group,
             a2a_link=system.link_for_group(a2a_group),
             p2p_link=system.link_for_group(dep.replica_chips),
+            cp=dep.adp,
             tp_topology=system.topology_for_group(dep.tp),
             a2a_topology=system.topology_for_group(a2a_group),
         )
@@ -237,6 +242,24 @@ class RooflineEngine(Engine):
                     op.comm_bytes, comm.a2a, _scaled_link(comm.a2a_link, eff.collective)
                 )
                 if comm.a2a > 1
+                else 0.0
+            )
+            one += eff.op_overhead_s
+            return OpTiming(op, op.count * one, 0.0, 0.0, op.count * one)
+        if op.kind is OpKind.CP_RING:
+            # context-parallel prefill K/V ring over the cp = adp groups: cp-1
+            # ring steps circulating each group's K/V block, so the closed form
+            # is ring_gather_time with group = cp (NOT the tp*adp a2a group) and
+            # payload = the full-prompt per-chip K/V.  It rides the a2a fabric
+            # (its members span the tp*adp array).  Collective efficiency scales
+            # the bandwidth (occupancy) term, never the flight latency.
+            if comm.a2a_link is None:
+                raise ValueError(f"{op.name}: no link available for {op.kind.value}")
+            one = (
+                ring_gather_time(
+                    op.comm_bytes, comm.cp, _scaled_link(comm.a2a_link, eff.collective)
+                )
+                if comm.cp > 1
                 else 0.0
             )
             one += eff.op_overhead_s

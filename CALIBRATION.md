@@ -471,6 +471,14 @@ Refit when anchors change (`inferencesim calibrate --efficiency sol`, then fit p
       per-GPU figure against a pinned TRT-LLM commit, and model **EPLB
       redundant-expert load balancing** + **mixed ADP+TP MoE attention** (TRT-LLM
       does both; `tp=1, ep=n` does neither).
+- [x] **Context-parallel prefill** landed (`Deployment.cp_prefill`, default on):
+      the dense `adp` groups double as context-parallel position shards during
+      prefill (ring/striped attention, arXiv:2310.01889; DeepSeek-V3
+      context-parallel prefill), so a long prompt's attention parallelises across
+      the whole `tp*adp` array instead of running on one adp group — closing the
+      recorded DEP-PR prefill gap (PARALLELISM.md §ADP; `DES_todo.md` §4;
+      `tests/test_context_parallel.py`). Remaining: MoE context-parallel prefill
+      (would ride the `ep` groups) and a per-window ring for SWA.
 
 _All retrieval dates: 2026-07-05. **[VERIFY]** cells and any GB200→GB300 uplift
 are unconfirmed/interpolated and flagged in-anchor `notes`._

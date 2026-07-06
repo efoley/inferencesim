@@ -390,7 +390,18 @@ class Deployment:
             shard over the whole tp*adp array (better weight streaming), and the
             FFN allreduce is replaced by a sequence-gather before the FFN and a
             reduce-scatter after.  MoE attention-DP is what `ep` already
-            provides, so adp is dense-only (validated).
+            provides, so adp is dense-only (validated).  During PREFILL the same
+            adp groups double as context-parallel position shards (`cp_prefill`),
+            so a single long prompt's attention parallelises across the whole
+            tp*adp array rather than running on one adp group.
+
+    cp_prefill -- if True (default), the adp groups run context-parallel prefill:
+            the prompt's positions split into adp striped blocks (ring / striped
+            attention, arXiv:2310.01889; DeepSeek-V3 context-parallel prefill), so
+            prefill attention divides by tp*adp and a K/V ring circulates the
+            blocks.  If False, prefill runs the old single-group-per-request path
+            (attention on one adp group, no CP ring) -- the degenerate anchor for
+            comparison.  No effect for adp == 1 or MoE (CP is dense-only).
     """
 
     tp: int = 1
@@ -400,6 +411,11 @@ class Deployment:
     weight_dtype: DType = DType.FP8
     kv_dtype: DType = DType.BF16
     act_dtype: DType = DType.BF16
+    # If True (default), the adp groups run context-parallel prefill (split the
+    # prompt's positions across the tp*adp array, ring/striped attention).  False
+    # keeps the historical single-group prefill (the degenerate anchor).  Prefill
+    # only; no effect on decode, adp == 1, or MoE.
+    cp_prefill: bool = True
     # If True, assume collectives fully overlap with compute/memory work
     # (phase time = max of the two streams instead of their sum).  Real stacks
     # land somewhere between the two settings.

@@ -237,9 +237,28 @@ simulator for ONE replica (dp = arrival-rate / dp, per `simulate.py`).
       prefill replicas make chunking moot (chunking caps the interference stall
       that disaggregation removes outright). Modelling a chunked prefill *pool*
       (e.g. Sarathi within each prefill replica) is future work.
-- [ ] **Context-parallel prefill (disagg)**: a prefill replica runs one whole
-      prompt on one replica (tp/ep/adp only); sequence/context parallelism to
-      split a very long prompt across a prefill replica's chips is future work.
+- [x] **Context-parallel prefill**: `Deployment.cp_prefill` (default on) makes the
+      dense `adp` attention-DP groups double as context-parallel position shards
+      *during prefill* — the prompt's positions split into `adp` striped blocks
+      (ring/striped attention, arXiv:2310.01889; DeepSeek-V3 context-parallel
+      prefill), so prefill attention parallelises across the whole `tp*adp` array
+      (flops + DRAM per chip divide by `tp*adp` under striped balancing) instead
+      of running on one adp group at `1/tp` — closing the DEP-PR gap (a long
+      prefill that was worse than plain TP is now competitive/better). A
+      `cp_kv_ring` op (`OpKind.CP_RING`) circulates the K/V blocks: `adp-1` ring
+      steps over the `adp` dimension, closed form `ring_gather_time(P, adp)` (half
+      a ring all-reduce over `adp`, `P` = the per-chip prompt K/V — the tiny
+      compressed latent for MLA), riding the `tp*adp` fabric; the DES expands it
+      via `half_ring` (steps = `adp-1`), so the pp=1 serial oracle equals roofline
+      exactly on RING and ALL_TO_ALL fabrics at any efficiency. The FFN side is
+      unchanged (CP leaves the sequence-sharded state the DEP gather expects).
+      Chunked prefill takes the same CP lowering per chunk (re-circulating the
+      growing context). `cp_prefill=False` restores the old single-group prefill
+      (the degenerate anchor). Prefill pools in `serve_disagg` inherit CP through
+      their `adp`. Tested in `tests/test_context_parallel.py`. **Remaining**: MoE
+      context-parallel prefill (would ride the `ep` groups), and a per-window
+      short-circuited ring for SWA (windowed layers currently circulate the full
+      prompt K/V, matching the dense prefill KV-read convention).
 - [ ] **Task-level pp>1 serving**: `serve()` restricts to pp=1 (at pp=1 an
       iteration is a serial chain, so its cost is a closed-form sum and needs
       no scheduler). pp>1 needs pipeline fill/drain across stages per
