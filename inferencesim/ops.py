@@ -32,7 +32,12 @@ Parallelism mapping (a replica = tp * pp * ep chips):
       full hidden state before the FFN and a reduce-scatter after it -- the
       DeepSeek-V3 "DP attention + TP FFN" pattern, and TRT-LLM's dense DEPn.
       Per-chip KV divides by adp (batch-sharded); the FFN streams 1/(tp*adp) of
-      the weights.  adp is dense-only (MoE attention-DP is exactly ep).
+      the weights.  adp is dense-only (MoE attention-DP is exactly ep).  During
+      PREFILL the adp groups double as context-parallel position shards
+      (cp_prefill): the prompt's positions split into adp striped blocks so
+      attention parallelises across the whole tp*adp array (ring/striped
+      attention), each layer paying a cp_kv_ring that circulates the K/V blocks
+      (_cp_width / _cp_attention_ring; CP_RING op).
 """
 
 from __future__ import annotations
@@ -54,10 +59,20 @@ class OpKind(str, Enum):
     # ring allreduce (g-1 steps vs 2(g-1)) -- since reduce-scatter is the
     # arithmetic dual of allgather with identical communication volume.
     HALFRING = "halfring"
+    # context-parallel prefill KV ring: the adp attention-DP groups double as
+    # context-parallel position shards during prefill, so a very long prompt's
+    # attention parallelises across the whole array instead of running on one
+    # adp group (ring/striped attention, arXiv:2310.01889; DeepSeek-V3's
+    # context-parallel prefill).  A causal ring pass over the cp = adp groups:
+    # adp-1 steps, each group forwarding its K/V block to the next.  Its closed
+    # form is exactly ring_gather_time (like HALFRING) but the ring is the adp
+    # dimension (adp-1 steps), not the tp*adp FFN array -- see engine.time_op.
+    CP_RING = "cp_ring"
     P2P = "p2p"  # activation hop between adjacent pipeline stages
 
 
-COMM_KINDS = {OpKind.ALLREDUCE, OpKind.ALLTOALL, OpKind.HALFRING, OpKind.P2P}
+COMM_KINDS = {OpKind.ALLREDUCE, OpKind.ALLTOALL, OpKind.HALFRING, OpKind.CP_RING,
+              OpKind.P2P}
 
 
 @dataclass(frozen=True)
@@ -167,7 +182,8 @@ def _linear(
 
 
 def _attention_ops(model: ModelSpec, n_seq: float, q_len: float, kv_len: float,
-                   causal_new: bool, dep: Deployment, count: int) -> list[Op]:
+                   causal_new: bool, dep: Deployment, count: int,
+                   cp: int = 1) -> list[Op]:
     """Self-attention over the KV cache, lowered to one or more Ops.
 
     * GQA (default): a single `attention` op (count = all layers).
@@ -177,27 +193,40 @@ def _attention_ops(model: ModelSpec, n_seq: float, q_len: float, kv_len: float,
       `attention_swa` op over the `n_swa_layers` windowed layers (which read and
       score only the last `swa_window` cached tokens).  Both keep category
       `attention`, so the DES/serve cost paths bucket and recost them together.
-    """
+
+    `cp` (context-parallel width, = adp during prefill CP; 1 otherwise) divides
+    the attention work: the prompt's positions split into `cp` striped blocks
+    over the adp groups, so the causal score triangle (S^2/2), its banded SWA
+    variant, and the MLA decompressed form all divide EVENLY by `cp` under
+    striped (zigzag) balancing -- and so does the K/V streamed per chip.  Each
+    attention op's flops and DRAM bytes therefore divide by `cp` (`cp=1` is the
+    identity, bit-for-bit).  The cross-group K/V exchange is a separate ring op
+    (`_cp_attention_ring`)."""
     if model.mla is not None:
-        return [_mla_attention(model, n_seq, q_len, kv_len, causal_new, dep, count)]
+        return [_mla_attention(model, n_seq, q_len, kv_len, causal_new, dep, count, cp)]
     swa = model.n_swa_layers
     if not swa:
-        return [_attention(model, n_seq, q_len, kv_len, causal_new, dep, count)]
+        return [_attention(model, n_seq, q_len, kv_len, causal_new, dep, count, cp=cp)]
     ops: list[Op] = []
     full = model.n_full_attn_layers
     if full:
-        ops.append(_attention(model, n_seq, q_len, kv_len, causal_new, dep, full))
-    ops.append(_swa_attention(model, n_seq, q_len, kv_len, causal_new, dep, swa))
+        ops.append(_attention(model, n_seq, q_len, kv_len, causal_new, dep, full, cp=cp))
+    ops.append(_swa_attention(model, n_seq, q_len, kv_len, causal_new, dep, swa, cp))
     return ops
 
 
 def _attention(model: ModelSpec, n_seq: float, q_len: float, kv_len: float,
                causal_new: bool, dep: Deployment, count: int,
-               name: str = "attention") -> Op:
+               name: str = "attention", cp: int = 1) -> Op:
     """Full-context GQA self-attention for n_seq sequences.
 
     q_len queries attend to kv_len cached tokens each; causal_new halves the
-    score work (prefill attends triangularly to its own tokens)."""
+    score work (prefill attends triangularly to its own tokens).  `cp` (>1 only
+    under context-parallel prefill) divides the whole op by the CP width: with
+    striped position sharding each of the `cp` adp groups does an equal 1/cp of
+    the causal score triangle and streams 1/cp of the prompt's K/V (the total
+    S^2/2 pairs and the once-streamed S-token K/V are conserved, just spread over
+    the groups) -- so flops, dram_read and dram_write all divide by cp."""
     kvh = _kv_heads_per_chip(model, dep.tp)
     heads = model.n_heads / dep.tp
     frac = 0.5 if causal_new else 1.0
@@ -208,15 +237,15 @@ def _attention(model: ModelSpec, n_seq: float, q_len: float, kv_len: float,
         category="attention",
         count=count,
         # QK^T and PV: 2 matmuls of [q_len, kv_len] x [kv_len, d_head] per head
-        flops=n_seq * heads * 2 * 2.0 * q_len * kv_len * frac * model.d_head,
+        flops=n_seq * heads * 2 * 2.0 * q_len * kv_len * frac * model.d_head / cp,
         # speed-of-light flash attention: stream K,V once; append new K,V
-        dram_read=n_seq * kv_len * 2 * kvh * model.d_head * dep.kv_dtype.bytes,
-        dram_write=n_seq * q_len * 2 * kvh * model.d_head * dep.kv_dtype.bytes,
+        dram_read=n_seq * kv_len * 2 * kvh * model.d_head * dep.kv_dtype.bytes / cp,
+        dram_write=n_seq * q_len * 2 * kvh * model.d_head * dep.kv_dtype.bytes / cp,
     )
 
 
 def _swa_attention(model: ModelSpec, n_seq: float, q_len: float, kv_len: float,
-                   causal_new: bool, dep: Deployment, count: int) -> Op:
+                   causal_new: bool, dep: Deployment, count: int, cp: int = 1) -> Op:
     """Sliding-window GQA self-attention over the windowed layers.
 
     Decode / chunk (causal_new=False): each query attends only to the last
@@ -229,7 +258,15 @@ def _swa_attention(model: ModelSpec, n_seq: float, q_len: float, kv_len: float,
     triangle S^2/2 when S <= W and S*W - W^2/2 when S >= W (dropping the +S/2
     diagonal, consistent with the dense op's frac=0.5).  Each K,V is still
     streamed once (every cached token lies in some query's band), so the DRAM
-    read matches the dense prefill -- the prefill win is in FLOPs, not bytes."""
+    read matches the dense prefill -- the prefill win is in FLOPs, not bytes.
+
+    `cp` (context-parallel prefill width) divides the op by cp.  The band is
+    translation-invariant (~W score pairs per position past the ramp), so
+    striped (zigzag) position sharding hands each of the cp groups S/cp
+    positions with a balanced band membership -- the banded total
+    0.5*(S^2-max(0,S-W)^2) divides EVENLY by cp, as does the once-streamed
+    S-token K/V (every cached token lies in some query's band, so all S
+    circulate on the ring regardless of the window)."""
     W = model.swa_window
     kvh = _kv_heads_per_chip(model, dep.tp)
     heads = model.n_heads / dep.tp
@@ -247,14 +284,14 @@ def _swa_attention(model: ModelSpec, n_seq: float, q_len: float, kv_len: float,
         dtype=dep.act_dtype,
         category="attention",
         count=count,
-        flops=n_seq * heads * 2 * 2.0 * score_pairs * model.d_head,
-        dram_read=n_seq * kv_tokens * 2 * kvh * model.d_head * dep.kv_dtype.bytes,
-        dram_write=n_seq * q_len * 2 * kvh * model.d_head * dep.kv_dtype.bytes,
+        flops=n_seq * heads * 2 * 2.0 * score_pairs * model.d_head / cp,
+        dram_read=n_seq * kv_tokens * 2 * kvh * model.d_head * dep.kv_dtype.bytes / cp,
+        dram_write=n_seq * q_len * 2 * kvh * model.d_head * dep.kv_dtype.bytes / cp,
     )
 
 
 def _mla_attention(model: ModelSpec, n_seq: float, q_len: float, kv_len: float,
-                   causal_new: bool, dep: Deployment, count: int) -> Op:
+                   causal_new: bool, dep: Deployment, count: int, cp: int = 1) -> Op:
     """Multi-head latent attention (DeepSeek-V2/V3).
 
     The KV cache is the shared compressed latent (kv_lora_rank + qk_rope_head_dim
@@ -271,7 +308,12 @@ def _mla_attention(model: ModelSpec, n_seq: float, q_len: float, kv_len: float,
     huge for long q, so real stacks decompress during prefill): per (query,key)
     pair per head, QK^T over qk_head_dim + PV over v_head_dim.  Simplifications:
     the small Q/KV down/up projections are folded into qkv_proj (a GEMM), and the
-    RoPE application is free at speed-of-light."""
+    RoPE application is free at speed-of-light.
+
+    `cp` (context-parallel prefill width) divides the op by cp: the decompressed
+    prefill score triangle splits evenly over the cp striped groups, and each
+    streams 1/cp of the compressed latent -- and the CP ring circulates only that
+    tiny latent (`_cp_ring_payload`), the MLA context-parallel win."""
     m = model.mla
     assert m is not None
     heads = model.n_heads / dep.tp
@@ -287,10 +329,66 @@ def _mla_attention(model: ModelSpec, n_seq: float, q_len: float, kv_len: float,
         dtype=dep.act_dtype,
         category="attention",
         count=count,
-        flops=n_seq * heads * 2.0 * q_len * kv_len * frac * per_pos,
-        dram_read=n_seq * kv_len * latent * dep.kv_dtype.bytes,
-        dram_write=n_seq * q_len * latent * dep.kv_dtype.bytes,
+        flops=n_seq * heads * 2.0 * q_len * kv_len * frac * per_pos / cp,
+        dram_read=n_seq * kv_len * latent * dep.kv_dtype.bytes / cp,
+        dram_write=n_seq * q_len * latent * dep.kv_dtype.bytes / cp,
     )
+
+
+def _cp_width(model: ModelSpec, dep: Deployment) -> int:
+    """Context-parallel width for prefill: the `adp` attention-DP groups double
+    as context-parallel position shards during prefill, so a single request's
+    prompt splits across the whole tp*adp array instead of running its attention
+    on one adp group (the recorded DEP-PR gap: batch-sharding can't split one
+    sequence).  Identity with `adp` -- no new axis -- matching DeepSeek's
+    DP-attention groups doing context-parallel prefill.  1 (no CP) for MoE
+    (attention-DP there is `ep`, and CP is dense-only), for adp == 1, or when
+    `cp_prefill` is disabled (the degenerate single-group-prefill anchor)."""
+    if model.moe is None and dep.cp_prefill and dep.adp > 1:
+        return dep.adp
+    return 1
+
+
+def _cp_ring_payload(model: ModelSpec, n_kv_tokens: float, dep: Deployment) -> float:
+    """Per-chip bytes the CP ring circulates: the `n_kv_tokens` context's K/V in
+    whatever form the model caches.  GQA/SWA send this chip's KV-head shard
+    (2*kvh*d_head per token); MLA sends only the shared compressed latent
+    (`latent_dim` per token) -- 1-2 orders of magnitude smaller, so the MLA
+    context-parallel ring is cheap (DeepSeek-V3 context-parallel prefill)."""
+    if model.mla is not None:
+        return n_kv_tokens * model.mla.latent_dim * dep.kv_dtype.bytes
+    kvh = _kv_heads_per_chip(model, dep.tp)
+    return n_kv_tokens * 2 * kvh * model.d_head * dep.kv_dtype.bytes
+
+
+def _cp_attention_ring(model: ModelSpec, n_kv_tokens: float, dep: Deployment,
+                       count: int, cp: int) -> list[Op]:
+    """The causal ring pass that circulates K/V blocks across the `cp` (= adp)
+    context-parallel groups during prefill (ring / striped attention,
+    arXiv:2310.01889; DeepSeek-V3 context-parallel prefill).
+
+    Each group holds an S/cp-token block's K, V.  A causal ring attention runs
+    cp-1 steps: in step t every group forwards its K/V block one hop round the
+    ring (to group i+1) so that, over the whole pass, each group's queries see
+    the K/V blocks they must attend to.  Per step every chip egresses one block
+    = (n_kv_tokens/cp) tokens' K/V; over cp-1 steps that is (cp-1)/cp of the full
+    per-chip K/V payload P = `_cp_ring_payload(n_kv_tokens)` (all cp blocks).  So
+    the makespan is
+
+        (cp-1)/cp * P/bw + (cp-1)*lat  ==  ring_gather_time(P, cp, link),
+
+    i.e. the HALFRING/allgather closed form (`engine.ring_gather_time`) but with
+    the ring over the `cp` = adp dimension (cp-1 steps), not the tp*adp FFN
+    array -- exactly the standard ring-attention K/V rotation.  Load imbalance
+    (group 0 attends 1 block-pair, group cp-1 attends cp) is removed by the
+    striped (zigzag) layout the attention op assumes, so every group does an
+    equal 1/cp of the work and the ring is paced uniformly.  `comm_bytes` carries
+    P; the engine applies the (cp-1)/cp and (cp-1) factors with group = cp."""
+    if cp <= 1:
+        return []
+    payload = _cp_ring_payload(model, n_kv_tokens, dep)
+    return [Op(name="cp_kv_ring", kind=OpKind.CP_RING, dtype=dep.kv_dtype,
+               category="comm", count=count, comm_bytes=payload)]
 
 
 def _ffn_gather_scatter(model: ModelSpec, tokens_total: float,
@@ -521,24 +619,40 @@ def decode_step_ops(model: ModelSpec, scen: Scenario, dep: Deployment) -> list[O
 
 def prefill_ops(model: ModelSpec, n_prompt_tokens: int, dep: Deployment) -> list[Op]:
     """Prefill of one request with n_prompt_tokens (TTFT is measured on a
-    single request; it occupies one attention group and traverses the pp
-    stages sequentially, so the whole-model op list is its critical path)."""
+    single request; it traverses the pp stages sequentially, so the whole-model
+    op list is its critical path).
+
+    Context parallelism (`_cp_width` > 1): the prompt's S positions split into
+    cp = adp striped blocks of S/cp, one per adp group, so attention parallelises
+    across the whole tp*adp array (ring / striped attention).  The per-group ops
+    -- qkv/out projections, the attention allreduce, the pipeline hop, embed --
+    then run on S/cp positions each (token-parallel across the groups, natural
+    sharding); the attention op divides by cp (striped work); a `cp_kv_ring`
+    circulates the K/V blocks; and the FFN keeps `tokens_total = S` (its weights
+    are TP over the whole tp*adp array, so it re-assembles the full sequence with
+    the existing gather + reduce-scatter -- CP leaves the prompt exactly the
+    sequence-sharded S/cp-per-group state that DEP gather already expects, so
+    that path is unchanged).  cp == 1 (adp == 1, MoE, or cp_prefill off) is the
+    historical single-group prefill, bit-for-bit."""
     validate_deployment(model, dep)
     S = n_prompt_tokens
     L = model.n_layers
+    cp = _cp_width(model, dep)
+    S_grp = S if cp == 1 else S / cp  # positions per CP group (S when no CP)
 
     ops: list[Op] = [
-        _linear("qkv_proj", S, model.attn_qkv_params, model.d_model,
+        _linear("qkv_proj", S_grp, model.attn_qkv_params, model.d_model,
                 model.qkv_proj_out_dim, dep, count=L),
         *_attention_ops(model, n_seq=1, q_len=S, kv_len=S, causal_new=True,
-                        dep=dep, count=L),
-        _linear("out_proj", S, model.attn_out_params,
+                        dep=dep, count=L, cp=cp),
+        *_cp_attention_ring(model, S, dep, count=L, cp=cp),
+        _linear("out_proj", S_grp, model.attn_out_params,
                 model.out_proj_in_dim, model.d_model, dep, count=L),
-        *_ffn_ops(model, tokens_per_group=S, tokens_total=S, dep=dep, count=L),
-        _allreduce(S, model, dep, count=_allreduces_per_layer(model, dep) * L),
-        *_pipeline_hops(S, model, dep, count=dep.pp - 1),
+        *_ffn_ops(model, tokens_per_group=S_grp, tokens_total=S, dep=dep, count=L),
+        _allreduce(S_grp, model, dep, count=_allreduces_per_layer(model, dep) * L),
+        *_pipeline_hops(S_grp, model, dep, count=dep.pp - 1),
         # only the last position needs logits during prefill
-        *_embed_and_head(model, tokens_in=S, tokens_out=1, dep=dep, count=1),
+        *_embed_and_head(model, tokens_in=S_grp, tokens_out=1, dep=dep, count=1),
     ]
     return ops
 
@@ -558,21 +672,33 @@ def prefill_chunk_ops(model: ModelSpec, dep: Deployment, chunk: int,
     attention op re-reads the whole prior KV every chunk (dram_read grows with
     prior_context), and the per-layer weights are re-streamed once per chunk
     (each chunk is its own op list).  Only the final chunk runs the LM head
-    (it emits the request's first token)."""
+    (it emits the request's first token).
+
+    Context parallelism (cp = adp under cp_prefill): a chunk is itself a mini
+    exclusive prefill, so it takes the same CP lowering -- its `chunk` query
+    positions split into cp striped blocks, the chunk attention divides by cp,
+    and a `cp_kv_ring` re-circulates the growing kv_len = prior+chunk context
+    (re-circulated every chunk, mirroring how the chunk re-reads the prior KV
+    every chunk -- the honest analogue that keeps chunk cost above an exclusive
+    prefill).  The FFN keeps `tokens_total = chunk` (re-assembled over tp*adp).
+    cp == 1 is the historical single-group chunk, bit-for-bit."""
     validate_deployment(model, dep)
     L = model.n_layers
     kv_len = prior_context + chunk
-    edge = _embed_and_head(model, tokens_in=chunk, tokens_out=1, dep=dep, count=1)
+    cp = _cp_width(model, dep)
+    chunk_grp = chunk if cp == 1 else chunk / cp  # chunk positions per CP group
+    edge = _embed_and_head(model, tokens_in=chunk_grp, tokens_out=1, dep=dep, count=1)
     ops: list[Op] = [
-        _linear("qkv_proj", chunk, model.attn_qkv_params, model.d_model,
+        _linear("qkv_proj", chunk_grp, model.attn_qkv_params, model.d_model,
                 model.qkv_proj_out_dim, dep, count=L),
         *_attention_ops(model, n_seq=1, q_len=chunk, kv_len=kv_len, causal_new=False,
-                        dep=dep, count=L),
-        _linear("out_proj", chunk, model.attn_out_params,
+                        dep=dep, count=L, cp=cp),
+        *_cp_attention_ring(model, kv_len, dep, count=L, cp=cp),
+        _linear("out_proj", chunk_grp, model.attn_out_params,
                 model.out_proj_in_dim, model.d_model, dep, count=L),
-        *_ffn_ops(model, tokens_per_group=chunk, tokens_total=chunk, dep=dep, count=L),
-        _allreduce(chunk, model, dep, count=_allreduces_per_layer(model, dep) * L),
-        *_pipeline_hops(chunk, model, dep, count=dep.pp - 1),
+        *_ffn_ops(model, tokens_per_group=chunk_grp, tokens_total=chunk, dep=dep, count=L),
+        _allreduce(chunk_grp, model, dep, count=_allreduces_per_layer(model, dep) * L),
+        *_pipeline_hops(chunk_grp, model, dep, count=dep.pp - 1),
         edge[0],  # embed the chunk's tokens
     ]
     if produce_logits:

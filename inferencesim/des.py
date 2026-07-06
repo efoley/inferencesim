@@ -79,6 +79,7 @@ class _LayerCosts:
     combine: float = 0.0
     gather: float = 0.0  # dense attention-DP FFN allgather (adp > 1)
     scatter: float = 0.0  # dense attention-DP FFN reduce-scatter (adp > 1)
+    cp_ring: float = 0.0  # context-parallel prefill K/V ring (adp > 1, prefill)
     hop: float = 0.0  # pipeline p2p
     edge: float = 0.0  # embed + lm_head on the edge stages
     n_layers: int = 1
@@ -109,6 +110,10 @@ class _CommPlan:
     a2a_bw: float = 0.0
     a2a_lat: float = 0.0
     a2a_topo: Topology = Topology.ALL_TO_ALL
+    # context-parallel prefill K/V ring: a ring pass over the cp = adp dimension
+    # (cp-1 steps), riding the a2a fabric (bw/lat/topo above).
+    cp_group: int = 1
+    cp_ring_bytes: float = 0.0
     # per-member routing-popularity vector over the tp*ep array (sum == 1) for a
     # skewed MoE dispatch/combine; None on the uniform path (skew=0) and for
     # non-MoE collectives, so those keep even per-member messages.
@@ -259,6 +264,8 @@ class DESEngine(Engine):
                 c.gather = one(op)
             elif op.name == "ffn_scatter":
                 c.scatter = one(op)
+            elif op.name == "cp_kv_ring":
+                c.cp_ring = one(op)
             elif op.name == "pp_hop":
                 c.hop = one(op)
             elif op.name in _EDGE_OPS:
@@ -310,6 +317,8 @@ class DESEngine(Engine):
             ffn_scatter_bytes=payload.get("ffn_scatter", 0.0),
             a2a_bw=a2a_bw, a2a_lat=a2a_lat, a2a_topo=comm.a2a_topology,
             a2a_weights=a2a_weights,
+            cp_group=comm.cp,
+            cp_ring_bytes=payload.get("cp_kv_ring", 0.0),
             hop_bytes=payload.get("pp_hop", 0.0),
             hop_bw=hop_bw, hop_lat=hop_lat,
         )
@@ -390,11 +399,25 @@ class DESEngine(Engine):
             if oh:
                 add(f"u{s}", oh, f"{tag} {name} oh")
 
+        def cp_ring() -> None:
+            # context-parallel prefill: circulate the K/V blocks over the cp = adp
+            # groups.  A ring pass (cp-1 steps) has the same expansion as the FFN
+            # half-ring, so `half_ring` (steps = group-1) reused with group = cp
+            # over the a2a fabric reproduces ring_gather_time(payload, cp) exactly.
+            nonlocal prev_key
+            prev_key = collectives.half_ring(
+                tasks, prev_key, plan.cp_group, plan.cp_ring_bytes, plan.a2a_bw,
+                plan.a2a_lat, plan.a2a_topo, prefix, f"{tag} cp_ring")
+            if oh:
+                add(f"u{s}", oh, f"{tag} cp_ring oh")
+
         prev_key = prev
         if is_first and c.edge:
             add(f"u{s}", 0.0, f"{tag} embed")  # embed cost folded
         for _ in range(n_layers_here):
             add(f"u{s}", c.attn, f"{tag} attn")
+            if c.cp_ring:  # context-parallel prefill K/V ring (prefill only)
+                cp_ring()
             if c.n_allreduce >= 2 and c.allreduce:
                 allreduce()
             if c.dispatch:

@@ -165,9 +165,15 @@ a composition/constraint map, and a decision guide. In brief:
   data-parallel across `adp` groups (weights replicated across them) so
   **per-chip KV divides by `adp` while attention weight bytes are unchanged**;
   the dense FFN shards over the whole `tp*adp` array, its allreduce replaced by
-  an allgather + reduce-scatter. Cuts KV past the `n_kv_heads` TP wall. At
-  `adp = 1` everything is bit-identical to plain TP; `adp` is rejected for MoE
-  (that is what `ep` provides).
+  an allgather + reduce-scatter. Cuts KV past the `n_kv_heads` TP wall. During
+  **prefill** the same `adp` groups run **context-parallel prefill**
+  (`cp_prefill`, default on): the prompt's positions split into `adp` striped
+  blocks (ring/striped attention — arXiv:2310.01889; DeepSeek-V3), so prefill
+  attention parallelises over the whole `tp*adp` array (paying an `adp`-group
+  `cp_kv_ring` per layer) instead of running on one group — a long prefill that
+  was *worse* than TP becomes competitive/better. At `adp = 1` everything is
+  bit-identical to plain TP; `adp` is rejected for MoE (that is what `ep`
+  provides).
 
 ### Engines
 
@@ -345,8 +351,10 @@ honestly costs a re-prefill *and* a re-transfer (reported as `n_preemptions`).
 **v1 simplifications**: **no transfer-link contention** between concurrent
 transfers (each pays its own `bytes/bw + lat`); **chunked prefill is N/A** with
 `--disagg` (exclusive prefill replicas make it moot — the combination is
-rejected); prefill is one whole prompt on one replica (no context-parallel
-prefill). See `DES_todo.md` §4.
+rejected). A prefill replica can now **context-parallelise** one prompt across
+its chips when its pool runs `--prefill-adp n` (CP rides the `adp` groups,
+default on); MoE context-parallel prefill remains future work. See
+`DES_todo.md` §4.
 
 ### Outputs
 
@@ -407,8 +415,11 @@ prefill). See `DES_todo.md` §4.
   `tp*ep` member and incasting the all-to-all onto its ingress port under the
   DES. **Prefill/decode disaggregation landed**: `serve --disagg`, a
   prefill pool + decode pool with KV streamed between them — DistServe/Dynamo;
-  see the Serving subsection. Remaining: transfer-link contention,
-  chunked+disagg, context-parallel prefill.)
+  see the Serving subsection. **Context-parallel prefill landed**: `--adp n`
+  splits a long prompt's positions across the `tp*adp` array during prefill
+  (ring/striped attention), closing the DEP-PR prefill gap (`--no-cp-prefill`
+  restores the old single-group prefill). Remaining: transfer-link contention,
+  chunked+disagg, MoE context-parallel prefill.)
 - Explicit attention-DP + expert-parallel (TRT-LLM `DEPn`) deployments —
   *landed*: dense attention-DP is `--adp n` (DP attention + TP FFN, KV cut by
   `adp`, FFN streamed over `tp*adp`); MoE `DEPn ≡ tp=1, ep=n` (validated, see

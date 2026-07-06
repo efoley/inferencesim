@@ -22,7 +22,7 @@ dense one.
 | **PP** pipeline | layers, into `pp` balanced stages | — (each stage owns distinct layers) | `pp` P2P hops per decode round | per-chip memory `~1/pp` → bigger batch, or fit at all | balance sensitivity; no weight-streaming speedup; `serve` unsupported | any link, incl. slow cross-node — only P2P hops |
 | **DP** data | nothing (whole replica copied) | the entire replica | none between replicas | linear throughput at fixed per-request latency | full model + KV per replica; no single-stream or fit help | none between replicas |
 | **EP** expert (MoE) | expert bank over `tp*ep`; batch + KV over `ep` | attention & shared-expert weights across `ep` groups | 1 attention all-reduce + dispatch/combine all-to-all | expert-weight sharding + KV batch-shard; full batch amortizes expert reads | 2 all-to-alls/layer (fabric-bound); EPLB unmodeled | high-bandwidth all-to-all; a ring pays multi-hop |
-| **ADP** attn-DP (dense) | FFN over `tp*adp`; batch + KV over `adp` | attention weights across `adp` groups | 1 attention all-reduce + allgather + reduce-scatter | per-chip KV `/adp` past the `n_kv_heads` TP wall; FFN streamed over `tp*adp` | gather/scatter/layer; dense-only; decode-only benefit | fast in-node all-to-all (like TP) |
+| **ADP** attn-DP (dense) | FFN over `tp*adp`; batch + KV over `adp`; **prefill: prompt positions over `adp` (CP)** | attention weights across `adp` groups | 1 attention all-reduce + allgather + reduce-scatter (+ a K/V ring in prefill) | per-chip KV `/adp` past the `n_kv_heads` TP wall; FFN streamed over `tp*adp`; **context-parallel prefill** (attention over the whole `tp*adp` array) | gather/scatter/layer; a K/V ring/layer in prefill; dense-only | fast in-node all-to-all (like TP) |
 
 The knobs compose multiplicatively (§3). Read the summary table as "at fixed
 hardware, which axis do I grow for this bottleneck" — §4 turns that into a
@@ -232,13 +232,51 @@ array, the FFN all-reduce is replaced by a **sequence allgather before the FFN**
 `tp`-group FFN all-reduce for a gather+scatter over the larger `tp*adp` group. At
 `adp=1` everything is bit-identical to plain TP.
 
-**Where it makes sense / where it doesn't.** ADP exists to cut per-chip KV once
-TP can't: TP's KV sharding caps at `n_kv_heads`, and MLA replicates the latent
-across TP, so past that wall batch-sharding is the only KV lever. It is a
-**decode** win — the KV division and the `tp*adp` FFN streaming both pay off in
-memory-bound decode; prefill is compute-bound and single-request, so ADP only
-adds gather/scatter comm there. ADP is **dense-only**: MoE attention-DP is exactly
-what `ep` provides, so `--adp` on a MoE model is rejected (`validate_deployment`).
+**Context-parallel prefill (`cp_prefill`, default on).** Batch-sharding cannot
+split *one* sequence, so a single request's prefill attention used to run on one
+`adp` group at `1/tp` — no attention-side benefit from `adp`, and prefill TTFT
+worse than plain TP at the same chip count (the recorded DEP-PR gap). Context
+parallelism (CP) fixes this: during prefill the `adp` groups double as
+**context-parallel position shards** — the prompt's `S` positions split into `adp`
+contiguous blocks of `S/adp`, one per group, each holding its block's Q/K/V. This
+is how DeepSeek's DP-attention groups serve long-context prefill (DeepSeek-V3
+report, [arXiv:2412.19437](https://arxiv.org/abs/2412.19437)) via the
+ring/striped-attention lineage
+([ring attention, arXiv:2310.01889](https://arxiv.org/abs/2310.01889);
+[striped attention, arXiv:2311.09431](https://arxiv.org/abs/2311.09431)). The
+identity `cp = adp` avoids a fourth axis. Two pieces:
+
+- **The causal ring pass.** Ring attention runs `adp-1` steps; in step `t` each
+  group forwards its K/V block one hop round the ring, so over the pass every
+  group's queries see the blocks they attend. Per chip that egresses `(adp-1)/adp`
+  of the full-prompt K/V, so the makespan is exactly `ring_gather_time(P, adp)`
+  with `P` = the per-chip prompt K/V (`2·kvh·d_head` per token for GQA/SWA; the
+  tiny compressed **latent** for MLA — the MLA ring is ~1-2 orders of magnitude
+  cheaper). It rides the `tp*adp` fabric but the ring is the `adp` dimension
+  (`adp-1` steps), *not* the `tp*adp` FFN array — a distinct `cp_kv_ring` op
+  (`OpKind.CP_RING`), half a ring all-reduce over `adp`.
+- **Striped (zigzag) balancing.** Contiguous CP is imbalanced (group 0 attends 1
+  block-pair, group `adp-1` attends `adp` — paced by the last group at ~2× ideal).
+  The default **striped** layout hands each group `S/adp` positions with balanced
+  causal-band membership, so the causal triangle `S²/2` (and the SWA banded total,
+  and the MLA decompressed form) divides *evenly* by `adp` — and so does the
+  once-streamed K/V. Net: prefill attention flops and DRAM per chip divide by the
+  whole `tp·adp` array. The FFN is untouched — CP leaves the hidden states exactly
+  the sequence-sharded `S/adp`-per-group state the DEP gather already expects, so
+  the same gather + reduce-scatter assembles the full sequence for the
+  `tp*adp`-sharded FFN. `cp_prefill=False` restores the old single-group prefill
+  (the degenerate anchor).
+
+**Where it makes sense / where it doesn't.** ADP cuts per-chip KV once TP can't:
+TP's KV sharding caps at `n_kv_heads`, and MLA replicates the latent across TP, so
+past that wall batch-sharding is the only KV lever. The KV division and the
+`tp*adp` FFN streaming both pay off in memory-bound **decode**; and with
+`cp_prefill` the **prefill** now parallelises its attention across the whole array
+(paying an `adp`-group K/V ring per layer, cheap relative to the `S²` attention it
+unlocks — so a long prefill that was worse than TP is now competitive or better).
+ADP is **dense-only**: MoE attention-DP is exactly what `ep` provides, so `--adp`
+on a MoE model is rejected (`validate_deployment`); CP is dense-only for the same
+reason (MoE context-parallel prefill would ride the `ep` groups — future work).
 
 **Real use.** DeepSeek-V3's DP-attention + TP/EP-FFN serving
 ([arXiv:2412.19437](https://arxiv.org/abs/2412.19437), MLA from
@@ -349,10 +387,14 @@ tables report `tps/gpu`; the `× GPUs` system-total conversions live per-anchor 
 
 ## 6. Not yet modeled (the honest boundary)
 
-- **Context / sequence parallelism** — ring attention, DeepSeek context-parallel
-  prefill: a very long prompt is not split across a replica's chips. `serve_disagg`
-  prefills one whole prompt on one replica (`DES_todo.md` §4, "context-parallel
-  prefill").
+- **Context / sequence parallelism** — *landed for dense `adp`* (`cp_prefill`,
+  default on): a long prompt's positions split across the `adp` groups
+  (ring/striped attention), so prefill attention parallelises over the whole
+  `tp*adp` array and a `cp_kv_ring` circulates the K/V blocks (§ADP above). Still
+  open: **MoE** context-parallel prefill (would ride the `ep` groups), and a
+  per-window short-circuited ring for SWA (windowed layers currently circulate the
+  full prompt K/V, matching the dense prefill KV-read convention). `serve_disagg`
+  prefill pools inherit CP through their `adp` (`DES_todo.md` §4).
 - **EPLB / redundant experts** — the `MoEConfig.skew` knob models the
   *unmitigated* hot-expert imbalance (skewed streaming + all-to-all incast onto
   hot owners, §EP above); DEP's redundant-expert load balancing that rebalances
