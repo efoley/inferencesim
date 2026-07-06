@@ -285,6 +285,23 @@ simulator for ONE replica (dp = arrival-rate / dp, per `simulate.py`).
 - [x] **`Report` surface**: `Phase.resource_busy`/`resource_span` and
       `Report.resource_util` carry per-resource utilisation, rendered as a
       per-phase line in the report (roofline output is unchanged).
+- [x] **Replay export + viewer**: `inferencesim/replay.py` `build_replay()`
+      turns a DES run into a versioned JSON document
+      (`"format": "inferencesim-replay-v1"`) — per level a standard hardware
+      `Graph`, a `resource_map` from DES resource names (`u{s}`, `s{s}.l{i}.*`,
+      instance nodes, `lo~hi` edges) to graph elements, and compact per-phase
+      task tracks (arrays, interned labels, kind + bytes-per-tile per row). A
+      **stage level** is always synthesised (per-stage composite of `u{s}` + the
+      member links, hop-wired into the pipeline ring); a **chip level** (the
+      expanded chip graph, one selectable track per op) appears only in graph
+      mode. Decode is capped to a steady-state window (documented in `meta`) so
+      the file stays loadable. `inferencesim ui` injects the document into a
+      packaged single-file canvas viewer (`inferencesim/viewer.html`; no deps,
+      no build step) and opens it; it single-steps the schedule so a human can
+      *see* tensors move and where they contend. This consumes the
+      timeline/util data above; the **graph-editor** UI (editing the JSON in
+      browser) stays open — this is a read-only viewer. The replay format is the
+      versioned contract a future native (ImGui/emscripten) front-end reuses.
 
 ## Validation philosophy
 

@@ -29,11 +29,13 @@ from .serve import (
 from .graph import Edge as GraphEdge, Graph, Node as GraphNode, NodeKind
 from .bridge import (
     chip_from_graph,
+    chip_graph_of,
     chip_to_graph,
     swap_chip_model,
     system_from_graph,
     system_to_graph,
 )
+from .replay import build_replay
 from . import presets, presets_fine
 
 __version__ = "0.2.0"
@@ -53,7 +55,8 @@ __all__ = [
     "chunked_prefill_ttft",
     "DisaggConfig", "serve_disagg", "kv_transfer_bytes", "kv_transfer_time",
     "Graph", "GraphNode", "GraphEdge", "NodeKind",
-    "chip_to_graph", "chip_from_graph", "system_to_graph", "system_from_graph",
-    "swap_chip_model",
+    "chip_to_graph", "chip_from_graph", "chip_graph_of", "system_to_graph",
+    "system_from_graph", "swap_chip_model",
+    "build_replay",
     "presets", "presets_fine",
 ]

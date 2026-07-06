@@ -1,0 +1,1098 @@
+<style>
+  /* ---- inferencesim replay viewer: dark live-telemetry scene ------------- */
+  :root {
+    --bg: #06080f;
+    --bg2: #0b0f1c;
+    --ink: #e7ecf5;
+    --ink-dim: #9aa6bd;
+    --ink-faint: #5f6b85;
+    --line: #1b2338;
+    --accent: #7aa2ff;
+    --mem: #3fb6d6;
+    --cmp: #ffab48;
+    --lnk: #9a86f0;
+    --panel: rgba(12, 16, 28, 0.86);
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Ubuntu,
+            system-ui, sans-serif;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+    font-family: var(--font); font-size: 13px; overflow: hidden;
+    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+  }
+  #app { display: grid; grid-template-rows: auto 1fr auto; height: 100vh; }
+
+  /* top bar */
+  #bar {
+    display: flex; align-items: center; gap: 14px; padding: 8px 14px;
+    background: linear-gradient(180deg, #0c1120, #080b15);
+    border-bottom: 1px solid var(--line); z-index: 5;
+  }
+  #bar .title { font-weight: 600; letter-spacing: .2px; white-space: nowrap; }
+  #bar .title small { color: var(--ink-faint); font-weight: 400; margin-left: 6px; }
+  #bar .sep { width: 1px; height: 22px; background: var(--line); }
+  #bar .spring { flex: 1; }
+  .ctl { display: flex; align-items: center; gap: 6px; }
+  .ctl label { color: var(--ink-dim); font-size: 11px; text-transform: uppercase;
+               letter-spacing: .6px; }
+  select, .btn {
+    appearance: none; background: #121829; color: var(--ink);
+    border: 1px solid var(--line); border-radius: 7px; padding: 5px 9px;
+    font-family: var(--font); font-size: 12px; cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  select:hover, .btn:hover { border-color: #2f3c5e; background: #161d31; }
+  .btn.on { border-color: var(--accent); color: #cfe0ff; background: #16203a; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px;
+         overflow: hidden; }
+  .seg .btn { border: none; border-radius: 0; }
+  .seg .btn + .btn { border-left: 1px solid var(--line); }
+  input[type=range] { accent-color: var(--accent); cursor: pointer; }
+
+  /* scene */
+  #scene-wrap { position: relative; overflow: hidden; }
+  #scene { position: absolute; inset: 0; display: block; }
+  #status {
+    position: absolute; left: 12px; bottom: 10px; font: 11px/1.4 var(--mono);
+    color: var(--ink-faint); pointer-events: none; white-space: pre;
+    text-shadow: 0 1px 3px #000;
+  }
+  #legend {
+    position: absolute; right: 12px; top: 10px; display: flex; flex-direction: column;
+    gap: 4px; padding: 8px 10px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 9px; font-size: 11px; color: var(--ink-dim);
+    backdrop-filter: blur(6px); pointer-events: none;
+  }
+  #legend .row { display: flex; align-items: center; gap: 7px; }
+  #legend .dot { width: 9px; height: 9px; border-radius: 50%; box-shadow: 0 0 7px currentColor; }
+
+  /* tooltip */
+  #tip {
+    position: absolute; z-index: 20; max-width: 300px; padding: 9px 11px;
+    background: var(--panel); border: 1px solid #26304c; border-radius: 9px;
+    font-size: 12px; color: var(--ink); pointer-events: none; opacity: 0;
+    transition: opacity .1s; box-shadow: 0 10px 30px rgba(0,0,0,.5);
+    backdrop-filter: blur(8px);
+  }
+  #tip h4 { margin: 0 0 5px; font-size: 12.5px; letter-spacing: .2px; }
+  #tip .k { color: var(--ink-faint); }
+  #tip .mono { font-family: var(--mono); font-size: 11px; }
+
+  /* pinned panel */
+  #panel {
+    position: absolute; right: 0; top: 0; bottom: 0; width: 292px;
+    background: var(--panel); border-left: 1px solid var(--line);
+    backdrop-filter: blur(10px); padding: 14px; overflow-y: auto;
+    transform: translateX(100%); transition: transform .22s cubic-bezier(.4,0,.2,1);
+    z-index: 15;
+  }
+  #panel.open { transform: none; }
+  #panel h3 { margin: 0 0 2px; font-size: 14px; }
+  #panel .sub { color: var(--ink-faint); font-size: 11px; margin-bottom: 12px;
+                font-family: var(--mono); word-break: break-all; }
+  #panel .close { position: absolute; right: 10px; top: 10px; }
+  .kv { display: grid; grid-template-columns: 96px 1fr; gap: 3px 8px; font-size: 12px;
+        margin-bottom: 12px; }
+  .kv .k { color: var(--ink-dim); }
+  .kv .v { font-family: var(--mono); font-size: 11.5px; text-align: right; }
+  .meter { height: 6px; border-radius: 4px; background: #182034; overflow: hidden; margin-top: 2px; }
+  .meter > span { display: block; height: 100%; background: linear-gradient(90deg, #2a6cff, #8b5cf6); }
+  .tasklist { font-family: var(--mono); font-size: 11px; color: var(--ink-dim); }
+  .tasklist .t { padding: 3px 0; border-top: 1px solid #141c2e; display: flex; gap: 6px; }
+  .tasklist .t b { color: var(--ink); font-weight: 500; }
+  .pill { display: inline-block; padding: 1px 6px; border-radius: 6px; font-size: 10px;
+          font-family: var(--font); }
+
+  /* timeline */
+  #timeline {
+    display: grid; grid-template-columns: auto 1fr auto; align-items: center;
+    gap: 12px; padding: 8px 14px 10px; background: #080b15;
+    border-top: 1px solid var(--line); z-index: 5;
+  }
+  #transport { display: flex; align-items: center; gap: 6px; }
+  #transport .btn { min-width: 34px; text-align: center; font-size: 14px; }
+  #transport .play { font-size: 15px; min-width: 40px; }
+  #track { position: relative; height: 46px; }
+  #activity { position: absolute; inset: 0; width: 100%; height: 100%;
+              border-radius: 8px; background: #0b1020; border: 1px solid var(--line); }
+  #scrub { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0;
+           opacity: 0; cursor: pointer; }
+  #playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: #cfe0ff;
+              box-shadow: 0 0 10px #7aa2ff; pointer-events: none; }
+  #clock { font-family: var(--mono); font-size: 12px; color: var(--ink-dim);
+           min-width: 150px; text-align: right; }
+  #clock b { color: var(--ink); }
+</style>
+
+<div id="app">
+  <div id="bar">
+    <div class="title">inferencesim <small id="sub-title">replay</small></div>
+    <div class="sep"></div>
+    <div class="ctl"><label>level</label><select id="sel-level"></select></div>
+    <div class="ctl" id="op-ctl" hidden><label>op</label><select id="sel-op"></select></div>
+    <div class="ctl"><label>phase</label>
+      <div class="seg" id="phase-seg">
+        <button class="btn on" data-phase="prefill">prefill</button>
+        <button class="btn" data-phase="decode">decode</button>
+      </div>
+    </div>
+    <div class="spring"></div>
+    <button class="btn" id="btn-heat" title="cumulative utilisation heat (h)">heat</button>
+    <button class="btn" id="btn-fit" title="reset view (f)">fit</button>
+    <div class="ctl"><label>speed</label>
+      <input type="range" id="speed" min="-3.5" max="0.6" step="0.05" value="-1.4" style="width:110px">
+      <span id="speed-lbl" style="font-family:var(--mono);font-size:11px;color:var(--ink-dim);min-width:52px"></span>
+    </div>
+  </div>
+
+  <div id="scene-wrap">
+    <canvas id="scene"></canvas>
+    <div id="status"></div>
+    <div id="legend"></div>
+    <div id="tip"></div>
+    <div id="panel"><button class="btn close" id="panel-close">close</button><div id="panel-body"></div></div>
+  </div>
+
+  <div id="timeline">
+    <div id="transport">
+      <button class="btn" id="b-back" title="step back (←)">⏮</button>
+      <button class="btn play" id="b-play" title="play / pause (space)">▶</button>
+      <button class="btn" id="b-fwd" title="step forward (→)">⏭</button>
+    </div>
+    <div id="track">
+      <canvas id="activity"></canvas>
+      <input type="range" id="scrub" min="0" max="1000" value="0">
+      <div id="playhead"></div>
+    </div>
+    <div id="clock"><b id="clock-t">0</b> / <span id="clock-m">0</span></div>
+  </div>
+</div>
+
+<script type="application/json" id="replay">/*__REPLAY_JSON__*/</script>
+
+<script>
+"use strict";
+// =====================================================================
+// inferencesim replay viewer -- hand-written, dependency-free canvas2d.
+// Sections: [data] [model] [layout] [scan] [render] [timeline] [ui].
+// =====================================================================
+
+// ---- palette --------------------------------------------------------
+const COL = {
+  bg0: "#06080f", bg1: "#0a0e1a",
+  read: "#37e0c6", compute: "#ffb454", writeback: "#ff73c7",
+  collective: "#84e888", hop: "#ffd24a", sync: "#4b5570",
+};
+const NODE = {            // fill hue by node kind / role
+  memory: "#39a9cc", compute: "#f0a03c", switch: "#8f79ef",
+  composite: "#3a4668", stage: "#2b3352",
+};
+function nodeColor(g) {
+  if (g.role === "link") return NODE.switch;
+  return NODE[g.kind] || "#48557a";
+}
+const KIND_NAMES = ["read", "compute", "writeback", "collective", "hop", "sync"];
+const PARTICLE_KINDS = new Set([0, 2, 3, 4]); // read, writeback, collective, hop
+const PARTICLE_CAP = 500;
+
+// ---- helpers --------------------------------------------------------
+const clamp = (x, a, b) => x < a ? a : x > b ? b : x;
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = t => t < .5 ? 2*t*t : 1 - Math.pow(-2*t+2, 2)/2;
+function fmtSI(v, unit) {
+  if (!v) return "0 " + unit;
+  const s = [[1e15,"P"],[1e12,"T"],[1e9,"G"],[1e6,"M"],[1e3,"k"]];
+  for (const [sc,p] of s) if (Math.abs(v) >= sc) return (v/sc).toPrecision(3)/1 + " " + p + unit;
+  return (+v.toPrecision(3)) + " " + unit;
+}
+function fmtTime(s) {
+  if (!s) return "0 s";
+  if (s >= 1) return s.toPrecision(3)/1 + " s";
+  if (s >= 1e-3) return (s*1e3).toPrecision(3)/1 + " ms";
+  if (s >= 1e-6) return (s*1e6).toPrecision(3)/1 + " µs";
+  return (s*1e9).toPrecision(3)/1 + " ns";
+}
+function roundRect(ctx, x, y, w, h, r) {
+  r = Math.min(r, w/2, h/2);
+  ctx.beginPath();
+  ctx.moveTo(x+r, y); ctx.arcTo(x+w, y, x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x, y+h, r); ctx.arcTo(x, y+h, x, y, r);
+  ctx.arcTo(x, y, x+w, y, r); ctx.closePath();
+}
+
+// =====================================================================
+// [data] parse the embedded replay document (with a demo fallback)
+// =====================================================================
+function loadDoc() {
+  const raw = (document.getElementById("replay").textContent || "").trim();
+  if (raw && raw[0] === "{") {
+    try { return JSON.parse(raw); } catch (e) { console.warn("replay parse failed", e); }
+  }
+  return demoDoc();
+}
+function demoDoc() {
+  // minimal self-standing scene so the raw template renders something.
+  const g = { name: "demo", format: "inferencesim-graph-v1",
+    nodes: [
+      { name: "u0", kind: "compute", role: "compute", peak_flops: { fp8: 1e15 } },
+      { name: "s0.fabric", kind: "switch", role: "link", count: 4, bandwidth: 4e11 },
+    ], edges: [{ src: "u0", dst: "s0.fabric", name: "egress", bandwidth: 4e11 }] };
+  const rows = [];
+  for (let i = 0; i < 60; i++) {
+    const s = i * 0.01;
+    rows.push([0, s, s + 0.006, 1, 0, 0]);
+    rows.push([1, s + 0.004, s + 0.012, 3, 1, 4096]);
+  }
+  const track = { makespan: 0.62, res: ["u0", "s0.fabric.l0.out"], labels: ["compute", "collective"], rows, n: rows.length, capped: false };
+  return { format: "inferencesim-replay-v1",
+    meta: { model: "demo", hardware: "demo", deployment: "demo", scenario: "raw template preview",
+            graph_mode: false, task_kinds: KIND_NAMES },
+    levels: [{ id: "demo", title: "Demo", kind: "stage", graph: g,
+      resource_map: { "u0": { kind: "node", id: "u0" },
+        "s0.fabric.l0.out": { kind: "node", id: "s0.fabric", instance: 0 } },
+      phases: { prefill: track, decode: track } }] };
+}
+
+const DOC = loadDoc();
+
+// ---- self-check (console.assert data-validation pass) ---------------
+(function selfCheck() {
+  console.assert(DOC.format === "inferencesim-replay-v1", "unexpected format", DOC.format);
+  console.assert(Array.isArray(DOC.levels) && DOC.levels.length, "no levels");
+  let checkedTracks = 0, checkedRows = 0;
+  for (const lvl of DOC.levels) {
+    console.assert(lvl.graph && Array.isArray(lvl.graph.nodes), "level missing graph", lvl.id);
+    const names = new Set(); (function walk(g){ for (const n of g.nodes){ names.add(n.name); if (n.inner) walk(n.inner);} })(lvl.graph);
+    const nEdges = (lvl.graph.edges || []).length;
+    for (const [res, ref] of Object.entries(lvl.resource_map || {})) {
+      if (ref.kind === "node") console.assert(names.has(ref.id), "resource_map node id missing", ref.id);
+      else console.assert(ref.id >= 0 && ref.id < nEdges, "resource_map edge idx oob", ref.id);
+    }
+    const tracks = lvl.kind === "chip"
+      ? Object.values(lvl.phases).flatMap(o => Object.values(o))
+      : Object.values(lvl.phases);
+    for (const tr of tracks) {
+      checkedTracks++;
+      for (const r of tr.rows) {
+        checkedRows++;
+        console.assert(tr.res[r[0]] !== undefined, "row resource idx oob");
+        console.assert(tr.res[r[0]] in lvl.resource_map, "row resource not mapped", tr.res[r[0]]);
+        console.assert(r[1] <= r[2] + 1e-9 && r[2] <= tr.makespan + 1e-9, "row time out of range");
+        console.assert(r[3] >= 0 && r[3] < 6, "kind out of range", r[3]);
+      }
+    }
+  }
+  console.info(`[inferencesim] self-check ok — ${DOC.levels.length} level(s), ${checkedTracks} track(s), ${checkedRows} task rows validated`);
+})();
+
+// =====================================================================
+// [model] per-level graph model + display cells + resolver
+// =====================================================================
+const baseName = n => n.replace(/\[\d+\]$/, "");
+
+function buildLevel(lvl) {
+  // flat name -> gnode (walking nesting)
+  const gmap = {};
+  (function walk(g, parent) {
+    for (const n of g.nodes) { n._parent = parent; gmap[n.name] = n; if (n.inner) walk(n.inner, n); }
+  })(lvl.graph, null);
+
+  // ---- display cells: group siblings by base name --------------------
+  // a "cell" is { id, kind:'group'|'composite'|'leaf', base, gnode, members[],
+  //   count, children[], collapsed, rect{}, cur{} }
+  let uid = 0;
+  function makeCells(nodeList, parentId) {
+    // group consecutive siblings sharing a base name (order preserved)
+    const groups = [];
+    const byBase = new Map();
+    for (const n of nodeList) {
+      const b = baseName(n.name);
+      if (!byBase.has(b)) { const arr = []; byBase.set(b, arr); groups.push([b, arr]); }
+      byBase.get(b).push(n);
+    }
+    const cells = [];
+    for (const [b, members] of groups) {
+      const rep = members[0];
+      if (rep.kind === "composite" && members.length === 1) {
+        const cell = { id: `${parentId}/${b}#c${uid++}`, kind: "composite", base: b,
+          gnode: rep, members, collapsed: false };
+        cell.children = makeCells(rep.inner.nodes, cell.id);
+        cells.push(cell);
+      } else {
+        // instance group: either N sibling nodes, or one node with count>1
+        let insts;
+        if (members.length > 1) {
+          insts = members.map((m, i) => ({ name: m.name, idx: i, gnode: m }));
+        } else if ((rep.count || 1) > 1) {
+          insts = Array.from({ length: rep.count }, (_, i) => ({ name: `${rep.name}[${i}]`, idx: i, gnode: rep }));
+        } else {
+          insts = [{ name: rep.name, idx: 0, gnode: rep }];
+        }
+        const isGroup = insts.length > 1;
+        cells.push({ id: `${parentId}/${b}#g${uid++}`, kind: isGroup ? "group" : "leaf",
+          base: b, gnode: rep, members, insts, collapsed: true });
+      }
+    }
+    return cells;
+  }
+  const topCells = makeCells(lvl.graph.nodes, lvl.id);
+
+  // ---- resolver: node-name -> {cell, instIdx} ------------------------
+  const resolve = {};
+  (function index(cells) {
+    for (const c of cells) {
+      if (c.kind === "composite") { resolve[c.gnode.name] = { cell: c, instIdx: null }; index(c.children); }
+      else {
+        // map each backing node name to this cell + instance index
+        if (c.members.length > 1) c.insts.forEach(it => resolve[it.name] = { cell: c, instIdx: it.idx });
+        else { resolve[c.gnode.name] = { cell: c, instIdx: null }; }
+      }
+    }
+  })(topCells);
+
+  function cellFor(ref) {
+    const r = resolve[ref.id];
+    if (!r) return null;
+    const inst = ref.instance != null ? ref.instance : (r.instIdx != null ? r.instIdx : 0);
+    return { cell: r.cell, inst };
+  }
+
+  // ---- edges: dedup to (cellA,cellB) trunks for drawing --------------
+  const edgeList = (lvl.graph.edges || []).map((e, i) => ({ ...e, idx: i }));
+
+  return { lvl, gmap, topCells, resolve, cellFor, edges: edgeList,
+           allCells: flattenCells(topCells) };
+}
+function flattenCells(cells, out=[]) {
+  for (const c of cells) { out.push(c); if (c.children) flattenCells(c.children, out); }
+  return out;
+}
+
+// =====================================================================
+// [layout] deterministic layered / row layout -> target rects
+// =====================================================================
+function layout(model, W, H) {
+  const lvl = model.lvl;
+  const pad = 26;
+  if (lvl.kind === "stage") layoutStages(model, W, H, pad);
+  else layoutChip(model, W, H, pad);
+}
+
+function anchor(rect) { return { x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 }; }
+
+function setRect(cell, x, y, w, h) { cell.rect = { x, y, w, h }; }
+
+function layoutStages(model, W, H, pad) {
+  const cells = model.topCells;
+  const n = cells.length;
+  const gap = 34;
+  const bw = Math.max(150, (W - pad*2 - gap*(n-1)) / n);
+  const bh = Math.min(H * 0.66, 360);
+  const y0 = (H - bh) / 2;
+  cells.forEach((c, i) => {
+    const x = pad + i * (bw + gap);
+    setRect(c, x, y0, bw, bh);
+    // inner: u{s} big on top-left, fabric group lower-right
+    if (!c.collapsed && c.children) {
+      const ipad = 16, headH = 26;
+      const iw = c.rect.w - ipad*2, ih = c.rect.h - ipad*2 - headH;
+      const ux = x + ipad, uy = y0 + ipad + headH;
+      const u = c.children.find(k => k.gnode.role === "compute");
+      const fab = c.children.find(k => k.gnode.role === "link");
+      if (u) setRect(u, ux, uy, iw, ih * 0.5);
+      if (fab) placeGroup(fab, ux, uy + ih*0.5 + 10, iw, ih*0.5 - 10);
+    }
+  });
+}
+
+function layoutChip(model, W, H, pad) {
+  // rank groups left->right by longest path over group-level edges
+  const cells = model.topCells;
+  const idOf = {}; cells.forEach(c => idOf[c.base] = c);
+  const gedges = [];
+  for (const e of model.edges) {
+    const a = baseName(e.src), b = baseName(e.dst);
+    if (a !== b && idOf[a] && idOf[b]) gedges.push([a, b]);
+  }
+  const rank = {}; cells.forEach(c => rank[c.base] = 0);
+  for (let it = 0; it < cells.length + 2; it++) {
+    let changed = false;
+    for (const [a, b] of gedges) if (rank[b] < rank[a] + 1) { rank[b] = rank[a] + 1; changed = true; }
+    if (!changed) break;
+  }
+  const cols = {};
+  let maxRank = 0;
+  cells.forEach(c => { (cols[rank[c.base]] ||= []).push(c); maxRank = Math.max(maxRank, rank[c.base]); });
+  const colW = (W - pad*2) / (maxRank + 1);
+  for (let r = 0; r <= maxRank; r++) {
+    const list = cols[r] || [];
+    const cx = pad + r*colW + colW/2;
+    const totalH = H - pad*2;
+    const cellH = totalH / list.length;
+    list.forEach((c, i) => {
+      // size grows a touch with instance count; expanded groups take more room
+      const n = c.insts ? c.insts.length : 1;
+      const baseW = Math.min(colW - 26, 168);
+      const w = c.collapsed ? Math.min(baseW, 96 + Math.log2(n+1)*16) : colW - 24;
+      const h = c.collapsed ? Math.min(cellH - 22, 72 + Math.log2(n+1)*10) : cellH - 20;
+      const x = cx - w/2, y = pad + i*cellH + (cellH - h)/2;
+      placeGroup(c, x, y, w, h);
+    });
+  }
+}
+
+function placeGroup(cell, x, y, w, h) {
+  setRect(cell, x, y, w, h);
+  if (cell.kind === "group" && !cell.collapsed) {
+    const n = cell.insts.length;
+    const ncol = Math.ceil(Math.sqrt(n * (w / Math.max(h, 1)) ));
+    const nrow = Math.ceil(n / ncol);
+    const gpad = 8, hh = 20;
+    const iw = (w - gpad*2) / ncol, ih = (h - gpad*2 - hh) / nrow;
+    cell.grid = { ncol, nrow, gpad, hh, iw, ih, x, y };
+  } else cell.grid = null;
+}
+
+// current (animated) rect for a cell
+function curRect(cell) { return cell.cur || cell.rect; }
+// current anchor for a resolved ref (cell + instance)
+function refAnchor(model, ref) {
+  const hit = model.cellFor(ref);
+  if (!hit) return null;
+  const c = hit.cell;
+  const rc = curRect(c);
+  if (!rc) return null;
+  if (c.kind === "group" && !c.collapsed && c.grid && hit.inst != null) {
+    const gd = c.grid, i = hit.inst;
+    const col = i % gd.ncol, row = (i / gd.ncol) | 0;
+    return { x: gd.x + gd.gpad + col*gd.iw + gd.iw/2, y: gd.y + gd.gpad + gd.hh + row*gd.ih + gd.ih/2, cell: c };
+  }
+  return { x: rc.x + rc.w/2, y: rc.y + rc.h/2, cell: c };
+}
+
+// =====================================================================
+// [scan] per-frame active / pending / heat, and particle collection
+// =====================================================================
+function scanTrack(track, t, lookahead) {
+  const active = {}, pending = {}, busy = {};
+  const particles = [];
+  const rows = track.rows, res = track.res;
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i], s = r[1], e = r[2], name = res[r[0]], k = r[3];
+    if (s <= t && t < e) {
+      active[name] = (active[name] || 0) + 1;
+      if (PARTICLE_KINDS.has(k)) particles.push({ res: name, k, p: (t - s) / (e - s || 1e-12), bytes: r[5], label: r[4] });
+    } else if (t < s && s <= t + lookahead) {
+      pending[name] = (pending[name] || 0) + 1;
+    }
+    if (s < t) busy[name] = (busy[name] || 0) + (Math.min(e, t) - s);
+  }
+  return { active, pending, busy, particles };
+}
+
+// =====================================================================
+// [render]
+// =====================================================================
+const cv = document.getElementById("scene");
+const ctx = cv.getContext("2d");
+let DPR = 1, VW = 0, VH = 0;
+
+function resize() {
+  const wrap = document.getElementById("scene-wrap");
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  VW = wrap.clientWidth; VH = wrap.clientHeight;
+  cv.width = Math.round(VW * DPR); cv.height = Math.round(VH * DPR);
+  cv.style.width = VW + "px"; cv.style.height = VH + "px";
+  relayout();
+}
+
+function drawBackground() {
+  ctx.fillStyle = COL.bg0; ctx.fillRect(0, 0, VW, VH);
+  // faint grid
+  ctx.save();
+  ctx.strokeStyle = "rgba(80,110,180,0.045)"; ctx.lineWidth = 1;
+  const step = 46;
+  for (let x = (VIEW.ox % step); x < VW; x += step) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, VH); ctx.stroke(); }
+  for (let y = (VIEW.oy % step); y < VH; y += step) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(VW, y); ctx.stroke(); }
+  ctx.restore();
+  // vignette
+  const g = ctx.createRadialGradient(VW/2, VH/2, Math.min(VW,VH)*0.35, VW/2, VH/2, Math.max(VW,VH)*0.75);
+  g.addColorStop(0, "rgba(0,0,0,0)"); g.addColorStop(1, "rgba(0,0,0,0.55)");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, VW, VH);
+}
+
+function edgeCurve(a, b) {
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  // perpendicular bow, gentle
+  const bow = clamp(len * 0.12, 8, 60) * (Math.abs(dx) > Math.abs(dy) ? 1 : -1) * 0.6;
+  return { cx: mx - dy/len*bow, cy: my + dx/len*bow };
+}
+function bez(a, c, b, t) {
+  const u = 1 - t;
+  return { x: u*u*a.x + 2*u*t*c.x + t*t*b.x, y: u*u*a.y + 2*u*t*c.y + t*t*b.y };
+}
+
+function drawEdges(model, scan) {
+  const drawn = new Set();
+  ctx.lineCap = "round";
+  for (const e of model.edges) {
+    const A = model.gmap[e.src], B = model.gmap[e.dst];
+    const ra = A ? refAnchor(model, { id: e.src }) : null;
+    const rb = B ? refAnchor(model, { id: e.dst }) : null;
+    if (!ra || !rb) continue;
+    const key = ra.cell.id + "|" + rb.cell.id;
+    if (drawn.has(key)) continue; drawn.add(key);
+    const c = edgeCurve(ra, rb);
+    const bw = e.bandwidth || 0;
+    const width = clamp(bw ? Math.log10(bw) - 8 : 1.2, 1, 6);
+    ctx.strokeStyle = "rgba(120,150,220,0.16)";
+    ctx.lineWidth = width;
+    ctx.beginPath(); ctx.moveTo(ra.x, ra.y); ctx.quadraticCurveTo(c.cx, c.cy, rb.x, rb.y); ctx.stroke();
+  }
+}
+
+function activityOf(scan, cell) {
+  // sum active over the backing resources of a cell
+  let a = 0, p = 0;
+  for (const name in scan.active) if (nameCellId(name) === cell.id) a += scan.active[name];
+  for (const name in scan.pending) if (nameCellId(name) === cell.id) p += scan.pending[name];
+  return { a, p };
+}
+// cache resource-name -> cell.id
+let _nameCell = {};
+function nameCellId(name) {
+  if (name in _nameCell) return _nameCell[name];
+  const ref = MODEL.lvl.resource_map[name];
+  const hit = ref ? MODEL.cellFor(ref) : null;
+  return _nameCell[name] = hit ? hit.cell.id : null;
+}
+
+function drawCells(model, scan, cells, depth) {
+  for (const c of cells) {
+    const rc = curRect(c); if (!rc) continue;
+    const color = nodeColor(c.gnode);
+    if (c.kind === "composite") {
+      drawComposite(c, rc, color, scan);
+      if (!c.collapsed && c.children) drawCells(model, scan, c.children, depth+1);
+    } else if (c.kind === "group" && !c.collapsed) {
+      drawExpandedGroup(c, rc, color, scan);
+    } else {
+      drawNode(c, rc, color, scan);
+    }
+  }
+}
+
+function drawComposite(c, rc, color, scan) {
+  ctx.save();
+  roundRect(ctx, rc.x, rc.y, rc.w, rc.h, 14);
+  const g = ctx.createLinearGradient(rc.x, rc.y, rc.x, rc.y+rc.h);
+  g.addColorStop(0, "rgba(30,40,66,0.55)"); g.addColorStop(1, "rgba(14,19,34,0.5)");
+  ctx.fillStyle = g; ctx.fill();
+  ctx.lineWidth = 1.2; ctx.strokeStyle = "rgba(120,150,220,0.28)"; ctx.stroke();
+  ctx.clip();
+  // header
+  ctx.fillStyle = "rgba(150,170,220,0.9)"; ctx.font = "600 12px var(--font)";
+  ctx.textBaseline = "top";
+  ctx.fillText(c.gnode.name, rc.x + 12, rc.y + 8);
+  ctx.fillStyle = "rgba(120,135,175,0.6)"; ctx.font = "10px var(--mono)";
+  ctx.textAlign = "right";
+  ctx.fillText(c.collapsed ? "▸" : "▾", rc.x + rc.w - 10, rc.y + 8);
+  ctx.textAlign = "left";
+  ctx.restore();
+  if (c.collapsed) {
+    const { a } = activityOf(scan, c);
+    glowNode(rc, color, clamp(a/4, 0, 1), c.gnode.name);
+  }
+}
+
+function heatTint(cell, scan) {
+  if (!showHeat) return 0;
+  let busy = 0;
+  for (const name in scan.busy) if (nameCellId(name) === cell.id) busy = Math.max(busy, scan.busy[name]);
+  return clamp(busy / (CLOCK.t || 1e-9), 0, 1);
+}
+
+function drawNode(c, rc, color, scan) {
+  const { a, p } = activityOf(scan, c);
+  const heat = heatTint(c, scan);
+  glowNode(rc, color, clamp(a / capacityOf(c), 0, 1), null, heat);
+  // label
+  ctx.fillStyle = "rgba(225,232,245,0.92)"; ctx.font = "600 11px var(--font)";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  const lbl = c.kind === "group" ? c.base : c.gnode.name;
+  ctx.fillText(fitText(lbl, rc.w - 12), rc.x + rc.w/2, rc.y + rc.h/2);
+  ctx.textAlign = "left";
+  // count badge
+  if (c.kind === "group" && c.collapsed) badge(rc, "×" + c.insts.length, color);
+  // pending queue stack
+  if (p > 0) queueStack(rc, p);
+}
+
+function drawExpandedGroup(c, rc, color, scan) {
+  ctx.save();
+  roundRect(ctx, rc.x, rc.y, rc.w, rc.h, 12);
+  ctx.fillStyle = "rgba(16,22,38,0.5)"; ctx.fill();
+  ctx.strokeStyle = "rgba(120,150,220,0.22)"; ctx.lineWidth = 1; ctx.stroke();
+  ctx.fillStyle = "rgba(150,170,220,0.85)"; ctx.font = "600 11px var(--font)";
+  ctx.textBaseline = "top"; ctx.fillText(`${c.base} ×${c.insts.length}`, rc.x + 10, rc.y + 6);
+  ctx.restore();
+  const gd = c.grid; if (!gd) return;
+  // per-instance active map
+  const perInst = {};
+  for (const name in scan.active) {
+    const ref = MODEL.lvl.resource_map[name]; if (!ref) continue;
+    const hit = MODEL.cellFor(ref); if (!hit || hit.cell.id !== c.id) continue;
+    perInst[hit.inst] = (perInst[hit.inst] || 0) + scan.active[name];
+  }
+  const cap = capacityOf(c) / Math.max(1, c.insts.length);
+  for (let i = 0; i < c.insts.length; i++) {
+    const col = i % gd.ncol, row = (i / gd.ncol) | 0;
+    const x = gd.x + gd.gpad + col*gd.iw, y = gd.y + gd.gpad + gd.hh + row*gd.ih;
+    const w = gd.iw - 3, h = gd.ih - 3;
+    const act = clamp((perInst[i] || 0) / Math.max(cap, 1), 0, 1);
+    const cell = { x, y, w, h };
+    glowNode(cell, color, act, null, 0, 4);
+  }
+}
+
+function capacityOf(c) {
+  // rough concurrency capacity so glow saturates sensibly
+  if (c.gnode.kind === "switch") return 8;
+  if (c.kind === "group") return Math.max(2, c.insts.length * 0.5);
+  return 3;
+}
+
+function glowNode(rc, color, act, labelOverride, heat=0, radius=10) {
+  ctx.save();
+  roundRect(ctx, rc.x, rc.y, rc.w, rc.h, radius);
+  // base fill
+  const g = ctx.createLinearGradient(rc.x, rc.y, rc.x, rc.y + rc.h);
+  g.addColorStop(0, shade(color, 0.20 + heat*0.28)); g.addColorStop(1, shade(color, 0.07 + heat*0.14));
+  ctx.fillStyle = g; ctx.fill();
+  // activity glow (additive)
+  if (act > 0.01) {
+    ctx.globalCompositeOperation = "lighter";
+    ctx.shadowColor = color; ctx.shadowBlur = 6 + act * 26;
+    ctx.fillStyle = withAlpha(color, 0.12 + act * 0.5);
+    roundRect(ctx, rc.x, rc.y, rc.w, rc.h, radius); ctx.fill();
+    ctx.shadowBlur = 0; ctx.globalCompositeOperation = "source-over";
+  }
+  // rim
+  ctx.lineWidth = 1.1; ctx.strokeStyle = withAlpha(color, 0.35 + act*0.5); ctx.stroke();
+  ctx.restore();
+}
+
+function badge(rc, text, color) {
+  ctx.save();
+  ctx.font = "600 10px var(--font)";
+  const w = ctx.measureText(text).width + 12;
+  const bx = rc.x + rc.w - w - 6, by = rc.y + 6;
+  roundRect(ctx, bx, by, w, 16, 8); ctx.fillStyle = withAlpha(color, 0.22); ctx.fill();
+  ctx.strokeStyle = withAlpha(color, 0.5); ctx.lineWidth = 1; ctx.stroke();
+  ctx.fillStyle = "#eaf0ff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(text, bx + w/2, by + 8); ctx.textAlign = "left";
+  ctx.restore();
+}
+
+function queueStack(rc, p) {
+  ctx.save();
+  const n = Math.min(p, 12), bx = rc.x - 10, by0 = rc.y + rc.h - 4;
+  for (let i = 0; i < n; i++) {
+    const h = 4, y = by0 - i * 5;
+    ctx.fillStyle = withAlpha(COL.sync, 0.35 + i/n*0.5);
+    ctx.fillRect(bx - 5, y, 8, h);
+  }
+  ctx.fillStyle = "#cbd4ea"; ctx.font = "600 9px var(--mono)"; ctx.textAlign = "right";
+  ctx.fillText(String(p), bx - 8, rc.y + rc.h - 4);
+  ctx.textAlign = "left"; ctx.restore();
+}
+
+// particles with short fading trails
+function drawParticles(model, particles) {
+  let list = particles;
+  let sampled = false;
+  if (list.length > PARTICLE_CAP) {
+    const stride = Math.ceil(list.length / PARTICLE_CAP);
+    list = list.filter((_, i) => i % stride === 0);
+    sampled = true;
+  }
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+  for (const pt of list) {
+    const path = particlePath(model, pt); if (!path) continue;
+    const col = kindColor(pt.k);
+    const size = clamp(1.6 + Math.log10((pt.bytes || 1) + 10) * 0.55, 1.6, 6);
+    // trail
+    for (let s = 0; s < 4; s++) {
+      const tp = clamp(pt.p - s * 0.05, 0, 1);
+      const q = bez(path.a, path.c, path.b, tp);
+      ctx.globalAlpha = (1 - s / 4) * 0.5;
+      ctx.fillStyle = col;
+      ctx.beginPath(); ctx.arc(q.x, q.y, size * (1 - s*0.16), 0, 7); ctx.fill();
+    }
+    const head = bez(path.a, path.c, path.b, pt.p);
+    ctx.globalAlpha = 1; ctx.shadowColor = col; ctx.shadowBlur = 10;
+    ctx.fillStyle = "#ffffff"; ctx.beginPath(); ctx.arc(head.x, head.y, size*0.7, 0, 7); ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+  ctx.restore();
+  return { drawn: list.length, total: particles.length, sampled };
+}
+
+function particlePath(model, pt) {
+  const ref = model.lvl.resource_map[pt.res]; if (!ref) return null;
+  if (ref.kind === "edge") {
+    const e = model.edges[ref.id]; if (!e) return null;
+    const a = refAnchor(model, { id: e.src }), b = refAnchor(model, { id: e.dst });
+    if (!a || !b) return null;
+    return { a, b, c: edgeCurve(a, b) };
+  }
+  // node-mapped: hop -> follow outgoing hop edge; collective -> egress edge
+  const here = refAnchor(model, ref); if (!here) return null;
+  if (pt.k === 4) { // hop: find hop edge leaving this stage
+    const stage = model.cellFor(ref)?.cell;
+    const he = findHopEdge(model, ref.id);
+    if (he) { const b = refAnchor(model, { id: he.dst }); if (b) return { a: here, b, c: edgeCurve(here, b) }; }
+  }
+  // collective / fallback: shimmer along the nearest incident edge
+  const inc = model.edges.find(e => e.src === ref.id || e.dst === ref.id);
+  if (inc) {
+    const other = inc.src === ref.id ? inc.dst : inc.src;
+    const b = refAnchor(model, { id: other }); if (b) return { a: b, b: here, c: edgeCurve(b, here) };
+  }
+  return { a: here, b: { x: here.x, y: here.y - 24 }, c: { cx: here.x + 12, cy: here.y - 12 } };
+}
+function findHopEdge(model, nodeId) {
+  // nodeId like "s0.fabric" -> stage index -> hop edge stageK -> next
+  const m = /^s(\d+)\./.exec(nodeId) || /^u(\d+)/.exec(nodeId);
+  if (!m) return null;
+  const src = "stage" + m[1];
+  return model.edges.find(e => e.name === "hop" && e.src === src);
+}
+
+function kindColor(k) { return COL[KIND_NAMES[k]] || "#fff"; }
+function withAlpha(hex, a) {
+  const c = hex2rgb(hex); return `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+}
+function shade(hex, a) { const c = hex2rgb(hex); return `rgba(${c[0]},${c[1]},${c[2]},${a})`; }
+function hex2rgb(h) {
+  if (h[0] !== "#") return [120,140,200];
+  const n = h.length === 4 ? h.slice(1).split("").map(x=>x+x).join("") : h.slice(1);
+  const v = parseInt(n, 16); return [(v>>16)&255, (v>>8)&255, v&255];
+}
+function fitText(s, maxw) {
+  ctx.font = "600 11px var(--font)";
+  if (ctx.measureText(s).width <= maxw) return s;
+  while (s.length > 2 && ctx.measureText(s + "…").width > maxw) s = s.slice(0, -1);
+  return s + "…";
+}
+
+// =====================================================================
+// [timeline] activity strip (mini stacked area of active tasks / kind)
+// =====================================================================
+const actCv = document.getElementById("activity");
+const actCtx = actCv.getContext("2d");
+function drawActivityStrip() {
+  const w = actCv.clientWidth, h = actCv.clientHeight;
+  actCv.width = Math.round(w * DPR); actCv.height = Math.round(h * DPR);
+  actCtx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  actCtx.clearRect(0, 0, w, h);
+  const tr = currentTrack(); if (!tr || !tr.makespan) return;
+  const N = Math.min(260, Math.max(60, (w|0)));
+  const stacks = new Array(N).fill(null).map(() => new Float32Array(6));
+  const dt = tr.makespan / N;
+  for (const r of tr.rows) {
+    const i0 = Math.max(0, Math.floor(r[1] / dt)), i1 = Math.min(N-1, Math.floor(r[2] / dt));
+    for (let i = i0; i <= i1; i++) stacks[i][r[3]]++;
+  }
+  let peak = 1; for (const s of stacks) { let sum=0; for (let k=0;k<6;k++) sum+=s[k]; peak = Math.max(peak, sum); }
+  // draw stacked columns
+  const order = [1,0,2,3,4,5]; // compute base, then transfers, sync on top
+  for (let i = 0; i < N; i++) {
+    const x = i / N * w, cw = w / N + 0.6;
+    let y = h;
+    for (const k of order) {
+      const v = stacks[i][k]; if (!v) continue;
+      const bh = v / peak * (h - 4);
+      actCtx.fillStyle = withAlpha(kindColor(k), 0.72);
+      actCtx.fillRect(x, y - bh, cw, bh); y -= bh;
+    }
+  }
+}
+
+// =====================================================================
+// [state] selection + clock
+// =====================================================================
+const STATE = { level: 0, phase: "prefill", op: 0 };
+const CLOCK = { t: 0, playing: false, rate: 0.04, last: 0 };
+let MODEL = null, showHeat = false;
+const VIEW = { ox: 0, oy: 0 };  // grid parallax only
+
+function currentLevel() { return DOC.levels[STATE.level]; }
+function currentTrack() {
+  const lvl = currentLevel();
+  if (lvl.kind === "chip") { const op = lvl.ops[STATE.op]; return lvl.phases[STATE.phase]?.[op]; }
+  return lvl.phases[STATE.phase];
+}
+function makespan() { return currentTrack()?.makespan || 1; }
+
+function rebuildModel() {
+  MODEL = buildLevel(currentLevel());
+  _nameCell = {};
+  relayout(true);
+}
+function relayout(snap=false) {
+  if (!MODEL || !VW) return;
+  layout(MODEL, VW, VH);
+  for (const c of MODEL.allCells) {
+    if (!c.rect) continue;
+    if (snap || !c.cur) c.cur = { ...c.rect };
+    c.tgt = { ...c.rect };
+  }
+  _nameCell = {};
+}
+
+// smooth cell transitions
+function animateCells(dt) {
+  if (!MODEL) return;
+  const k = 1 - Math.pow(0.001, dt); // time-based ease toward target
+  for (const c of MODEL.allCells) {
+    if (!c.cur || !c.tgt) continue;
+    c.cur.x = lerp(c.cur.x, c.tgt.x, k); c.cur.y = lerp(c.cur.y, c.tgt.y, k);
+    c.cur.w = lerp(c.cur.w, c.tgt.w, k); c.cur.h = lerp(c.cur.h, c.tgt.h, k);
+    if (c.grid) { c.grid.x = c.cur.x; c.grid.y = c.cur.y; }
+  }
+}
+
+// =====================================================================
+// [loop]
+// =====================================================================
+let lastStatus = "";
+function frame(ts) {
+  const dt = Math.min(0.05, (ts - (CLOCK.last || ts)) / 1000); CLOCK.last = ts;
+  if (CLOCK.playing) {
+    CLOCK.t += dt * CLOCK.rate;
+    if (CLOCK.t >= makespan()) { CLOCK.t = makespan(); setPlaying(false); }
+  }
+  VIEW.ox += dt * 6; VIEW.oy += dt * 3;
+  animateCells(dt);
+
+  const tr = currentTrack();
+  drawBackground();
+  let pinfo = { drawn: 0, total: 0, sampled: false };
+  if (tr) {
+    const look = makespan() * 0.02;
+    const scan = scanTrack(tr, CLOCK.t, look);
+    drawEdges(MODEL, scan);
+    drawCells(MODEL, scan, MODEL.topCells, 0);
+    pinfo = drawParticles(MODEL, scan.particles);
+    LAST_SCAN = scan;
+  }
+  updatePlayhead();
+  // status line
+  const st = `${currentLevel().title}   ${STATE.phase}` +
+    (currentLevel().kind === "chip" ? "  op:" + currentLevel().ops[STATE.op] : "") +
+    `   particles ${pinfo.drawn}${pinfo.sampled ? "/" + pinfo.total + " (sampled)" : ""}` +
+    `   tasks ${tr ? tr.rows.length : 0}${tr && tr.capped ? " (downsampled from " + tr.n + ")" : ""}`;
+  if (st !== lastStatus) { document.getElementById("status").textContent = st; lastStatus = st; }
+  requestAnimationFrame(frame);
+}
+let LAST_SCAN = null;
+
+// =====================================================================
+// [ui] controls, interaction, keyboard
+// =====================================================================
+function buildBar() {
+  const sl = document.getElementById("sel-level");
+  sl.innerHTML = DOC.levels.map((l, i) => `<option value="${i}">${l.title}</option>`).join("");
+  sl.onchange = () => { STATE.level = +sl.value; STATE.op = 0; refreshOpCtl(); rebuildModel(); onTrackChange(); };
+  refreshOpCtl();
+
+  document.querySelectorAll("#phase-seg .btn").forEach(b => b.onclick = () => {
+    document.querySelectorAll("#phase-seg .btn").forEach(x => x.classList.remove("on"));
+    b.classList.add("on"); STATE.phase = b.dataset.phase; onTrackChange();
+  });
+  document.getElementById("btn-heat").onclick = e => { showHeat = !showHeat; e.target.classList.toggle("on", showHeat); };
+  document.getElementById("btn-fit").onclick = () => relayout(true);
+  const sp = document.getElementById("speed");
+  const applySpeed = () => { CLOCK.rate = Math.pow(10, +sp.value); document.getElementById("speed-lbl").textContent = fmtTime(CLOCK.rate) + "/s"; };
+  sp.oninput = applySpeed; applySpeed();
+
+  document.getElementById("b-play").onclick = () => setPlaying(!CLOCK.playing);
+  document.getElementById("b-fwd").onclick = () => step(1);
+  document.getElementById("b-back").onclick = () => step(-1);
+  const scr = document.getElementById("scrub");
+  scr.oninput = () => { CLOCK.t = +scr.value / 1000 * makespan(); setPlaying(false); };
+  document.getElementById("panel-close").onclick = () => document.getElementById("panel").classList.remove("open");
+
+  // legend
+  document.getElementById("legend").innerHTML = KIND_NAMES.map(k =>
+    `<div class="row"><span class="dot" style="color:${COL[k]}"></span>${k}</div>`).join("");
+  // header meta
+  const m = DOC.meta;
+  document.getElementById("sub-title").textContent = `${m.hardware_name || m.hardware || ""}  ·  ${m.model_name || m.model || ""}`;
+}
+function refreshOpCtl() {
+  const lvl = currentLevel(), ctl = document.getElementById("op-ctl"), so = document.getElementById("sel-op");
+  if (lvl.kind === "chip" && lvl.ops) {
+    ctl.hidden = false;
+    so.innerHTML = lvl.ops.map((o, i) => `<option value="${i}">${o}</option>`).join("");
+    so.value = STATE.op;
+    so.onchange = () => { STATE.op = +so.value; onTrackChange(); };
+  } else ctl.hidden = true;
+}
+function onTrackChange() { CLOCK.t = 0; drawActivityStrip(); refreshPanel(); }
+
+function setPlaying(p) {
+  CLOCK.playing = p;
+  if (p && CLOCK.t >= makespan()) CLOCK.t = 0;
+  document.getElementById("b-play").textContent = p ? "⏸" : "▶";
+}
+function step(dir) {
+  setPlaying(false);
+  const tr = currentTrack(); if (!tr) return;
+  const t = CLOCK.t, eps = 1e-9;
+  let best = dir > 0 ? Infinity : -Infinity;
+  for (const r of tr.rows) {
+    for (const e of [r[1], r[2]]) {
+      if (dir > 0 && e > t + eps && e < best) best = e;
+      if (dir < 0 && e < t - eps && e > best) best = e;
+    }
+  }
+  if (isFinite(best)) CLOCK.t = clamp(best, 0, makespan());
+}
+function updatePlayhead() {
+  const f = clamp(CLOCK.t / makespan(), 0, 1);
+  document.getElementById("playhead").style.left = (f * 100) + "%";
+  document.getElementById("scrub").value = f * 1000;
+  document.getElementById("clock-t").textContent = fmtTime(CLOCK.t);
+  document.getElementById("clock-m").textContent = fmtTime(makespan());
+}
+
+// hit-testing + hover/click
+function pickCell(x, y) {
+  if (!MODEL) return null;
+  let found = null;
+  (function rec(cells) {
+    for (const c of cells) {
+      const rc = curRect(c); if (!rc) continue;
+      const inside = x >= rc.x && x <= rc.x + rc.w && y >= rc.y && y <= rc.y + rc.h;
+      if (c.kind === "composite") { if (inside) found = c; if (!c.collapsed && c.children) rec(c.children); }
+      else if (inside) found = c;
+    }
+  })(MODEL.topCells);
+  return found;
+}
+function cellStats(cell) {
+  // aggregate live active/pending/busy over this cell's resources
+  let a = 0, p = 0, busy = 0; const labels = [];
+  if (LAST_SCAN) {
+    for (const name in LAST_SCAN.active) if (nameCellId(name) === cell.id) a += LAST_SCAN.active[name];
+    for (const name in LAST_SCAN.pending) if (nameCellId(name) === cell.id) p += LAST_SCAN.pending[name];
+    for (const name in LAST_SCAN.busy) if (nameCellId(name) === cell.id) busy = Math.max(busy, LAST_SCAN.busy[name]);
+    const tr = currentTrack();
+    if (tr) for (const r of tr.rows) {
+      if (r[1] <= CLOCK.t && CLOCK.t < r[2] && nameCellId(tr.res[r[0]]) === cell.id) {
+        if (labels.length < 6) labels.push({ label: tr.labels[r[4]], kind: r[3], s: r[1], e: r[2] });
+      }
+    }
+  }
+  return { a, p, busy, util: clamp(busy / (CLOCK.t || 1e-9), 0, 1), labels };
+}
+function nodeInfoRows(g) {
+  const rows = [];
+  rows.push(["kind", g.kind + (g.role ? " / " + g.role : "")]);
+  if (g.count > 1) rows.push(["count", "×" + g.count]);
+  if (g.peak_flops) { const d = Object.keys(g.peak_flops)[0]; rows.push(["peak", fmtSI(g.peak_flops[d], "FLOP/s") + " @" + d]); }
+  if (g.capacity_bytes) rows.push(["capacity", fmtSI(g.capacity_bytes, "B")]);
+  if (g.bandwidth) rows.push(["bandwidth", fmtSI(g.bandwidth, "B/s")]);
+  if (g.derate != null && g.derate !== 1) rows.push(["derate", g.derate]);
+  if (g.meta && g.meta.topology) rows.push(["topology", g.meta.topology]);
+  return rows;
+}
+function tipHTML(cell) {
+  const g = cell.gnode, st = cellStats(cell);
+  const name = cell.kind === "group" ? `${cell.base} ×${cell.insts.length}` : g.name;
+  let h = `<h4>${name}</h4>`;
+  h += `<div class="mono">` + nodeInfoRows(g).map(([k,v]) => `<span class="k">${k}</span> ${v}`).join("<br>") + `</div>`;
+  h += `<div style="margin-top:6px" class="mono"><span class="k">active</span> ${st.a}  <span class="k">queued</span> ${st.p}  <span class="k">busy</span> ${(st.util*100).toFixed(0)}%</div>`;
+  return h;
+}
+function refreshPanel() {
+  const pinned = document.getElementById("panel").dataset.cell;
+  if (!pinned || !MODEL) return;
+  const cell = MODEL.allCells.find(c => c.id === pinned);
+  if (cell) fillPanel(cell);
+}
+function fillPanel(cell) {
+  const g = cell.gnode, st = cellStats(cell);
+  const name = cell.kind === "group" ? `${cell.base} ×${cell.insts.length}` : g.name;
+  let h = `<h3>${name}</h3><div class="sub">${cell.kind}${g.role ? " · " + g.role : ""}</div>`;
+  h += `<div class="kv">` + nodeInfoRows(g).map(([k,v]) => `<div class="k">${k}</div><div class="v">${v}</div>`).join("") + `</div>`;
+  h += `<div class="k" style="font-size:11px;text-transform:uppercase;letter-spacing:.6px;margin-bottom:4px">live state</div>`;
+  h += `<div class="kv"><div class="k">active</div><div class="v">${st.a}</div>` +
+       `<div class="k">queued</div><div class="v">${st.p}</div>` +
+       `<div class="k">cum. busy</div><div class="v">${(st.util*100).toFixed(1)}%</div></div>`;
+  h += `<div class="meter"><span style="width:${(st.util*100).toFixed(1)}%"></span></div>`;
+  if (st.labels.length) {
+    h += `<div class="k" style="font-size:11px;text-transform:uppercase;letter-spacing:.6px;margin:12px 0 4px">active tasks</div><div class="tasklist">`;
+    for (const t of st.labels)
+      h += `<div class="t"><span class="pill" style="background:${withAlpha(kindColor(t.kind),0.22)};color:${kindColor(t.kind)}">${KIND_NAMES[t.kind]}</span><b>${t.label}</b></div>` +
+           `<div class="t" style="border:0;padding-top:0;color:var(--ink-faint)">${fmtTime(t.s)} → ${fmtTime(t.e)} (${fmtTime(t.e-t.s)})</div>`;
+    h += `</div>`;
+  }
+  document.getElementById("panel-body").innerHTML = h;
+  document.getElementById("panel").dataset.cell = cell.id;
+  document.getElementById("panel").classList.add("open");
+}
+
+function bindPointer() {
+  const tip = document.getElementById("tip");
+  cv.addEventListener("mousemove", ev => {
+    const r = cv.getBoundingClientRect();
+    const cell = pickCell(ev.clientX - r.left, ev.clientY - r.top);
+    if (cell) {
+      tip.innerHTML = tipHTML(cell); tip.style.opacity = 1;
+      const tx = Math.min(ev.clientX - r.left + 16, VW - 310), ty = Math.min(ev.clientY - r.top + 14, VH - 120);
+      tip.style.left = tx + "px"; tip.style.top = ty + "px";
+      cv.style.cursor = (cell.kind === "group" || cell.kind === "composite") ? "pointer" : "default";
+    } else { tip.style.opacity = 0; cv.style.cursor = "default"; }
+  });
+  cv.addEventListener("mouseleave", () => tip.style.opacity = 0);
+  cv.addEventListener("click", ev => {
+    const r = cv.getBoundingClientRect();
+    const cell = pickCell(ev.clientX - r.left, ev.clientY - r.top);
+    if (!cell) return;
+    if (cell.kind === "group" || cell.kind === "composite") {
+      cell.collapsed = !cell.collapsed; relayout();
+    }
+    fillPanel(cell);
+  });
+}
+function bindKeys() {
+  window.addEventListener("keydown", e => {
+    if (e.target.tagName === "SELECT" || e.target.tagName === "INPUT") return;
+    if (e.code === "Space") { e.preventDefault(); setPlaying(!CLOCK.playing); }
+    else if (e.code === "ArrowRight") { e.preventDefault(); step(1); }
+    else if (e.code === "ArrowLeft") { e.preventDefault(); step(-1); }
+    else if (e.key === "h") document.getElementById("btn-heat").click();
+    else if (e.key === "f") relayout(true);
+  });
+}
+
+// =====================================================================
+// boot
+// =====================================================================
+buildBar();
+resize();
+rebuildModel();
+onTrackChange();
+bindPointer();
+bindKeys();
+window.addEventListener("resize", () => { resize(); drawActivityStrip(); });
+requestAnimationFrame(frame);
+</script>

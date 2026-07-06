@@ -373,6 +373,16 @@ def system_from_graph(g: Graph) -> System:
     )
 
 
+def chip_graph_of(g: Graph) -> Graph:
+    """The chip-level model a graph-mode DES (and the viewer) walks: the first
+    ``role="chip"`` composite's inner graph, or the whole graph when there is
+    no such composite (a bare chip graph like ``blackhole-p150-fine``)."""
+    for _path, node in g.walk():
+        if node.role == "chip" and node.inner is not None:
+            return node.inner
+    return g
+
+
 def swap_chip_model(system_graph: Graph, chip_inner: Graph, port: str) -> Graph:
     """Replace the chip-level model inside a system graph with a different
     abstraction level (e.g. swap a lumped chip for a per-core model).

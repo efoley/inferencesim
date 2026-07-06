@@ -20,5 +20,8 @@ inferencesim = "inferencesim.cli:main"
 [tool.setuptools.packages.find]
 include = ["inferencesim*"]
 
+[tool.setuptools.package-data]
+inferencesim = ["viewer.html"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
