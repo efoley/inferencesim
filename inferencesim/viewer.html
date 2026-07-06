@@ -164,7 +164,7 @@
       <button class="btn play" id="b-play" title="play / pause (space)">▶</button>
       <button class="btn" id="b-fwd" title="step forward (→)">⏭</button>
     </div>
-    <div id="track">
+    <div id="track" title="concurrently active tasks over time, stacked by kind (colors match the legend)">
       <canvas id="activity"></canvas>
       <input type="range" id="scrub" min="0" max="1000" value="0">
       <div id="playhead"></div>
@@ -975,7 +975,8 @@ function buildBar() {
     `<div class="row"><span class="dot" style="color:${COL[k]}"></span>${k}</div>`).join("") +
     `<div class="row" style="margin-top:5px"><svg width="26" height="10"><path d="M1 7 Q13 1 22 5" stroke="rgba(120,150,220,.7)" fill="none"/><path d="M25 5 L19 3 L20 7 Z" fill="rgba(120,150,220,.7)"/></svg>link (width ~ bandwidth)</div>` +
     `<div class="row"><svg width="26" height="10"><path d="M1 6 Q13 1 25 5" stroke="rgba(150,130,220,.8)" stroke-dasharray="4 3" fill="none"/></svg>ring wrap (next round)</div>` +
-    `<div class="row"><svg width="26" height="12"><rect x="9" y="8" width="8" height="3" fill="rgba(140,150,190,.9)"/><rect x="9" y="4" width="8" height="3" fill="rgba(140,150,190,.65)"/><rect x="9" y="0" width="8" height="3" fill="rgba(140,150,190,.4)"/></svg>tasks queued (waiting)</div>`;
+    `<div class="row"><svg width="26" height="12"><rect x="9" y="8" width="8" height="3" fill="rgba(140,150,190,.9)"/><rect x="9" y="4" width="8" height="3" fill="rgba(140,150,190,.65)"/><rect x="9" y="0" width="8" height="3" fill="rgba(140,150,190,.4)"/></svg>tasks queued (waiting)</div>` +
+    `<div class="row" style="color:var(--ink-faint)">timeline strip: active tasks by kind</div>`;
   // header meta
   const m = DOC.meta;
   document.getElementById("sub-title").textContent = `${m.hardware_name || m.hardware || ""}  ·  ${m.model_name || m.model || ""}`;
