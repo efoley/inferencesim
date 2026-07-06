@@ -137,43 +137,32 @@ by a batch, which is what actually determines DRAM traffic.
 ### Parallelism
 
 A replica occupies `tp * pp * ep * adp` chips; the remaining chips form
-data-parallel (DP) replicas.
+data-parallel (DP) replicas. **See `PARALLELISM.md` for the full reference** —
+what each strategy shards, which real deployments use it, per-strategy examples,
+a composition/constraint map, and a decision guide. In brief:
 
-- **TP (tensor parallel)**: every matrix sharded `tp` ways; 2 ring
-  allreduces per layer. Cuts TPOT (each chip streams 1/tp of the weights)
-  at the cost of per-layer collective latency.
-- **PP (pipeline parallel)**: layers split into `pp` balanced stages;
-  decode runs `pp` microbatches round-robin, so TPOT is the pipeline round
-  time plus P2P hops. Per-chip memory drops ~1/pp — PP buys *capacity*
-  (bigger batches, or fitting at all), not faster weight streaming.
-- **EP (expert parallel, MoE only)**: attention runs data-parallel across
-  `ep` groups while expert weights shard over the whole `tp*ep` array;
-  the FFN allreduce is replaced by dispatch/combine all-to-alls, and the
-  full batch (not just one group's share) amortizes expert weight reads.
-  **This is exactly TRT-LLM's `DEPn` for MoE**: `DEPn ≡ tp=1, ep=n` here —
-  attention weights replicated across the `n` groups, batch and KV sharded by
-  `ep`, experts sharded over `ep`, dispatch/combine all-to-alls, and no FFN
-  allreduce (the tp=1 attention allreduce is zero-cost). So a benchmark point
-  labelled `DEP4` is simulated as `--tp 1 --ep 4` (validated in
-  `tests/test_dep.py`); what stays unmodeled is EPLB redundant-expert load
-  balancing and mixed ADP+TP MoE attention.
-- **ADP (attention data-parallel, dense only)**: the DeepSeek-V3-style
-  "DP attention + TP FFN" pattern, and TRT-LLM's dense `DEPn`. Attention runs
-  data-parallel across `adp` groups (each `tp`-sharded, handling `batch/adp`
-  sequences); its qkv/out weights are sharded `tp` ways and **replicated**
-  across the groups, so **per-chip attention weight bytes are unchanged by
-  `adp` while per-chip KV divides by `adp`** — that KV cut is the point. The
-  dense FFN instead shards over the **whole `tp*adp` array** (per-chip FFN
-  weight bytes = `ffn_params/(tp*adp)`, better weight streaming than `tp`
-  alone). Because attention leaves each token sequence-sharded but the FFN is
-  TP over the whole array, the FFN allreduce is replaced by a **sequence
-  allgather before the FFN** (assemble the full-batch hidden state) and a
-  **reduce-scatter after** it. Each is exactly *half* a ring allreduce over
-  `g = tp*adp` — `(g-1)/g · payload/bw + (g-1)·lat` with `payload` the full
-  batch's `B×d_model` hidden state — so `adp` trades one `tp`-group FFN
-  allreduce for an allgather + reduce-scatter over the larger `tp*adp` group.
-  At `adp = 1` everything is bit-identical to plain TP. MoE attention-DP is
-  what `ep` already provides, so `adp` is rejected for MoE models.
+- **TP (tensor parallel)**: every matrix sharded `tp` ways; 2 ring allreduces
+  per layer. Cuts TPOT (each chip streams 1/tp of the weights) at the cost of
+  per-layer collective latency. KV sharding caps at `n_kv_heads`.
+- **PP (pipeline parallel)**: layers split into `pp` balanced stages; decode
+  runs `pp` microbatches round-robin (TPOT = pipeline round time + P2P hops).
+  Per-chip memory drops ~1/pp — PP buys *capacity* (bigger batches, or fitting
+  at all), not faster weight streaming.
+- **EP (expert parallel, MoE only)**: attention runs data-parallel across `ep`
+  groups while expert weights shard over the whole `tp*ep` array; the FFN
+  allreduce becomes dispatch/combine all-to-alls, and the full batch amortizes
+  expert weight reads. **This is exactly TRT-LLM's `DEPn` for MoE**:
+  `DEPn ≡ tp=1, ep=n` here, so `DEP4` is simulated as `--tp 1 --ep 4` (validated
+  in `tests/test_dep.py`). Unmodeled: EPLB redundant-expert load balancing and
+  mixed ADP+TP MoE attention.
+- **ADP (attention data-parallel, dense only)**: the DeepSeek-V3-style "DP
+  attention + TP FFN" pattern, and TRT-LLM's dense `DEPn`. Attention runs
+  data-parallel across `adp` groups (weights replicated across them) so
+  **per-chip KV divides by `adp` while attention weight bytes are unchanged**;
+  the dense FFN shards over the whole `tp*adp` array, its allreduce replaced by
+  an allgather + reduce-scatter. Cuts KV past the `n_kv_heads` TP wall. At
+  `adp = 1` everything is bit-identical to plain TP; `adp` is rejected for MoE
+  (that is what `ep` provides).
 
 ### Engines
 
