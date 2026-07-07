@@ -259,12 +259,13 @@ def _cmd_ui(args: argparse.Namespace) -> int:
         print(f"unknown hardware '{args.hardware}' (try: inferencesim list)",
               file=sys.stderr)
         return 2
-    model = MODELS[args.model]
+    model = _apply_moe_skew(MODELS[args.model], args.moe_skew)
     dep = Deployment(
         tp=args.tp, pp=args.pp, ep=args.ep, adp=args.adp,
         weight_dtype=DType(args.weight_dtype),
         kv_dtype=DType(args.kv_dtype),
         act_dtype=DType(args.act_dtype),
+        cp_prefill=args.cp_prefill,
     )
     scen = Scenario(batch=args.batch, prompt_len=args.prompt, output_len=args.output)
     efficiency = _efficiency_from_args(args, getattr(args, "hardware", None) or "")
@@ -490,6 +491,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="expert-parallel groups (MoE models only)")
     ui.add_argument("--adp", type=int, default=1,
                     help="attention-data-parallel groups (dense models only)")
+    ui.add_argument("--no-cp-prefill", dest="cp_prefill", action="store_false",
+                    help="disable context-parallel prefill (see `run --no-cp-prefill`)")
+    ui.set_defaults(cp_prefill=True)
+    ui.add_argument("--moe-skew", type=float, default=None,
+                    help="MoE expert-load imbalance (Zipf exponent; 0 = uniform, "
+                         "larger = hotter experts). Under the DES the dispatch/"
+                         "combine all-to-all incasts onto the hot owner's ingress "
+                         "port -- visible in the viewer as ingress-port occupancy")
     ui.add_argument("--batch", type=int, default=32,
                     help="concurrent sequences per replica")
     ui.add_argument("--prompt", type=int, default=2048, help="prompt tokens per request")

@@ -96,7 +96,11 @@ _KIND = {k: i for i, k in enumerate(TASK_KINDS)}
 _TRACK_CAP = 6000
 
 _U_RE = re.compile(r"^u(\d+)$")
-_LINK_RE = re.compile(r"^s(\d+)\.l(\d+)\.(cw|ccw|out)$")
+# member i's link occupancy at stage s: an egress port (`.out` switched / `.cw`,
+# `.ccw` ring) or -- under a skewed all-to-all's incast -- its ingress port
+# (`.in`).  All resolve to the same fabric member; ingress is just the inbound
+# lane the store-and-forward hop lands on (collectives.py, PR: hot-expert).
+_LINK_RE = re.compile(r"^s(\d+)\.l(\d+)\.(cw|ccw|out|in)$")
 _STAGE_RE = re.compile(r"^s(\d+)\.")
 _HOP_LABEL_RE = re.compile(r"h\d+$")
 
@@ -212,9 +216,13 @@ def _meta(system, model, scenario, deployment, graph_mode, warmup, window) -> di
 def _stage_graph(system: System, dep: Deployment, comm: CommContext) -> Graph:
     """Synthesise the pipeline-stage graph in the standard format: one
     composite box per stage, holding the stage execution unit `u{s}` and its
-    `tp` member outbound links as a count group, with hop edges wiring
-    consecutive stages (and the wrap link) into the pipeline ring."""
+    member fabric links as a count group, with hop edges wiring consecutive
+    stages (and the wrap link) into the pipeline ring.  The count group is the
+    full FFN array (`comm.a2a = tp*ep*adp`): allreduce and the pipeline hop use
+    member 0, the MoE dispatch/combine all-to-all and the dense adp gather /
+    cp_ring the wider `l{i}.{out,in,cw,ccw}` members."""
     pp, tp = dep.pp, dep.tp
+    n_members = comm.a2a  # widest member set egressing/ingressing on this fabric
     chip = system.node.chip
     tp_link = comm.tp_link
     fabric_bw = tp_link.bandwidth if tp_link else None
@@ -232,10 +240,10 @@ def _stage_graph(system: System, dep: Deployment, comm: CommContext) -> Graph:
                   f"({tp} chip{'s' if tp > 1 else ''})"},
         )
         fabric = Node(
-            name=f"s{s}.fabric", kind=NodeKind.SWITCH, role="link", count=tp,
+            name=f"s{s}.fabric", kind=NodeKind.SWITCH, role="link", count=n_members,
             bandwidth=fabric_bw, latency_s=fabric_lat,
             meta={"stage": s, "topology": comm.tp_topology.value,
-                  "desc": f"stage {s} member outbound links"},
+                  "desc": f"stage {s} member fabric links (egress + ingress)"},
         )
         inner_edges = [Edge(src=f"u{s}", dst=f"s{s}.fabric",
                             bandwidth=fabric_bw, name="egress")]
@@ -282,7 +290,10 @@ def _classify_stage(resource: str, label: str) -> int:
         return _KIND["sync"]
     if _U_RE.match(resource):
         return _KIND["compute"]
-    if _LINK_RE.match(resource):  # member outbound link occupancy
+    if _LINK_RE.match(resource):  # member link occupancy (egress or ingress)
+        # only the pipeline hop rides an egress port with an `h{s}` label; every
+        # other link task (allreduce / all-to-all egress+ingress / cp_ring) is
+        # collective traffic.
         return _KIND["hop"] if _HOP_LABEL_RE.search(label) else _KIND["collective"]
     return _KIND["compute"]
 

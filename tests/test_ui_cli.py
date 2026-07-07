@@ -82,6 +82,29 @@ def test_ui_rejects_unknown_model(tmp_path, capsys):
     assert rc == 2
 
 
+def test_ui_accepts_moe_skew_and_no_cp_prefill(tmp_path):
+    """The ui subcommand mirrors run's --moe-skew (MoE hot-expert incast) and
+    --no-cp-prefill plumbing into the same Deployment/ModelSpec the run uses."""
+    out = tmp_path / "v.html"
+    rc = main([
+        "ui", "--hardware", "gb300-nvl72", "--model", "gpt-oss-120b",
+        "--ep", "8", "--moe-skew", "0.5", "--no-cp-prefill",
+        "--batch", "4", "--prompt", "128", "--output", "16",
+        "--decode-rounds", "6", "--no-open", "-o", str(out),
+    ])
+    assert rc == 0
+    doc = _extract_replay(out.read_text())
+    assert doc["meta"]["ep"] == 8
+
+
+def test_ui_moe_skew_rejected_on_dense_model(tmp_path):
+    """--moe-skew is MoE-only, exactly as on `run`/`serve`."""
+    with pytest.raises(SystemExit) as ei:
+        main(["ui", "--hardware", "gb300-nvl72", "--model", "llama-3.1-70b",
+              "--moe-skew", "0.5", "--no-open", "-o", str(tmp_path / "v.html")])
+    assert ei.value.code == 2
+
+
 # ---- packaging: the template ships and is loadable --------------------------
 
 

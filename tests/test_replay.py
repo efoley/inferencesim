@@ -7,14 +7,15 @@ only in graph mode.
 """
 
 import re
+from dataclasses import replace
 
 import pytest
 
 from inferencesim.bridge import chip_graph_of, system_from_graph
 from inferencesim.des import DESEngine
 from inferencesim.hardware import DType
-from inferencesim.presets import GB300_NVL72, LLAMA_3_1_70B
-from inferencesim.presets_fine import tt_quietbox_fine
+from inferencesim.presets import GB300_NVL72, GPT_OSS_120B, LLAMA_3_1_70B
+from inferencesim.presets_fine import blackhole_p150_mesh, tt_quietbox_fine
 from inferencesim.replay import FORMAT, TASK_KINDS, build_replay
 from inferencesim.simulate import simulate
 from inferencesim.workload import Deployment, Scenario
@@ -38,6 +39,43 @@ def graph_replay():
     system = system_from_graph(hw)
     dep = Deployment(tp=2, pp=2, weight_dtype=DType.FP8, kv_dtype=DType.FP8)
     scen = Scenario(batch=8, prompt_len=512, output_len=64)
+    engine = DESEngine(decode_rounds=6, chip_graph=chip_graph_of(hw))
+    simulate(system, LLAMA_3_1_70B, scen, dep, engine=engine)
+    return build_replay(engine, system, LLAMA_3_1_70B, scen, dep, hw)
+
+
+@pytest.fixture(scope="module")
+def moe_skew_replay():
+    """A skewed MoE run: the dispatch/combine all-to-all incasts onto the hot
+    owner's ingress port, so the stage level carries `s{s}.l{i}.in` resources
+    the dense fixtures never exercise."""
+    model = replace(GPT_OSS_120B, moe=replace(GPT_OSS_120B.moe, skew=0.6))
+    dep = Deployment(tp=1, ep=8, weight_dtype=DType.FP8, kv_dtype=DType.FP8)
+    scen = Scenario(batch=4, prompt_len=256, output_len=32)
+    engine = DESEngine(decode_rounds=6)
+    simulate(GB300_NVL72, model, scen, dep, engine=engine)
+    return build_replay(engine, GB300_NVL72, model, scen, dep, None)
+
+
+@pytest.fixture(scope="module")
+def cp_replay():
+    """A context-parallel prefill run (adp > 1): each layer pays a `cp_kv_ring`
+    circulating the K/V blocks over the cp = adp groups."""
+    dep = Deployment(tp=2, adp=4, weight_dtype=DType.FP8, kv_dtype=DType.FP8)
+    scen = Scenario(batch=4, prompt_len=2048, output_len=32)
+    engine = DESEngine(decode_rounds=6)
+    simulate(GB300_NVL72, LLAMA_3_1_70B, scen, dep, engine=engine)
+    return build_replay(engine, GB300_NVL72, LLAMA_3_1_70B, scen, dep, None)
+
+
+@pytest.fixture(scope="module")
+def mesh_replay():
+    """The per-router 2-D mesh chip preset (12x17 router grid): a dense chip
+    level whose generic layout must stay geometrically valid."""
+    hw = blackhole_p150_mesh()
+    system = system_from_graph(hw)
+    dep = Deployment(tp=1, weight_dtype=DType.FP8, kv_dtype=DType.FP8)
+    scen = Scenario(batch=4, prompt_len=256, output_len=32)
     engine = DESEngine(decode_rounds=6, chip_graph=chip_graph_of(hw))
     simulate(system, LLAMA_3_1_70B, scen, dep, engine=engine)
     return build_replay(engine, system, LLAMA_3_1_70B, scen, dep, hw)
@@ -96,7 +134,8 @@ def test_meta_carries_header_numbers(lumped_replay):
 # ---- resource_map resolves --------------------------------------------------
 
 
-@pytest.mark.parametrize("fixture", ["lumped_replay", "graph_replay"])
+@pytest.mark.parametrize("fixture", ["lumped_replay", "graph_replay",
+                                     "moe_skew_replay", "cp_replay", "mesh_replay"])
 def test_every_task_resource_resolves_to_an_existing_element(fixture, request):
     doc = request.getfixturevalue(fixture)
     for level in doc["levels"]:
@@ -118,7 +157,8 @@ def test_every_task_resource_resolves_to_an_existing_element(fixture, request):
                     assert 0 <= ref["id"] < n_edges
 
 
-@pytest.mark.parametrize("fixture", ["lumped_replay", "graph_replay"])
+@pytest.mark.parametrize("fixture", ["lumped_replay", "graph_replay",
+                                     "moe_skew_replay", "cp_replay", "mesh_replay"])
 def test_task_times_within_makespan(fixture, request):
     doc = request.getfixturevalue(fixture)
     for level in doc["levels"]:
@@ -128,6 +168,53 @@ def test_task_times_within_makespan(fixture, request):
                 start, end = row[1], row[2]
                 assert 0.0 <= start <= end <= ms + 1e-9
                 assert 0 <= row[3] < len(TASK_KINDS)
+
+
+# ---- new comm families: all-to-all ingress + context-parallel ring ----------
+
+
+def _stage_level(doc):
+    return _levels_by_kind(doc, "stage")[0]
+
+
+def test_ingress_ports_map_to_their_member_and_read_as_collective(moe_skew_replay):
+    """A skewed all-to-all lands each message on the receiver's `.in` ingress
+    port; those must map to their own fabric member (not member 0) and read as
+    collective traffic, never compute -- the `_LINK_RE`/`_classify_stage` `.in`
+    extension.  Without it the catch-all would fold every ingress onto member 0
+    and mislabel it compute."""
+    level = _stage_level(moe_skew_replay)
+    rmap = level["resource_map"]
+    collective = TASK_KINDS.index("collective")
+    seen_ingress = 0
+    for _phase, _op, track in _tracks(level):
+        for row in track["rows"]:
+            res = track["res"][row[0]]
+            m = re.match(r"^s\d+\.l(\d+)\.in$", res)
+            if not m:
+                continue
+            seen_ingress += 1
+            ref = rmap[res]
+            assert ref["kind"] == "node" and ref["id"].endswith(".fabric")
+            assert ref["instance"] == int(m.group(1))  # its own member, not 0
+            assert row[3] == collective
+    assert seen_ingress > 0, "skewed MoE run emitted no ingress-port tasks"
+
+
+def test_context_parallel_ring_tasks_present_and_collective(cp_replay):
+    """CP prefill circulates the K/V blocks as a `cp_kv_ring`; its link
+    occupancy rides the member egress ports and must read as collective (the
+    ring barriers stay sync)."""
+    level = _stage_level(cp_replay)
+    collective = TASK_KINDS.index("collective")
+    sync = TASK_KINDS.index("sync")
+    ring_kinds = set()
+    for _phase, _op, track in _tracks(level):
+        for row in track["rows"]:
+            if "cp_ring" in track["labels"][row[4]]:
+                ring_kinds.add(row[3])
+    assert collective in ring_kinds, "no cp_ring link occupancy classified collective"
+    assert ring_kinds <= {collective, sync}, f"unexpected cp_ring kinds {ring_kinds}"
 
 
 # ---- stage level always synthesised -----------------------------------------
