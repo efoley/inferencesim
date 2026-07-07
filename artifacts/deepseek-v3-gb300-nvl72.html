@@ -1,0 +1,1116 @@
+<title>DeepSeek-V3 Inference in Five Charts</title>
+<style>
+  :root {
+    --page: #f9f9f7;
+    --surface: #fcfcfb;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --baseline: #c3c2b7;
+    --border: rgba(11, 11, 11, 0.10);
+    --s1: #2a78d6;
+    --s2: #1baf7a;
+    --s3: #eda100;
+    --s4: #008300;
+    --s5: #4a3aa7;
+    --wash: rgba(11, 11, 11, 0.035);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page: #0d0d0d;
+      --surface: #1a1a19;
+      --ink: #ffffff;
+      --ink-2: #c3c2b7;
+      --muted: #898781;
+      --grid: #2c2c2a;
+      --baseline: #383835;
+      --border: rgba(255, 255, 255, 0.10);
+      --s1: #3987e5;
+      --s2: #199e70;
+      --s3: #c98500;
+      --s4: #008300;
+      --s5: #9085e9;
+      --wash: rgba(255, 255, 255, 0.045);
+    }
+  }
+  :root[data-theme="dark"] {
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --baseline: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --s1: #3987e5;
+    --s2: #199e70;
+    --s3: #c98500;
+    --s4: #008300;
+    --s5: #9085e9;
+    --wash: rgba(255, 255, 255, 0.045);
+  }
+  :root[data-theme="light"] {
+    --page: #f9f9f7;
+    --surface: #fcfcfb;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --baseline: #c3c2b7;
+    --border: rgba(11, 11, 11, 0.10);
+    --s1: #2a78d6;
+    --s2: #1baf7a;
+    --s3: #eda100;
+    --s4: #008300;
+    --s5: #4a3aa7;
+    --wash: rgba(11, 11, 11, 0.035);
+  }
+
+  html { background: var(--page); }
+  body {
+    background: var(--page);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    line-height: 1.55;
+    margin: 0;
+  }
+  .wrap { max-width: 920px; margin: 0 auto; padding: 48px 24px 72px; }
+  .prose { max-width: 68ch; }
+
+  .eyebrow {
+    font-size: 12px; font-weight: 600; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--muted); margin: 0 0 10px;
+  }
+  h1 {
+    font-size: clamp(30px, 5vw, 42px); line-height: 1.12; font-weight: 700;
+    letter-spacing: -0.015em; margin: 0 0 16px; text-wrap: balance;
+  }
+  h2 {
+    font-size: 24px; line-height: 1.2; font-weight: 700;
+    letter-spacing: -0.01em; margin: 0 0 12px; text-wrap: balance;
+  }
+  p { margin: 0 0 14px; color: var(--ink-2); }
+  p strong, li strong { color: var(--ink); font-weight: 600; }
+  section { margin-top: 64px; }
+  header.top { margin-bottom: 8px; }
+
+  .callout {
+    border: 1px solid var(--border); border-radius: 10px;
+    background: var(--surface); padding: 14px 18px; margin: 20px 0 0;
+    font-size: 14.5px; color: var(--ink-2); max-width: 68ch;
+  }
+  .callout b { color: var(--ink); }
+
+  .toc { display: flex; flex-wrap: wrap; gap: 8px; margin: 22px 0 0; padding: 0; list-style: none; }
+  .toc a {
+    display: inline-block; padding: 5px 12px; border: 1px solid var(--border);
+    border-radius: 999px; font-size: 13px; color: var(--ink-2);
+    text-decoration: none; background: var(--surface);
+  }
+  .toc a:hover { color: var(--ink); border-color: var(--baseline); }
+
+  figure.card {
+    margin: 22px 0; padding: 18px 18px 12px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 12px;
+  }
+  .figtitle { font-size: 15px; font-weight: 650; color: var(--ink); margin: 0 0 2px; }
+  .figsub { font-size: 13px; color: var(--muted); margin: 0 0 10px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
+  .chip {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11.5px; color: var(--ink-2); border: 1px solid var(--border);
+    border-radius: 6px; padding: 2px 8px; background: var(--page);
+    white-space: nowrap;
+  }
+  .panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 18px; }
+  .panel-label { font-size: 12.5px; font-weight: 600; color: var(--ink-2); margin: 0 0 4px; }
+  .chart { position: relative; }
+  .chart svg { width: 100%; height: auto; display: block; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 10px 0 2px; }
+  .legend .key { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--ink-2); }
+  .key .sw { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+  .key .ln { width: 18px; height: 2.5px; border-radius: 2px; flex: none; }
+  .key .tick-key { width: 14px; height: 0; border-top: 2px solid var(--ink-2); flex: none; }
+
+  figcaption { font-size: 13.5px; color: var(--muted); margin: 12px 0 4px; line-height: 1.5; }
+  .prov {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px; color: var(--muted); border-top: 1px solid var(--grid);
+    margin-top: 12px; padding-top: 8px; overflow-x: auto; white-space: nowrap;
+  }
+
+  details.tbl { margin: 10px 0 0; font-size: 13px; }
+  details.tbl summary {
+    cursor: pointer; color: var(--ink-2); font-weight: 600; font-size: 13px;
+    padding: 4px 0; user-select: none;
+  }
+  details.tbl summary:hover { color: var(--ink); }
+  .tscroll { overflow-x: auto; }
+  table { border-collapse: collapse; margin: 8px 0 4px; min-width: 480px; }
+  th, td {
+    text-align: right; padding: 4px 12px; border-bottom: 1px solid var(--grid);
+    font-variant-numeric: tabular-nums; color: var(--ink-2); white-space: nowrap;
+  }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  th:first-child, td:first-child { text-align: left; }
+  td:first-child { color: var(--ink); }
+
+  .tip {
+    position: absolute; pointer-events: none; z-index: 5; display: none;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 11px; font-size: 12.5px; box-shadow: 0 4px 14px rgba(0,0,0,0.12);
+    min-width: 130px; max-width: 260px;
+  }
+  .tip .t-title { font-weight: 650; color: var(--ink); margin-bottom: 4px; font-size: 12.5px; }
+  .tip .t-row { display: flex; align-items: baseline; gap: 8px; justify-content: space-between; }
+  .tip .t-row .lbl { color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
+  .tip .t-row .lbl i { display: inline-block; width: 10px; height: 2.5px; border-radius: 2px; }
+  .tip .t-row .val { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  svg text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .ax { font-size: 11px; fill: var(--muted); }
+  .ax-name { font-size: 11.5px; fill: var(--muted); font-weight: 600; letter-spacing: 0.02em; }
+  .dlabel { font-size: 11.5px; fill: var(--ink-2); font-weight: 600; }
+  .dlabel-strong { font-size: 12px; fill: var(--ink); font-weight: 650; }
+  .anno { font-size: 11px; fill: var(--muted); }
+  .capval { font-size: 11.5px; fill: var(--ink-2); font-weight: 650; }
+
+  .pct-moe { fill: #ffffff; font-size: 11px; font-weight: 650; }
+  @media (prefers-color-scheme: dark) { .pct-moe { fill: #0b0b0b; } }
+  :root[data-theme="dark"] .pct-moe { fill: #0b0b0b; }
+  :root[data-theme="light"] .pct-moe { fill: #ffffff; }
+
+  [tabindex="0"]:focus { outline: 2px solid var(--s1); outline-offset: 2px; }
+  svg [tabindex="0"]:focus { outline: none; }
+  svg [tabindex="0"]:focus-visible { stroke: var(--ink); stroke-width: 1.5; }
+
+  footer {
+    margin-top: 72px; border-top: 1px solid var(--grid); padding-top: 18px;
+    font-size: 13px; color: var(--muted); max-width: 70ch;
+  }
+  footer p { font-size: 13px; color: var(--muted); }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.92em; background: var(--wash); border-radius: 4px; padding: 1px 5px;
+    color: var(--ink-2);
+  }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <div class="eyebrow">inferencesim · five roofline studies · deepseek-v3 edition</div>
+    <h1>DeepSeek-V3 inference in five charts</h1>
+    <div class="prose">
+      <p>A 671-billion-parameter mixture-of-experts model is what a GB300 NVL72 rack is
+      actually <em>for</em> — and it bends every rule of dense-model serving. The KV cache is
+      compressed a hundredfold but refuses to shard the usual way; the weights don't fit a
+      chip, so parallelism is mandatory before it is fast; and the expert bank turns batch
+      size from a discount lever into the whole business.</p>
+      <p>Every number here comes from <strong>inferencesim</strong>'s roofline engine. The
+      reference deployment is <strong>DeepSeek-V3 on a GB300 NVL72 rack</strong> at
+      <strong>tp=1, ep=8</strong> — TRT-LLM's <em>DEP8</em>: attention runs data-parallel
+      across 8 chips while the 256 experts shard over them — with fp4 weights, fp8 KV,
+      4k-token prompts, 1k-token outputs, batch 256. Each chart varies one axis. (A companion
+      page runs the same five studies on dense Llama-3.1-70B.)</p>
+    </div>
+    <div class="callout"><b>These are speed-of-light numbers.</b> Perfect tiling,
+      100%-efficient bandwidth, bandwidth-optimal collectives, zero kernel overhead, and
+      expert routing with no skew — every value is an optimistic bound. The <em>shapes and
+      crossovers</em> are the lesson, not the absolute values.</div>
+    <ul class="toc">
+      <li><a href="#phases">1 · The two phases, remixed</a></li>
+      <li><a href="#ep">2 · The EP ladder</a></li>
+      <li><a href="#kv">3 · What EP shards</a></li>
+      <li><a href="#econ">4 · Batch economics</a></li>
+      <li><a href="#moe">5 · Expert amortization</a></li>
+    </ul>
+  </header>
+
+  <!-- ============================== 1 · ROOFLINE ============================== -->
+  <section id="phases">
+    <div class="eyebrow">1 · The two phases, remixed</div>
+    <h2>MLA flips the roofline</h2>
+    <div class="prose">
+      <p>For a dense GQA model, the rule is simple: prefill is compute-bound, decode streams
+      from memory. DeepSeek's <strong>multi-head latent attention</strong> breaks it. The KV
+      cache is one shared 576-dim latent per layer instead of per-head keys and values, so
+      attention reads almost nothing from DRAM while still doing 128 heads of math — and
+      even <em>decode</em> attention crosses the ridge into compute-bound territory. The
+      memory burden moves to the <strong>routed experts</strong>, which must stream every
+      expert any token picked.</p>
+    </div>
+    <figure class="card">
+      <div class="figtitle">One deployment, twelve ops — attention computes, experts stream</div>
+      <div class="figsub">Each dot is an op placed on the B300 chip's roofline at its arithmetic intensity</div>
+      <div class="chips">
+        <span class="chip">deepseek-v3 · 671B/37B active</span><span class="chip">GB300 NVL72</span>
+        <span class="chip">tp=1 · ep=8 (DEP8)</span><span class="chip">fp4 weights · fp8 KV</span>
+        <span class="chip">batch 256 · 4k prompt · 1k out</span><span class="chip">roofline (speed of light)</span>
+      </div>
+      <div class="chart" id="c-roofline"></div>
+      <div class="legend" id="l-roofline"></div>
+      <figcaption>Decode attention lands at 484 FLOP/byte — <em>past</em> the bf16 ridge and
+        compute-bound, where a GQA model sits at ~16, deep in memory territory. The routed
+        experts are the mirror image: at batch 256, essentially all 256 experts are activated
+        (coupon-collector), so each chip streams its whole 32-expert shard while computing only
+        top-8 worth of FLOPs — intensity 32, the most memory-bound op in the model, and 67% of
+        the decode step. Not shown on a roofline: the ep=8 dispatch/combine all-to-alls, which
+        at speed of light are ~66% of the 96&nbsp;ms prefill TTFT (vs 8% of decode).</figcaption>
+      <details class="tbl"><summary>Data table</summary><div class="tscroll" id="t-roofline"></div></details>
+      <div class="prov">prefill_ops(deepseek_v3, 4096, dep) + decode_ops(dep, batch=256, ctx=4608) · B300: 8 TB/s HBM · 15 PFLOP/s fp4 · 2.25 PFLOP/s bf16 · MLA latent 576 · 256 experts, top-8</div>
+    </figure>
+    <div class="prose">
+      <p><strong>Why it matters:</strong> MLA buys its hundred-fold KV compression by
+      re-spending FLOPs — a trade that only works on chips with compute to spare, exactly what
+      dense decode leaves idle. And because the memory wall moves from attention to expert
+      streaming, the fix is no longer "more KV bandwidth" but "more batch" (chart 5) and "more
+      expert shards" (chart 2).</p>
+    </div>
+  </section>
+
+  <!-- ============================== 2 · EP LADDER ============================== -->
+  <section id="ep">
+    <div class="eyebrow">2 · The EP ladder</div>
+    <h2>Expert parallelism is mandatory before it is fast</h2>
+    <div class="prose">
+      <p>At fp4, DeepSeek-V3's weights are 335&nbsp;GB — no single 288&nbsp;GB chip can even
+      hold them, so <strong>ep=1 is not a slow option, it is not an option</strong>. From
+      there, every doubling of the EP group shards the expert bank and the MLA-batch further,
+      and unlike dense TP (two ring allreduces per layer), the MoE all-to-all's payload
+      <em>also shrinks</em> with ep — so the ladder never turns against you on latency. What
+      grows instead is the bill.</p>
+    </div>
+    <figure class="card">
+      <div class="figtitle">Decode TPOT by component, ep = 1 → 64</div>
+      <div class="figsub">Stacked time per output token; tick = TPOT if comm overlapped perfectly with compute</div>
+      <div class="chips">
+        <span class="chip">deepseek-v3</span><span class="chip">GB300 NVL72</span>
+        <span class="chip">tp=1 · batch 256 · ctx 4608</span><span class="chip">fp4 · fp8 KV</span>
+        <span class="chip">comm = MoE all-to-all (no allreduce at tp=1)</span>
+      </div>
+      <div class="chart" id="c-ep"></div>
+      <div class="legend" id="l-ep"></div>
+      <figcaption>TPOT falls monotonically, 29.2&nbsp;ms at ep=2 to 1.97&nbsp;ms at ep=64 —
+        no latency wall in range, because expert weights, MLA KV reads, <em>and</em> the
+        all-to-all payload all shard with ep. The catch is under the bars: each rung burns more
+        chips per replica, so the rack's replica count collapses 36 → 1 (with 8 chips stranded
+        idle from ep=16 up, since 72 isn't divisible) and $/M output tokens rises 15×. The
+        latency optimum and the cost optimum sit at opposite ends of the ladder — and note the
+        near-flat blue floor: attention's qkv/out projections shard with <em>tp</em> only, so
+        ep buys them nothing.</figcaption>
+      <details class="tbl"><summary>Data table</summary><div class="tscroll" id="t-ep"></div></details>
+      <div class="prov">simulate(GB300_NVL72, deepseek_v3, Scenario(256, 4096, 1024), Deployment(tp=1, ep=E)) · decode Phase.category_times() · ep=1: "does not fit: 381.5 GB needed vs 288.0 GB per chip"</div>
+    </figure>
+    <div class="prose">
+      <p><strong>Why it matters:</strong> for dense models TP eventually turns latency
+      <em>worse</em> (the KV-head wall); for MoE, EP keeps buying latency all the way up — you
+      stop because of economics, not physics. Real deployments pick the rung by SLA: ep=8
+      here gives 123&nbsp;tok/s/user at $0.42/M with zero idle silicon, which is why DEP8-class
+      configs are common; ep=64 is what a latency-at-any-price product buys.</p>
+    </div>
+  </section>
+
+  <!-- ============================== 3 · WHAT EP SHARDS ============================== -->
+  <section id="kv">
+    <div class="eyebrow">3 · What EP shards</div>
+    <h2>EP divides what TP cannot touch</h2>
+    <div class="prose">
+      <p>Parallelism dimensions aren't interchangeable — each one shards a specific set of
+      bytes. For DeepSeek, TP slices the matmuls but <strong>cannot shard the MLA cache at
+      all</strong>: the compressed latent has no heads to split, so every TP rank keeps a full
+      replica. EP is the opposite: it splits the expert bank (the bulk of 671B) <em>and</em>,
+      because attention runs data-parallel across the EP group, it divides the KV cache by
+      batch-sharding.</p>
+    </div>
+    <figure class="card">
+      <div class="figtitle">Per-chip bytes vs the parallelism dimension doing the sharding</div>
+      <div class="chips">
+        <span class="chip">fp4 weights · fp8 KV</span><span class="chip">context 128k · batch 32</span>
+        <span class="chip">weight_bytes_per_chip() · kv_cache_bytes_per_chip()</span>
+      </div>
+      <div class="panels">
+        <div>
+          <div class="panel-label">A · DeepSeek weights per chip vs ep — why ep ≥ 2 is mandatory</div>
+          <div class="chart" id="c-kvw"></div>
+          <div class="legend" id="l-kvw"></div>
+        </div>
+        <div>
+          <div class="panel-label">B · KV cache per chip — EP divides, TP can't</div>
+          <div class="chart" id="c-kvb"></div>
+          <div class="legend" id="l-kvb"></div>
+        </div>
+      </div>
+      <figcaption>Panel A: at ep=1 the weights alone (335&nbsp;GB) overflow the chip; ep=2 is
+        the first configuration that exists. The curve flattens toward an 8.5&nbsp;GB floor —
+        embeddings, attention, the shared expert, and the 3 dense-prefix layers replicate
+        across EP groups and never shard. Panel B: EP halves the MLA cache on every doubling
+        (147&nbsp;GB → 2.3&nbsp;GB at ep=64) while TP leaves it perfectly flat. The dense
+        contrast (Llama-70B under TP) shards — until its 8 KV heads run out at tp=8.</figcaption>
+      <details class="tbl"><summary>Data table</summary><div class="tscroll" id="t-kv"></div></details>
+      <div class="prov">weight_bytes_per_chip: expert bank ÷ tp·ep·pp, everything else ÷ tp·pp (simulate.py) · MLA kv_cache_bytes_per_chip ÷ pp·ep·adp, tp absent (ops.py:119) · GB = 10⁹ bytes</div>
+    </figure>
+    <div class="prose">
+      <p><strong>Why it matters:</strong> "just add TP" — the dense reflex — does nothing for
+      an MLA model's memory problem. Deployment shape is dictated by which bytes are the
+      constraint: expert weights and KV say <em>ep</em>, the per-layer matmuls say <em>tp</em>,
+      and the replicated floor says even infinite ep leaves ~8.5&nbsp;GB per chip untouched.</p>
+    </div>
+  </section>
+
+  <!-- ============================== 4 · BATCH ECONOMICS ============================== -->
+  <section id="econ">
+    <div class="eyebrow">4 · Batch economics</div>
+    <h2>The discount runs deeper for MoE</h2>
+    <div class="prose">
+      <p>Dense batching amortizes one fixed weight stream, so its discount is spent by
+      batch ≈ 64. MoE keeps a second amortization running: each doubling of batch also spreads
+      the ever-growing union of activated experts over more tokens, so the price keeps falling
+      long after a dense curve has flattened. And with tp=1 there is no allreduce latency
+      floor under any of it.</p>
+    </div>
+    <figure class="card">
+      <div class="figtitle">Cost and interactivity vs batch size</div>
+      <div class="figsub">One DEP8 replica swept batch 1 → 1024 · whole-rack economics (72 chips, 9 replicas)</div>
+      <div class="chips">
+        <span class="chip">deepseek-v3</span><span class="chip">GB300 NVL72 · tp=1 · ep=8</span>
+        <span class="chip">fp4 · fp8 KV</span><span class="chip">4k prompt · 1k out</span>
+        <span class="chip">capex 4y + power · PUE 1.25</span>
+      </div>
+      <div class="chart" id="c-econ1"></div>
+      <div class="chart" id="c-econ2" style="margin-top:6px"></div>
+      <div class="legend" id="l-econ"></div>
+      <figcaption>One user decodes at a startling 809&nbsp;tok/s — MLA's tiny KV read plus
+        zero allreduce make batch-1 decode absurdly fast at speed of light — and costs $4.43/M
+        output tokens. The discount compounds all the way out: $0.64 at batch 64, $0.42 at 256,
+        still easing to $0.36 at 1024 as the expert pool saturates (chart 5). Decode is
+        <strong>memory-bound at every point</strong> — no comm-bound region, unlike dense TP
+        serving. The shaded left edge (batch &lt; 8) is a starved regime: fewer sequences than
+        EP attention groups, so chips idle.</figcaption>
+      <details class="tbl"><summary>Data table</summary><div class="tscroll" id="t-econ"></div></details>
+      <div class="prov">simulate(..., Scenario(batch=B, 4096, 1024), Deployment(tp=1, ep=8)) · usd_per_m_output_tokens · 1/tpot_s · decode bound = memory for all B</div>
+    </figure>
+    <div class="prose">
+      <p><strong>Why it matters:</strong> the marginal value of batch is architecture-dependent.
+      A dense fleet can stop growing batches at the SLA knee; an MoE fleet leaves real money on
+      the table unless it aggregates traffic until the expert pool saturates — which is why MoE
+      serving gravitates to fewer, larger, busier deployments.</p>
+    </div>
+  </section>
+
+  <!-- ============================== 5 · MOE ============================== -->
+  <section id="moe">
+    <div class="eyebrow">5 · Expert amortization</div>
+    <h2>256 experts, and every one of them reads</h2>
+    <div class="prose">
+      <p>Each DeepSeek token activates 8 of 256 experts — but <em>which</em> 8 differs per
+      token, so a decode step streams the union. At batch 1 that's 8 experts' weights for one
+      token; at batch 256, essentially all 256 for 256 tokens. Expert traffic per token
+      therefore falls as E(B)/B, not 1/B — the curve that justifies this page's entire
+      deployment shape.</p>
+    </div>
+    <figure class="card">
+      <div class="figtitle">Expert activation and DRAM traffic vs batch</div>
+      <div class="chips">
+        <span class="chip">deepseek-v3 · 256 experts · top-8</span>
+        <span class="chip">gpt-oss-120b · 128 experts · top-4</span>
+        <span class="chip">tp=1 · ctx 4096 · fp4</span>
+      </div>
+      <div class="panels">
+        <div>
+          <div class="panel-label">A · Expected distinct experts read per decode step</div>
+          <div class="chart" id="c-moea"></div>
+          <div class="legend" id="l-moea"></div>
+        </div>
+        <div>
+          <div class="panel-label">B · Decode DRAM bytes per token (weights only)</div>
+          <div class="chart" id="c-moeb"></div>
+          <div class="legend" id="l-moeb"></div>
+        </div>
+      </div>
+      <figcaption>Panel A: DeepSeek touches 8 experts at batch 1, 222 at batch 64, and
+        effectively all 256 by ≈256 — prefill (4096 tokens) saturates trivially, which is why
+        prefill experts are a bulk stream while decode experts are the pain point. Panel B,
+        log-log: dense weights (yellow) amortize on a clean 1/B slope; expert bytes start
+        nearly flat and bend onto the slope only past saturation — 12.1× cheaper per token from
+        batch 1 to 256, vs 43× for dense over the same range. Sparsity is a batch-1 discount
+        that batch slowly repays.</figcaption>
+      <details class="tbl"><summary>Data table</summary><div class="tscroll" id="t-moe"></div></details>
+      <div class="prov">MoEConfig.expected_active_experts(B) · decode_ops(model, Deployment(tp=1), batch=B, ctx=4096) → Σ dram bytes / B · no routing skew modeled</div>
+    </figure>
+    <div class="prose">
+      <p><strong>Why it matters:</strong> this curve, times chart 2's ladder, is the DeepSeek
+      serving playbook — shard experts wide (ep), aggregate the biggest batch traffic allows,
+      and let attention ride data-parallel on MLA's tiny cache. It's also why MoE benchmarks at
+      batch 1 flatter the architecture: the expert stream is nearly free there and brutal at
+      mid-batch.</p>
+    </div>
+  </section>
+
+  <footer>
+    <p><strong>Provenance.</strong> Generated 2026-07-06 from inferencesim (commit b8ab085)
+    with its analytic roofline engine at speed-of-light efficiency — no kernel overheads,
+    bandwidth-optimal collectives, expected-value expert routing (no skew / EPLB). The ep=1
+    column reports the simulator's own infeasibility warning; idle-chip counts come from rack
+    divisibility (72 chips). Preset spec-sheet numbers are best-effort approximations of
+    public material. A companion page, <code>llama-3.1-70b-gb300-nvl72.html</code>, runs the
+    same five studies on a dense model for contrast.</p>
+    <p>Each chart's <em>data table</em> disclosure carries the exact values; GB and KB are
+    decimal (10⁹, 10³).</p>
+  </footer>
+</div>
+
+<script id="data" type="application/json">{"roofline":{"bw":8000000000000.0,"roofs":{"bf16":2250000000000000.0,"fp4":1.5e+16},"ridges":{"bf16":281.25,"fp4":1875.0},"ops":[{"name":"qkv_proj","phase":"prefill","cat":"linear","dtype":"fp4","x":1904.8662364650552,"flops":570693779456.0,"bytes":299597824.0,"bound":"compute","t_us":2320.821369787733,"count":61},{"name":"attention","phase":"prefill","cat":"attention","dtype":"bf16","x":145635.55555555556,"flops":687194767360.0,"bytes":4718592.0,"bound":"compute","t_us":18630.613692871113,"count":61},{"name":"out_proj","phase":"prefill","cat":"linear","dtype":"fp4","x":3822.9333333333334,"flops":962072674304.0,"bytes":251658240.0,"bound":"compute","t_us":3912.428875502933,"count":61},{"name":"moe_routed","phase":"prefill","cat":"moe","dtype":"fp4","x":468.1142857142857,"flops":360777252864.0,"bytes":770703360.0,"bound":"memory","t_us":5876.613120000001,"count":61},{"name":"moe_shared","phase":"prefill","cat":"moe","dtype":"fp4","x":2586.9473684210525,"flops":360777252864.0,"bytes":139460608.0,"bound":"compute","t_us":1467.1608283136002,"count":61},{"name":"lm_head","phase":"prefill","cat":"head","dtype":"fp4","x":3.9976454815222207,"flops":1853358080.0,"bytes":463612416.0,"bound":"memory","t_us":57.951552,"count":1},{"name":"qkv_proj","phase":"decode","cat":"linear","dtype":"fp4","x":120.82495282495283,"flops":4458545152.0,"bytes":36900864.0,"bound":"memory","t_us":281.369088,"count":61},{"name":"attention","phase":"decode","cat":"attention","dtype":"bf16","x":483.45064005207206,"flops":41070624768.0,"bytes":84953088.0,"bound":"compute","t_us":1113.470271488,"count":61},{"name":"out_proj","phase":"decode","cat":"linear","dtype":"fp4","x":124.79651795429815,"flops":7516192768.0,"bytes":60227584.0,"bound":"memory","t_us":459.235328,"count":61},{"name":"moe_routed","phase":"decode","cat":"moe","dtype":"fp4","x":31.822933421032477,"flops":22548578304.0,"bytes":708563789.6944205,"bound":"memory","t_us":5402.798896419956,"count":61},{"name":"moe_shared","phase":"decode","cat":"moe","dtype":"fp4","x":122.88,"flops":2818572288.0,"bytes":22937600.0,"bound":"memory","t_us":174.8992,"count":61},{"name":"lm_head","phase":"decode","cat":"head","dtype":"fp4","x":125.63217991878666,"flops":59307458560.0,"bytes":472072192.0,"bound":"memory","t_us":59.009024000000004,"count":1}]},"ep":{"rows":[{"ep":2,"cats_ms":{"linear":0.8224010239999999,"attention":4.453881085951999,"moe":21.723131073679824,"comm":2.111964231111111,"head":0.062570496},"tpot_ms":29.173947910742935,"overlap_ms":27.061983679631826,"dp":36,"idle":0,"usd_per_m":0.18857976205779675},{"ep":4,"cats_ms":{"linear":0.767869952,"attention":2.2269405429759996,"moe":10.959509088839912,"comm":1.1169821155555557,"head":0.060243968},"tpot_ms":15.131545667371467,"overlap_ms":14.014563551815911,"dp":18,"idle":0,"usd_per_m":0.2662421169228152},{"ep":8,"cats_ms":{"linear":0.740604416,"attention":1.1134702714879998,"moe":5.577698096419956,"comm":0.6194910577777778,"head":0.059080704000000005},"tpot_ms":8.110344545685733,"overlap_ms":7.490853487907955,"dp":9,"idle":0,"usd_per_m":0.42156682665285206},{"ep":16,"cats_ms":{"linear":0.726971648,"attention":0.5567351357439999,"moe":2.8867926002099775,"comm":0.37074552888888884,"head":0.058499072},"tpot_ms":4.599743984842867,"overlap_ms":4.228998455953978,"dp":4,"idle":8,"usd_per_m":0.8210762758724941},{"ep":32,"cats_ms":{"linear":0.7201552640000001,"attention":0.27836756787199995,"moe":1.541339852104989,"comm":0.24637276444444445,"head":0.058208256},"tpot_ms":2.8444437044214337,"overlap_ms":2.5980709399769895,"dp":2,"idle":8,"usd_per_m":1.5179118538110363},{"ep":64,"cats_ms":{"linear":0.716747072,"attention":0.13918378393599998,"moe":0.8686134780524944,"comm":0.18418638222222222,"head":0.058062848},"tpot_ms":1.9667935642107168,"overlap_ms":1.7826071819884945,"dp":1,"idle":8,"usd_per_m":2.911583009688121}],"ep1":{"weights_gb":335.46,"kv_gb":46.05,"total_gb":381.53,"capacity_gb":288.0}},"kvw":{"weights":[{"ep":1,"gb":335.459483648,"fits":false},{"ep":2,"gb":171.982290944,"fits":true},{"ep":4,"gb":90.243694592,"fits":true},{"ep":8,"gb":49.374396416,"fits":true},{"ep":16,"gb":28.939747328,"fits":true},{"ep":32,"gb":18.722422784,"fits":true},{"ep":64,"gb":13.613760512,"fits":true}],"cap_gb":288.0,"floor_gb":8.50509824},"kvb":{"ds_ep":[{"chips":1,"gb":147.371065344},{"chips":2,"gb":73.685532672},{"chips":4,"gb":36.842766336},{"chips":8,"gb":18.421383168},{"chips":16,"gb":9.210691584},{"chips":32,"gb":4.605345792},{"chips":64,"gb":2.302672896}],"ds_tp":[{"chips":1,"gb":147.371065344},{"chips":2,"gb":147.371065344},{"chips":4,"gb":147.371065344},{"chips":8,"gb":147.371065344},{"chips":16,"gb":147.371065344},{"chips":32,"gb":147.371065344}],"llama_tp":[{"chips":1,"gb":687.19476736},{"chips":2,"gb":343.59738368},{"chips":4,"gb":171.79869184},{"chips":8,"gb":85.89934592},{"chips":16,"gb":85.89934592},{"chips":32,"gb":85.89934592}]},"econ":{"points":[{"b":1,"usd":4.432640722838351,"user":809.3122997325626,"tpot_ms":1.2356169556924443,"sys":6769.763631568193,"bound":"memory","joules":8.086024543727337,"warn":true},{"b":2,"usd":2.656800853933091,"user":711.8312269729042,"tpot_ms":1.404827383384889,"sys":11303.15961836249,"bound":"memory","joules":4.890315345505115,"warn":true},{"b":4,"usd":1.7562804472485631,"user":578.6507749828561,"tpot_ms":1.7281580587697778,"sys":17114.7120079029,"bound":"memory","joules":3.2689871330606706,"warn":true},{"b":8,"usd":1.282605021465541,"user":431.26948565115515,"tpot_ms":2.3187358096762707,"sys":23457.914265603562,"bound":"memory","joules":2.4147024491670046,"warn":false},{"b":16,"usd":1.0052916054854522,"user":302.48048759244585,"tpot_ms":3.305998373512851,"sys":29955.192436253095,"bound":"memory","joules":1.9121572980071253,"warn":false},{"b":32,"usd":0.8058862389395961,"user":212.83350415176122,"tpot_ms":4.698508366835649,"sys":37398.36464646284,"bound":"memory","joules":1.5477151129701705,"warn":false},{"b":64,"usd":0.6365488119376579,"user":162.6220366054476,"tpot_ms":6.149228117381119,"sys":47391.98313258388,"bound":"memory","joules":1.235770386386403,"warn":false},{"b":96,"usd":0.552558738918194,"user":146.88025063422896,"tpot_ms":6.808267249558738,"sys":54630.446922929885,"bound":"memory","joules":1.0804761781864902,"warn":false},{"b":128,"usd":0.5030842925509479,"user":139.26268877591824,"tpot_ms":7.180674226454569,"sys":60030.86990338439,"bound":"memory","joules":0.9888955665381137,"warn":false},{"b":192,"usd":0.44934561218134195,"user":130.20219779698448,"tpot_ms":7.6803619057124735,"sys":67251.6401340787,"bound":"memory","joules":0.8893710478446614,"warn":false},{"b":256,"usd":0.42156682665285206,"user":123.29932401354591,"tpot_ms":8.110344545685733,"sys":71710.35846891416,"bound":"memory","joules":0.8379145687931002,"warn":false},{"b":384,"usd":0.39361867142655177,"user":111.72138736440657,"tpot_ms":8.95083764703222,"sys":76835.523453283,"bound":"memory","joules":0.7861425683290383,"warn":false},{"b":512,"usd":0.379634597590381,"user":102.14714927688952,"tpot_ms":9.789798414141812,"sys":79685.12154294863,"bound":"memory","joules":0.7602379459795454,"warn":false},{"b":768,"usd":0.3656502927661305,"user":87.20169624133753,"tpot_ms":11.46766683565904,"sys":82754.2791207755,"bound":"memory","joules":0.7343328933188094,"warn":false},{"b":1024,"usd":0.3586581388271308,"user":76.07145818304693,"tpot_ms":13.14553478906307,"sys":84379.2581064344,"bound":"memory","joules":0.7213803641440037,"warn":false}]},"moe":{"experts":{"gpt-oss-120b":{"n":128,"topk":4,"pts":[{"b":1,"e":4.0},{"b":2,"e":7.875},{"b":4,"e":15.2655029296875},{"b":8,"e":28.710415392997675},{"b":16,"e":50.98108116069474},{"b":32,"e":81.65692297519148},{"b":64,"e":111.2212438427552},{"b":128,"e":125.80057298293531},{"b":256,"e":127.96220719372349},{"b":512,"e":127.9999888414359},{"b":1024,"e":127.99999999999903}]},"deepseek-v3":{"n":256,"topk":8,"pts":[{"b":1,"e":8.0},{"b":2,"e":15.75},{"b":4,"e":30.531005859375},{"b":8,"e":57.42083078599535},{"b":16,"e":101.96216232138948},{"b":32,"e":163.31384595038296},{"b":64,"e":222.4424876855104},{"b":128,"e":251.60114596587061},{"b":256,"e":255.92441438744697},{"b":512,"e":255.9999776828718},{"b":1024,"e":255.99999999999807}]}},"bytes":{"gpt-oss-120b":[{"b":1,"v":1792005120.0},{"b":2,"v":1764011520.0},{"b":4,"v":1709760251.25},{"b":8,"v":1607830488.6908393},{"b":16,"v":1427558713.5800242},{"b":32,"v":1143350339.49916},{"b":64,"v":778785472.9091381},{"b":128,"v":440616084.9818872},{"b":256,"v":224297397.7061386},{"b":512,"v":112389110.23848812},{"b":1024,"v":56401919.99999958}],"deepseek-v3":[{"b":1,"v":12092530688.0},{"b":2,"v":11253014528.0},{"b":4,"v":10591813568.0},{"b":8,"v":9812544289.09372},{"b":16,"v":8647337897.734959},{"b":32,"v":6900704433.354853},{"b":64,"v":4693087465.064674},{"b":128,"v":2654282284.91084},{"b":256,"v":1351574220.104989},{"b":512,"v":677734341.451282},{"b":1024,"v":340616191.99999744}],"llama-dense":[{"b":1,"v":34759342592.0},{"b":2,"v":17383913984.0},{"b":4,"v":8696199680.0},{"b":8,"v":4352342528.0},{"b":16,"v":2180413952.0},{"b":32,"v":1094449664.0},{"b":64,"v":551467520.0},{"b":128,"v":279976448.0},{"b":256,"v":144230912.0},{"b":512,"v":76358144.0},{"b":1024,"v":42421760.0}]}}}</script>
+<script>
+"use strict";
+const DATA = JSON.parse(document.getElementById("data").textContent);
+const NS = "http://www.w3.org/2000/svg";
+
+/* ---------- tiny helpers ---------- */
+function E(tag, attrs, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function D(cls, parent, text) {
+  const e = document.createElement("div");
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  if (parent) parent.appendChild(e);
+  return e;
+}
+const log10 = Math.log10;
+function logScale(d0, d1, r0, r1) {
+  const l0 = log10(d0), k = (r1 - r0) / (log10(d1) - l0);
+  return (v) => r0 + (log10(v) - l0) * k;
+}
+function linScale(d0, d1, r0, r1) {
+  const k = (r1 - r0) / (d1 - d0);
+  return (v) => r0 + (v - d0) * k;
+}
+function fmtSI(v, digits) {
+  const units = [[1e15, "P"], [1e12, "T"], [1e9, "G"], [1e6, "M"], [1e3, "k"]];
+  for (const [f, s] of units) if (Math.abs(v) >= f) return trim(v / f, digits) + s;
+  return trim(v, digits);
+}
+function trim(v, digits) {
+  const d = digits === undefined ? 3 : digits;
+  return parseFloat(v.toPrecision(d)).toString();
+}
+function fmtBytes(v) { return fmtSI(v) + "B"; }
+function fmtMs(v) { return v >= 10 ? v.toFixed(1) : v.toFixed(2); }
+function fmtUSD(v) { return "$" + (v >= 1 ? v.toFixed(2) : v.toFixed(3)); }
+
+/* ---------- tooltip ---------- */
+function makeTip(chartDiv) {
+  const tip = D("tip", chartDiv);
+  function show(px, py, title, rows) {
+    tip.replaceChildren();
+    if (title) D("t-title", tip, title);
+    for (const r of rows) {
+      const row = D("t-row", tip);
+      const lbl = document.createElement("span");
+      lbl.className = "lbl";
+      if (r.color) {
+        const i = document.createElement("i");
+        i.style.background = r.color;
+        lbl.appendChild(i);
+      }
+      lbl.appendChild(document.createTextNode(r.k));
+      const val = document.createElement("span");
+      val.className = "val";
+      val.textContent = r.v;
+      row.appendChild(lbl); row.appendChild(val);
+    }
+    tip.style.display = "block";
+    const bw = chartDiv.clientWidth, tw = tip.offsetWidth, th = tip.offsetHeight;
+    let x = px + 14, y = py - th - 10;
+    if (x + tw > bw - 4) x = px - tw - 14;
+    if (x < 4) x = 4;
+    if (y < 4) y = py + 14;
+    tip.style.left = x + "px"; tip.style.top = y + "px";
+  }
+  function hide() { tip.style.display = "none"; }
+  return { show, hide };
+}
+function toLocal(svg, x, y, vbW, vbH) {
+  const r = svg.getBoundingClientRect();
+  const host = svg.parentNode.getBoundingClientRect();
+  return [r.left - host.left + (x / vbW) * r.width, r.top - host.top + (y / vbH) * r.height];
+}
+
+/* ---------- axis helpers ---------- */
+function yGrid(g, ticks, scale, x0, x1, fmt) {
+  for (const t of ticks) {
+    const y = scale(t);
+    E("line", { x1: x0, x2: x1, y1: y, y2: y, stroke: "var(--grid)", "stroke-width": 1 }, g);
+    E("text", { x: x0 - 8, y: y + 3.5, "text-anchor": "end", class: "ax" }, g).textContent = fmt(t);
+  }
+}
+function xTicks(g, ticks, scale, yBase, fmt, yLabelOff) {
+  for (const t of ticks) {
+    const x = scale(t);
+    E("line", { x1: x, x2: x, y1: yBase, y2: yBase + 4, stroke: "var(--baseline)", "stroke-width": 1 }, g);
+    E("text", { x, y: yBase + (yLabelOff || 16), "text-anchor": "middle", class: "ax" }, g).textContent = fmt(t);
+  }
+}
+function baseline(g, x0, x1, y) {
+  E("line", { x1: x0, x2: x1, y1: y, y2: y, stroke: "var(--baseline)", "stroke-width": 1 }, g);
+}
+function legend(id, keys) {
+  const el = document.getElementById(id);
+  for (const k of keys) {
+    const key = document.createElement("span");
+    key.className = "key";
+    const sw = document.createElement("span");
+    sw.className = k.line ? "ln" : (k.tick ? "tick-key" : "sw");
+    if (!k.tick) sw.style.background = k.color;
+    key.appendChild(sw);
+    key.appendChild(document.createTextNode(k.label));
+    el.appendChild(key);
+  }
+}
+function table(id, headers, rows) {
+  const host = document.getElementById(id);
+  const t = document.createElement("table");
+  const tr = document.createElement("tr");
+  for (const h of headers) { const th = document.createElement("th"); th.textContent = h; tr.appendChild(th); }
+  t.appendChild(tr);
+  for (const r of rows) {
+    const tr2 = document.createElement("tr");
+    for (const c of r) { const td = document.createElement("td"); td.textContent = c; tr2.appendChild(td); }
+    t.appendChild(tr2);
+  }
+  host.appendChild(t);
+}
+const S1 = "var(--s1)", S2 = "var(--s2)", S3 = "var(--s3)", S4 = "var(--s4)", S5 = "var(--s5)";
+function cssHex(v) { /* resolve var(--sN) to current hex for tooltip swatches */
+  return getComputedStyle(document.documentElement).getPropertyValue(v.slice(4, -1)).trim();
+}
+
+/* ============================== 1 · ROOFLINE ============================== */
+(function roofline() {
+  const R = DATA.roofline;
+  const W = 860, H = 470, m = { t: 30, r: 150, b: 52, l: 64 };
+  const host = document.getElementById("c-roofline");
+  const svg = E("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Roofline scatter for DeepSeek-V3 ops, prefill vs decode" }, host);
+  const tip = makeTip(host);
+  const x = logScale(1, 262144, m.l, W - m.r);
+  const y = logScale(1e13, 4e16, H - m.b, m.t);
+
+  yGrid(svg, [1e13, 1e14, 1e15, 1e16], y, m.l, W - m.r, (v) => fmtSI(v, 2) + "F/s");
+  xTicks(svg, [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144], x, H - m.b, (v) => fmtSI(v, 3));
+  baseline(svg, m.l, W - m.r, H - m.b);
+  E("text", { x: (m.l + W - m.r) / 2, y: H - 12, "text-anchor": "middle", class: "ax-name" }, svg)
+    .textContent = "arithmetic intensity — FLOPs per DRAM byte (log)";
+  E("text", { x: 16, y: (m.t + H - m.b) / 2, "text-anchor": "middle", class: "ax-name",
+    transform: `rotate(-90 16 ${(m.t + H - m.b) / 2})` }, svg).textContent = "attainable FLOP/s (log)";
+
+  const bw = R.bw;
+  /* memory slope from bottom of domain up to fp4 ridge */
+  const ridgeMax = R.ridges.fp4;
+  E("line", { x1: x(1e13 / bw), y1: y(1e13), x2: x(ridgeMax), y2: y(bw * ridgeMax),
+    stroke: "var(--baseline)", "stroke-width": 1.5 }, svg);
+  const roofs = [
+    { d: "bf16", peak: R.roofs.bf16, label: "bf16 roof · " + fmtSI(R.roofs.bf16, 3) + "FLOP/s" },
+    { d: "fp4", peak: R.roofs.fp4, label: "fp4 roof · " + fmtSI(R.roofs.fp4, 2) + "FLOP/s" },
+  ];
+  for (const r of roofs) {
+    const rx = r.peak / bw;
+    E("line", { x1: x(rx), y1: y(r.peak), x2: x(262144), y2: y(r.peak),
+      stroke: "var(--baseline)", "stroke-width": 1.5 }, svg);
+    E("circle", { cx: x(rx), cy: y(r.peak), r: 3, fill: "var(--muted)" }, svg);
+    E("text", { x: x(262144) + 8, y: y(r.peak) + 3.5, class: "anno" }, svg).textContent = r.label;
+    E("text", { x: x(rx) - 8, y: y(r.peak) - 8, "text-anchor": "end", class: "anno" }, svg)
+      .textContent = "ridge " + trim(rx, 4) + " F/B";
+  }
+  const ang = Math.atan2(y(bw * 100) - y(bw * 10), x(100) - x(10)) * 180 / Math.PI;
+  const sx = x(30), sy = y(bw * 30) + 22;
+  E("text", { x: sx, y: sy, class: "anno", transform: `rotate(${ang} ${sx} ${sy})` }, svg)
+    .textContent = "HBM slope · 8 TB/s";
+
+  const phaseColor = { prefill: S1, decode: S2 };
+  const labelled = {
+    "prefill/attention": ["attention (MLA)", -10, -12, "end"],
+    "prefill/qkv_proj": ["qkv", 0, -14, "middle"],
+    "prefill/moe_shared": ["shared expert", 0, 24, "middle"],
+    "prefill/out_proj": ["out proj", 6, -14, "start"],
+    "prefill/moe_routed": ["routed experts", 0, -14, "middle"],
+    "prefill/lm_head": ["lm_head", 0, -14, "middle"],
+    "decode/attention": ["attention (MLA)", 10, -12, "start"],
+    "decode/moe_routed": ["routed experts", 8, 22, "start"],
+    "decode/qkv_proj": ["qkv · out · shared · lm_head", 8, 22, "start"],
+  };
+  for (const o of R.ops) {
+    const py = Math.min(R.roofs[o.dtype], bw * o.x);
+    const cx = x(o.x), cy = y(py);
+    const c = phaseColor[o.phase];
+    E("circle", { cx, cy, r: 8, fill: "var(--surface)" }, svg);
+    const dot = E("circle", { cx, cy, r: 6, fill: c, tabindex: 0, role: "img",
+      "aria-label": `${o.phase} ${o.name}: ${trim(o.x, 3)} FLOP per byte, ${o.bound}-bound` }, svg);
+    const hit = E("circle", { cx, cy, r: 14, fill: "transparent" }, svg);
+    const showTip = () => {
+      const [lx, ly] = toLocal(svg, cx, cy, W, H);
+      tip.show(lx, ly, `${o.phase} · ${o.name}`, [
+        { k: "intensity", v: trim(o.x, 4) + " F/B" },
+        { k: "FLOPs/chip", v: fmtSI(o.flops, 3) },
+        { k: "DRAM bytes", v: fmtBytes(o.bytes) },
+        { k: "time (×" + o.count + ")", v: trim(o.t_us, 3) + " µs" },
+        { k: "bound", v: o.bound },
+      ]);
+    };
+    for (const el of [dot, hit]) {
+      el.addEventListener("pointerenter", showTip);
+      el.addEventListener("pointerleave", tip.hide);
+    }
+    dot.addEventListener("focus", showTip);
+    dot.addEventListener("blur", tip.hide);
+    const key = o.phase + "/" + o.name;
+    if (labelled[key]) {
+      const [txt, dx, dy, anchor] = labelled[key];
+      E("text", { x: cx + dx, y: cy + dy, "text-anchor": anchor, class: "dlabel" }, svg).textContent = txt;
+    }
+  }
+  legend("l-roofline", [
+    { label: "prefill ops (4096-token prompt)", color: "#2a78d6" },
+    { label: "decode ops (batch 256)", color: "#1baf7a" },
+  ]);
+  document.querySelectorAll("#l-roofline .sw").forEach((el, i) => { el.style.background = i === 0 ? S1 : S2; });
+
+  table("t-roofline",
+    ["op", "phase", "dtype", "FLOP/byte", "FLOPs/chip", "DRAM bytes/chip", "bound"],
+    R.ops.map((o) => [o.name, o.phase, o.dtype, trim(o.x, 5), fmtSI(o.flops, 3), fmtBytes(o.bytes), o.bound]));
+})();
+
+/* ============================== 2 · EP WATERFALL ============================== */
+(function epWaterfall() {
+  const rows = DATA.ep.rows;
+  const ep1 = DATA.ep.ep1;
+  const W = 860, H = 470, m = { t: 34, r: 24, b: 82, l: 64 };
+  const host = document.getElementById("c-ep");
+  const svg = E("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": "Stacked decode TPOT by category across expert parallelism 1 to 64" }, host);
+  const tip = makeTip(host);
+  const y = linScale(0, 30, H - m.b, m.t);
+  const plotW = W - m.l - m.r;
+  const slots = [{ ep: 1, infeasible: true }].concat(rows);
+  const bandW = plotW / slots.length;
+  const cats = [
+    { k: "moe", label: "routed experts (weight stream)", c: S5 },
+    { k: "attention", label: "attention (MLA read)", c: S2 },
+    { k: "linear", label: "qkv/out proj", c: S1 },
+    { k: "comm", label: "comm (all-to-all)", c: S3 },
+    { k: "head", label: "lm head", c: S4 },
+  ];
+
+  yGrid(svg, [0, 5, 10, 15, 20, 25, 30], y, m.l, W - m.r, (v) => v + " ms");
+  baseline(svg, m.l, W - m.r, y(0));
+  E("text", { x: 16, y: (m.t + H - m.b) / 2, "text-anchor": "middle", class: "ax-name",
+    transform: `rotate(-90 16 ${(m.t + H - m.b) / 2})` }, svg).textContent = "decode TPOT (ms)";
+
+  slots.forEach((r, i) => {
+    const cx = m.l + (i + 0.5) * bandW;
+    E("text", { x: cx, y: H - m.b + 18, "text-anchor": "middle", class: "ax" }, svg).textContent = "ep=" + r.ep;
+    if (r.infeasible) {
+      E("text", { x: cx, y: y(15) - 10, "text-anchor": "middle", class: "anno" }, svg).textContent = "✕ doesn't fit";
+      E("text", { x: cx, y: y(15) + 6, "text-anchor": "middle", class: "anno" }, svg).textContent = ep1.weights_gb.toFixed(0) + " GB weights";
+      E("text", { x: cx, y: y(15) + 22, "text-anchor": "middle", class: "anno" }, svg).textContent = "> " + ep1.capacity_gb.toFixed(0) + " GB HBM";
+      return;
+    }
+    const barW = 24, x0 = cx - barW / 2;
+    let acc = 0;
+    for (const cat of cats) {
+      const v = r.cats_ms[cat.k] || 0;
+      if (v <= 0) continue;
+      const yTop = y(acc + v), yBot = y(acc);
+      const hpx = yBot - yTop;
+      const inset = hpx > 5 ? 1 : 0;
+      const isTop = acc + v >= r.tpot_ms - 1e-9;
+      const segH = Math.max(hpx - 2 * inset, 0.75);
+      const rect = E("rect", {
+        x: x0, y: yTop + inset, width: barW, height: segH,
+        fill: cat.c, rx: isTop ? Math.min(4, segH / 2) : 0, tabindex: 0, role: "img",
+        "aria-label": `ep=${r.ep} ${cat.k}: ${fmtMs(v)} ms, ${Math.round(v / r.tpot_ms * 100)}%`,
+      }, svg);
+      if (isTop && hpx > 8) {
+        E("rect", { x: x0, y: yTop + inset + 4, width: barW, height: Math.max(segH - 4, 0.5),
+          fill: cat.c, "pointer-events": "none" }, svg);
+      }
+      const showTip = () => {
+        const [lx, ly] = toLocal(svg, cx, (yTop + yBot) / 2, W, H);
+        tip.show(lx, ly, `ep=${r.ep}`, [
+          { k: cat.k, v: fmtMs(v) + " ms", color: cssHex(cat.c) },
+          { k: "share of step", v: Math.round(v / r.tpot_ms * 100) + "%" },
+          { k: "TPOT total", v: fmtMs(r.tpot_ms) + " ms" },
+          { k: "with overlap", v: fmtMs(r.overlap_ms) + " ms" },
+          { k: "replicas (rack)", v: r.dp + (r.idle ? " · " + r.idle + " idle" : "") },
+          { k: "$ / M out tok", v: fmtUSD(r.usd_per_m) },
+        ]);
+      };
+      rect.addEventListener("pointerenter", showTip);
+      rect.addEventListener("pointerleave", tip.hide);
+      rect.addEventListener("focus", showTip);
+      rect.addEventListener("blur", tip.hide);
+      /* in-segment % on the dominant moe segment, dodging the overlap tick */
+      if (cat.k === "moe" && hpx > 26) {
+        const tickY = y(r.overlap_ms);
+        const candidates = [(yTop + yBot) / 2 + 4, yTop + 16, yBot - 8];
+        const ly = candidates.find((cnd) => Math.abs(cnd - 4 - tickY) > 13 && cnd > yTop + 12 && cnd < yBot - 4);
+        if (ly !== undefined) {
+          const t = E("text", { x: cx, y: ly, "text-anchor": "middle", class: "pct-moe" }, svg);
+          t.textContent = Math.round(v / r.tpot_ms * 100) + "%";
+        }
+      }
+      acc += v;
+    }
+    E("line", { x1: x0 - 5, x2: x0 + barW + 5, y1: y(r.overlap_ms), y2: y(r.overlap_ms),
+      stroke: "var(--ink)", "stroke-width": 2 }, svg);
+    E("text", { x: cx, y: y(r.tpot_ms) - 7, "text-anchor": "middle", class: "capval" }, svg)
+      .textContent = fmtMs(r.tpot_ms);
+    E("text", { x: cx, y: H - m.b + 34, "text-anchor": "middle", class: "ax" }, svg)
+      .textContent = r.dp + (r.dp === 1 ? " replica" : " replicas");
+    E("text", { x: cx, y: H - m.b + 50, "text-anchor": "middle", class: "ax" }, svg)
+      .textContent = fmtUSD(r.usd_per_m) + "/M tok";
+  });
+
+  legend("l-ep", [
+    { label: "routed experts (weight stream)", color: "#4a3aa7" },
+    { label: "attention (MLA read)", color: "#1baf7a" },
+    { label: "qkv/out proj", color: "#2a78d6" },
+    { label: "comm (all-to-all)", color: "#eda100" },
+    { label: "lm head", color: "#008300" },
+    { label: "TPOT with perfect comm overlap", tick: true },
+  ]);
+  document.querySelectorAll("#l-ep .sw").forEach((el, i) => {
+    el.style.background = [S5, S2, S1, S3, S4][i];
+  });
+
+  table("t-ep",
+    ["ep", "experts ms", "attention ms", "qkv/out ms", "comm ms", "head ms", "TPOT ms", "overlap ms", "replicas", "$/M out"],
+    [["1 (infeasible)", "—", "—", "—", "—", "—", "—", "—", "—", "weights 335 GB > 288 GB"]].concat(
+      rows.map((r) => [r.ep, fmtMs(r.cats_ms.moe), fmtMs(r.cats_ms.attention), fmtMs(r.cats_ms.linear),
+        fmtMs(r.cats_ms.comm), r.cats_ms.head.toFixed(3), fmtMs(r.tpot_ms), fmtMs(r.overlap_ms),
+        r.dp + (r.idle ? " (+" + r.idle + " idle)" : ""), fmtUSD(r.usd_per_m)])));
+})();
+
+/* ============================== 3A · WEIGHTS VS EP ============================== */
+(function kvWeights() {
+  const Wt = DATA.kvw;
+  const W = 430, H = 300, m = { t: 24, r: 30, b: 44, l: 52 };
+  const host = document.getElementById("c-kvw");
+  const svg = E("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": "DeepSeek per-chip weight bytes vs expert parallelism, with chip capacity line" }, host);
+  const tip = makeTip(host);
+  const x = logScale(1, 64, m.l, W - m.r);
+  const y = logScale(5, 500, H - m.b, m.t);
+
+  yGrid(svg, [10, 30, 100, 300], y, m.l, W - m.r, (v) => v + " GB");
+  xTicks(svg, [1, 2, 4, 8, 16, 32, 64], x, H - m.b, (v) => v);
+  baseline(svg, m.l, W - m.r, H - m.b);
+  E("text", { x: (m.l + W - m.r) / 2, y: H - 8, "text-anchor": "middle", class: "ax-name" }, svg)
+    .textContent = "ep (log)";
+
+  /* capacity + floor reference lines */
+  E("line", { x1: m.l, x2: W - m.r, y1: y(Wt.cap_gb), y2: y(Wt.cap_gb), stroke: "var(--baseline)", "stroke-width": 1.5 }, svg);
+  E("text", { x: W - m.r, y: y(Wt.cap_gb) + 14, "text-anchor": "end", class: "anno" }, svg)
+    .textContent = "B300 HBM · " + Wt.cap_gb.toFixed(0) + " GB";
+  E("line", { x1: m.l, x2: W - m.r, y1: y(Wt.floor_gb), y2: y(Wt.floor_gb), stroke: "var(--grid)", "stroke-width": 1 }, svg);
+  E("text", { x: W - m.r, y: y(Wt.floor_gb) - 6, "text-anchor": "end", class: "anno" }, svg)
+    .textContent = "replicated floor · " + trim(Wt.floor_gb, 2) + " GB";
+
+  const pts = Wt.weights;
+  const d = pts.map((p, i) => (i ? "L" : "M") + x(p.ep).toFixed(1) + " " + y(p.gb).toFixed(1)).join(" ");
+  E("path", { d, fill: "none", stroke: S1, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+  for (const p of pts) {
+    const cx = x(p.ep), cy = y(p.gb);
+    E("circle", { cx, cy, r: 6, fill: "var(--surface)" }, svg);
+    const dot = E("circle", { cx, cy, r: 4, fill: S1, tabindex: 0, role: "img",
+      "aria-label": `ep=${p.ep}: ${trim(p.gb, 3)} GB weights per chip${p.fits ? "" : ", does not fit"}` }, svg);
+    const hit = E("circle", { cx, cy, r: 13, fill: "transparent" }, svg);
+    const showTip = () => {
+      const [lx, ly] = toLocal(svg, cx, cy, W, H);
+      tip.show(lx, ly, "ep=" + p.ep, [
+        { k: "weights / chip", v: trim(p.gb, 4) + " GB" },
+        { k: "fits 288 GB", v: p.fits ? "yes" : "NO" },
+      ]);
+    };
+    for (const t of [dot, hit]) {
+      t.addEventListener("pointerenter", showTip);
+      t.addEventListener("pointerleave", tip.hide);
+    }
+    dot.addEventListener("focus", showTip);
+    dot.addEventListener("blur", tip.hide);
+  }
+  const p1 = pts[0];
+  E("text", { x: x(p1.ep) + 10, y: y(p1.gb) + 4, class: "dlabel" }, svg)
+    .textContent = "✕ 335 GB — doesn't fit";
+  legend("l-kvw", [{ label: "DeepSeek-V3 weights per chip, fp4 (tp=1)", color: "#2a78d6", line: true }]);
+  document.querySelectorAll("#l-kvw .ln").forEach((el) => { el.style.background = S1; });
+})();
+
+/* ============================== 3B · KV SHARDING ============================== */
+(function kvB() {
+  const B = DATA.kvb;
+  const W = 430, H = 300, m = { t: 26, r: 118, b: 44, l: 52 };
+  const host = document.getElementById("c-kvb");
+  const svg = E("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": "Per-chip KV cache vs chips sharding it: EP divides MLA, TP leaves it flat" }, host);
+  const tip = makeTip(host);
+  const x = logScale(1, 64, m.l, W - m.r);
+  const y = logScale(1.5, 900, H - m.b, m.t);
+
+  yGrid(svg, [3, 10, 30, 100, 300], y, m.l, W - m.r, (v) => v + " GB");
+  xTicks(svg, [1, 2, 4, 8, 16, 32, 64], x, H - m.b, (v) => v);
+  baseline(svg, m.l, W - m.r, H - m.b);
+  E("text", { x: (m.l + W - m.r) / 2, y: H - 8, "text-anchor": "middle", class: "ax-name" }, svg)
+    .textContent = "chips in the sharding group (log)";
+
+  const series = [
+    { pts: B.ds_ep.map((p) => [p.chips, p.gb, "ep=" + p.chips]), c: S1, label: "DeepSeek MLA · EP", end: "EP shards it" },
+    { pts: B.ds_tp.map((p) => [p.chips, p.gb, "tp=" + p.chips]), c: S2, label: "DeepSeek MLA · TP", end: "TP: flat" },
+    { pts: B.llama_tp.map((p) => [p.chips, p.gb, "tp=" + p.chips]), c: S3, label: "Llama-70B GQA · TP", end: "GQA · walls at 8" },
+  ];
+  for (const s of series) {
+    const d = s.pts.map((p, i) => (i ? "L" : "M") + x(p[0]).toFixed(1) + " " + y(p[1]).toFixed(1)).join(" ");
+    E("path", { d, fill: "none", stroke: s.c, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+    for (const p of s.pts) {
+      const cx = x(p[0]), cy = y(p[1]);
+      E("circle", { cx, cy, r: 6, fill: "var(--surface)" }, svg);
+      const dot = E("circle", { cx, cy, r: 4, fill: s.c, tabindex: 0, role: "img",
+        "aria-label": `${s.label}, ${p[2]}: ${trim(p[1], 3)} GB per chip` }, svg);
+      const hit = E("circle", { cx, cy, r: 13, fill: "transparent" }, svg);
+      const showTip = () => {
+        const [lx, ly] = toLocal(svg, cx, cy, W, H);
+        tip.show(lx, ly, s.label, [{ k: p[2], v: trim(p[1], 3) + " GB/chip" }]);
+      };
+      for (const t of [dot, hit]) {
+        t.addEventListener("pointerenter", showTip);
+        t.addEventListener("pointerleave", tip.hide);
+      }
+      dot.addEventListener("focus", showTip);
+      dot.addEventListener("blur", tip.hide);
+    }
+    const last = s.pts[s.pts.length - 1];
+    E("text", { x: x(last[0]) + 10, y: y(last[1]) + 3.5, class: "dlabel" }, svg).textContent = s.end;
+  }
+  legend("l-kvb", [
+    { label: "DeepSeek MLA under EP", color: "#2a78d6", line: true },
+    { label: "DeepSeek MLA under TP", color: "#1baf7a", line: true },
+    { label: "Llama-70B GQA under TP", color: "#eda100", line: true },
+  ]);
+  document.querySelectorAll("#l-kvb .ln").forEach((el, i) => { el.style.background = [S1, S2, S3][i]; });
+
+  const wt = DATA.kvw.weights;
+  const kv = DATA.kvb.ds_ep;
+  table("t-kv",
+    ["ep", "weights GB/chip (fp4)", "fits 288 GB", "MLA KV GB/chip (128k × 32)"],
+    wt.map((p, i) => [p.ep, trim(p.gb, 4), p.fits ? "yes" : "NO", trim(kv[i].gb, 4)]));
+  table("t-kv",
+    ["chips under TP", "DeepSeek MLA KV GB/chip", "Llama-70B GQA KV GB/chip"],
+    DATA.kvb.ds_tp.map((p, i) => [p.chips, trim(p.gb, 4), trim(DATA.kvb.llama_tp[i].gb, 4)]));
+})();
+
+/* ============================== 4 · BATCH ECONOMICS ============================== */
+(function econ() {
+  const pts = DATA.econ.points;
+  const W = 860, PH = 240, m = { t: 30, r: 26, b: 40, l: 64 };
+  const host1 = document.getElementById("c-econ1");
+  const host2 = document.getElementById("c-econ2");
+  const x = logScale(1, 1024, m.l, W - m.r);
+
+  function panel(host, yScale, yTicks_, yFmt, val, name, labelPts, valueFmt, isTop) {
+    const svg = E("svg", { viewBox: `0 0 ${W} ${PH}`, role: "img", "aria-label": name }, host);
+    const tip = makeTip(host);
+    /* starved region wash: batch < ep group count (8) */
+    E("rect", { x: x(1), y: m.t, width: x(8) - x(1), height: PH - m.t - m.b, fill: "var(--wash)" }, svg);
+    yGrid(svg, yTicks_, yScale, m.l, W - m.r, yFmt);
+    baseline(svg, m.l, W - m.r, PH - m.b);
+    xTicks(svg, [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024], x, PH - m.b, (v) => v >= 1024 ? "1k" : v);
+    E("text", { x: 16, y: (m.t + PH - m.b) / 2, "text-anchor": "middle", class: "ax-name",
+      transform: `rotate(-90 16 ${(m.t + PH - m.b) / 2})` }, svg).textContent = name;
+    if (isTop) {
+      E("text", { x: x(8) - 4, y: m.t - 16, "text-anchor": "end", class: "anno" }, svg)
+        .textContent = "batch < 8 ep groups: starved";
+      E("text", { x: W - m.r, y: m.t - 16, "text-anchor": "end", class: "anno" }, svg)
+        .textContent = "memory-bound at every batch — no allreduce floor at tp=1";
+    } else {
+      E("text", { x: (m.l + W - m.r) / 2, y: PH - 6, "text-anchor": "middle", class: "ax-name" }, svg)
+        .textContent = "batch size (log)";
+    }
+    const d = pts.map((p, i) => (i ? "L" : "M") + x(p.b).toFixed(1) + " " + yScale(val(p)).toFixed(1)).join(" ");
+    E("path", { d, fill: "none", stroke: S1, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+    for (const p of pts) {
+      const cx = x(p.b), cy = yScale(val(p));
+      E("circle", { cx, cy, r: 5.5, fill: "var(--surface)" }, svg);
+      E("circle", { cx, cy, r: 3.5, fill: S1, tabindex: 0, role: "img",
+        "aria-label": `batch ${p.b}: ${valueFmt(val(p))}` }, svg);
+    }
+    for (const [b, dx, dy, anchor] of labelPts) {
+      const p = pts.find((q) => q.b === b);
+      E("text", { x: x(p.b) + dx, y: yScale(val(p)) + dy, class: "dlabel-strong", "text-anchor": anchor }, svg)
+        .textContent = valueFmt(val(p));
+    }
+    const cross = E("line", { x1: 0, x2: 0, y1: m.t, y2: PH - m.b, stroke: "var(--baseline)",
+      "stroke-width": 1, visibility: "hidden" }, svg);
+    const overlay = E("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: PH - m.t - m.b,
+      fill: "transparent" }, svg);
+    overlay.addEventListener("pointermove", (ev) => {
+      const r = svg.getBoundingClientRect();
+      const vx = ((ev.clientX - r.left) / r.width) * W;
+      let best = pts[0], bd = Infinity;
+      for (const p of pts) { const d2 = Math.abs(x(p.b) - vx); if (d2 < bd) { bd = d2; best = p; } }
+      const cx = x(best.b);
+      cross.setAttribute("x1", cx); cross.setAttribute("x2", cx);
+      cross.setAttribute("visibility", "visible");
+      const [lx, ly] = toLocal(svg, cx, m.t + 30, W, PH);
+      tip.show(lx, ly, "batch " + best.b, [
+        { k: "$ / M out tok", v: fmtUSD(best.usd) },
+        { k: "tok/s per user", v: trim(best.user, 3) },
+        { k: "TPOT", v: fmtMs(best.tpot_ms) + " ms" },
+        { k: "rack out tok/s", v: fmtSI(best.sys, 3) },
+        { k: "decode bound", v: best.bound },
+      ]);
+    });
+    overlay.addEventListener("pointerleave", () => { cross.setAttribute("visibility", "hidden"); tip.hide(); });
+  }
+
+  panel(host1, logScale(0.28, 6, PH - m.b, m.t), [0.5, 1, 2, 5], (v) => "$" + (v >= 1 ? v : v.toFixed(1)),
+    (p) => p.usd, "$ / M output tokens (log)", [[1, 10, -8, "start"], [256, 0, -12, "middle"], [1024, -4, -12, "end"]], fmtUSD, true);
+  panel(host2, linScale(0, 900, PH - m.b, m.t), [0, 200, 400, 600, 800], (v) => v,
+    (p) => p.user, "tokens / s per user", [[1, 10, -6, "start"], [64, 0, -12, "middle"], [1024, -4, 18, "end"]],
+    (v) => trim(v, 3) + " tok/s", false);
+
+  legend("l-econ", [{ label: "DeepSeek-V3 · GB300 NVL72 · tp=1 ep=8 (single series, both panels)", color: "#2a78d6", line: true }]);
+  document.querySelectorAll("#l-econ .ln").forEach((el) => { el.style.background = S1; });
+
+  table("t-econ",
+    ["batch", "$/M out", "tok/s/user", "TPOT ms", "rack tok/s", "J/tok", "decode bound"],
+    pts.map((p) => [p.b + (p.warn ? " *" : ""), fmtUSD(p.usd), trim(p.user, 4), fmtMs(p.tpot_ms), fmtSI(p.sys, 4), trim(p.joules, 3), p.bound]));
+})();
+
+/* ============================== 5A · EXPERTS ============================== */
+(function moeA() {
+  const Ex = DATA.moe.experts;
+  const W = 430, H = 300, m = { t: 24, r: 26, b: 44, l: 46 };
+  const host = document.getElementById("c-moea");
+  const svg = E("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": "Expected distinct experts activated per decode step vs batch size" }, host);
+  const tip = makeTip(host);
+  const x = logScale(1, 1024, m.l, W - m.r);
+  const y = linScale(0, 280, H - m.b, m.t);
+
+  yGrid(svg, [0, 64, 128, 192, 256], y, m.l, W - m.r, (v) => v);
+  xTicks(svg, [1, 4, 16, 64, 256, 1024], x, H - m.b, (v) => v);
+  baseline(svg, m.l, W - m.r, H - m.b);
+  E("text", { x: (m.l + W - m.r) / 2, y: H - 8, "text-anchor": "middle", class: "ax-name" }, svg)
+    .textContent = "batch size (log)";
+  E("text", { x: 14, y: (m.t + H - m.b) / 2, "text-anchor": "middle", class: "ax-name",
+    transform: `rotate(-90 14 ${(m.t + H - m.b) / 2})` }, svg).textContent = "distinct experts read";
+
+  for (const [n, lbl] of [[128, "all 128 (gpt-oss)"], [256, "all 256 (DeepSeek)"]]) {
+    E("line", { x1: m.l, x2: W - m.r, y1: y(n), y2: y(n), stroke: "var(--baseline)", "stroke-width": 1 }, svg);
+    E("text", { x: W - m.r - 14, y: y(n) - 8, "text-anchor": "end", class: "anno" }, svg).textContent = lbl;
+  }
+
+  const series = [
+    { d: Ex["deepseek-v3"], c: S1, name: "deepseek-v3" },
+    { d: Ex["gpt-oss-120b"], c: S2, name: "gpt-oss-120b" },
+  ];
+  for (const s of series) {
+    const d = s.d.pts.map((p, i) => (i ? "L" : "M") + x(p.b).toFixed(1) + " " + y(p.e).toFixed(1)).join(" ");
+    E("path", { d, fill: "none", stroke: s.c, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+    for (const p of s.d.pts) {
+      const cx = x(p.b), cy = y(p.e);
+      E("circle", { cx, cy, r: 5.5, fill: "var(--surface)" }, svg);
+      const dot = E("circle", { cx, cy, r: 3.5, fill: s.c, tabindex: 0, role: "img",
+        "aria-label": `${s.name} batch ${p.b}: ${trim(p.e, 3)} experts` }, svg);
+      const hit = E("circle", { cx, cy, r: 12, fill: "transparent" }, svg);
+      const showTip = () => {
+        const [lx, ly] = toLocal(svg, cx, cy, W, H);
+        tip.show(lx, ly, s.name + " · batch " + p.b, [
+          { k: "experts read", v: trim(p.e, 4) + " / " + s.d.n },
+          { k: "share of pool", v: Math.round(p.e / s.d.n * 100) + "%" },
+        ]);
+      };
+      for (const t of [dot, hit]) {
+        t.addEventListener("pointerenter", showTip);
+        t.addEventListener("pointerleave", tip.hide);
+      }
+      dot.addEventListener("focus", showTip);
+      dot.addEventListener("blur", tip.hide);
+    }
+  }
+  legend("l-moea", [
+    { label: "DeepSeek-V3 (top-8 of 256)", color: "#2a78d6", line: true },
+    { label: "gpt-oss-120b (top-4 of 128)", color: "#1baf7a", line: true },
+  ]);
+  document.querySelectorAll("#l-moea .ln").forEach((el, i) => { el.style.background = i === 0 ? S1 : S2; });
+})();
+
+/* ============================== 5B · BYTES/TOKEN ============================== */
+(function moeB() {
+  const By = DATA.moe.bytes;
+  const W = 430, H = 300, m = { t: 24, r: 26, b: 44, l: 56 };
+  const host = document.getElementById("c-moeb");
+  const svg = E("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": "Decode DRAM weight bytes per token vs batch, MoE vs dense, log-log" }, host);
+  const tip = makeTip(host);
+  const x = logScale(1, 1024, m.l, W - m.r);
+  const y = logScale(1e7, 6e10, H - m.b, m.t);
+
+  yGrid(svg, [1e7, 1e8, 1e9, 1e10], y, m.l, W - m.r, (v) => fmtSI(v, 2) + "B");
+  xTicks(svg, [1, 4, 16, 64, 256, 1024], x, H - m.b, (v) => v);
+  baseline(svg, m.l, W - m.r, H - m.b);
+  E("text", { x: (m.l + W - m.r) / 2, y: H - 8, "text-anchor": "middle", class: "ax-name" }, svg)
+    .textContent = "batch size (log)";
+  E("text", { x: 14, y: (m.t + H - m.b) / 2, "text-anchor": "middle", class: "ax-name",
+    transform: `rotate(-90 14 ${(m.t + H - m.b) / 2})` }, svg).textContent = "weight bytes / token (log)";
+
+  const gx0 = 2.5, gx1 = 12, gy0 = 1.1e8;
+  E("line", { x1: x(gx0), y1: y(gy0), x2: x(gx1), y2: y(gy0 * gx0 / gx1),
+    stroke: "var(--baseline)", "stroke-width": 1.5 }, svg);
+  E("text", { x: x(gx1) + 5, y: y(gy0 * gx0 / gx1) + 3, class: "anno" }, svg).textContent = "1/B slope";
+
+  const series = [
+    { d: By["deepseek-v3"], c: S1, name: "DeepSeek-V3 expert weights" },
+    { d: By["gpt-oss-120b"], c: S2, name: "gpt-oss-120b expert weights" },
+    { d: By["llama-dense"], c: S3, name: "Llama-70B dense weights" },
+  ];
+  for (const s of series) {
+    const d = s.d.map((p, i) => (i ? "L" : "M") + x(p.b).toFixed(1) + " " + y(p.v).toFixed(1)).join(" ");
+    E("path", { d, fill: "none", stroke: s.c, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+    for (const p of s.d) {
+      const cx = x(p.b), cy = y(p.v);
+      E("circle", { cx, cy, r: 5.5, fill: "var(--surface)" }, svg);
+      const dot = E("circle", { cx, cy, r: 3.5, fill: s.c, tabindex: 0, role: "img",
+        "aria-label": `${s.name} batch ${p.b}: ${fmtBytes(p.v)} per token` }, svg);
+      const hit = E("circle", { cx, cy, r: 12, fill: "transparent" }, svg);
+      const showTip = () => {
+        const [lx, ly] = toLocal(svg, cx, cy, W, H);
+        tip.show(lx, ly, s.name, [{ k: "batch " + p.b, v: fmtBytes(p.v) + "/tok" }]);
+      };
+      for (const t of [dot, hit]) {
+        t.addEventListener("pointerenter", showTip);
+        t.addEventListener("pointerleave", tip.hide);
+      }
+      dot.addEventListener("focus", showTip);
+      dot.addEventListener("blur", tip.hide);
+    }
+  }
+  legend("l-moeb", [
+    { label: "DeepSeek-V3 expert weights", color: "#2a78d6", line: true },
+    { label: "gpt-oss-120b expert weights", color: "#1baf7a", line: true },
+    { label: "Llama-70B dense weights", color: "#eda100", line: true },
+  ]);
+  document.querySelectorAll("#l-moeb .ln").forEach((el, i) => { el.style.background = [S1, S2, S3][i]; });
+
+  const dp = DATA.moe.experts["deepseek-v3"].pts, gp = DATA.moe.experts["gpt-oss-120b"].pts;
+  const db = By["deepseek-v3"], gb = By["gpt-oss-120b"], lb = By["llama-dense"];
+  table("t-moe",
+    ["batch", "ds-v3 experts", "gpt-oss experts", "ds-v3 B/tok", "gpt-oss B/tok", "llama dense B/tok"],
+    dp.map((p, i) => [p.b, trim(p.e, 4), trim(gp[i].e, 4), fmtBytes(db[i].v), fmtBytes(gb[i].v), fmtBytes(lb[i].v)]));
+})();
+</script>
