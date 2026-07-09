@@ -54,6 +54,21 @@
   .seg .btn { border: none; border-radius: 0; }
   .seg .btn + .btn { border-left: 1px solid var(--line); }
   input[type=range] { accent-color: var(--accent); cursor: pointer; }
+  .btn.help { padding: 5px 8px; font-weight: 600; color: var(--ink-dim); }
+
+  /* level-help popover */
+  #lvlhelp {
+    position: fixed; z-index: 30; max-width: 430px; padding: 12px 14px;
+    background: var(--panel); border: 1px solid #26304c; border-radius: 10px;
+    font-size: 12px; line-height: 1.55; color: var(--ink);
+    box-shadow: 0 12px 34px rgba(0,0,0,.55); backdrop-filter: blur(8px);
+  }
+  #lvlhelp h4 { margin: 0 0 6px; font-size: 12.5px; letter-spacing: .2px; }
+  #lvlhelp p { margin: 0 0 8px; color: var(--ink-dim); }
+  #lvlhelp p:last-child { margin-bottom: 0; }
+  #lvlhelp b { color: var(--ink); font-weight: 600; }
+  #lvlhelp code { font-family: var(--mono); font-size: 11px; color: var(--ink);
+                  background: #121829; padding: 0 4px; border-radius: 4px; }
 
   /* scene */
   #scene-wrap { position: relative; overflow: hidden; }
@@ -134,7 +149,7 @@
   <div id="bar">
     <div class="title">inferencesim <small id="sub-title">replay</small></div>
     <div class="sep"></div>
-    <div class="ctl"><label>level</label><select id="sel-level"></select></div>
+    <div class="ctl"><label>level</label><select id="sel-level"></select><button class="btn help" id="btn-lvlhelp" title="what is this level showing?">?</button></div>
     <div class="ctl" id="op-ctl" hidden><label>op</label><select id="sel-op"></select></div>
     <div class="ctl"><label>phase</label>
       <div class="seg" id="phase-seg">
@@ -156,6 +171,7 @@
     <div id="status"></div>
     <div id="legend"></div>
     <div id="tip"></div>
+    <div id="lvlhelp" hidden></div>
     <div id="panel"><button class="btn close" id="panel-close">close</button><div id="panel-body"></div></div>
   </div>
 
@@ -979,8 +995,15 @@ let LAST_SCAN = null;
 function buildBar() {
   const sl = document.getElementById("sel-level");
   sl.innerHTML = DOC.levels.map((l, i) => `<option value="${i}">${l.title}</option>`).join("");
-  sl.onchange = () => { STATE.level = +sl.value; STATE.op = 0; refreshOpCtl(); rebuildModel(); onTrackChange(); };
+  sl.onchange = () => { STATE.level = +sl.value; STATE.op = 0; refreshOpCtl(); refreshLevelHelp(); rebuildModel(); onTrackChange(); };
   refreshOpCtl();
+  const hb = document.getElementById("btn-lvlhelp");
+  hb.onclick = () => {
+    const box = document.getElementById("lvlhelp");
+    box.hidden = !box.hidden;
+    hb.classList.toggle("on", !box.hidden);
+    refreshLevelHelp();
+  };
 
   document.querySelectorAll("#phase-seg .btn").forEach(b => b.onclick = () => {
     document.querySelectorAll("#phase-seg .btn").forEach(x => x.classList.remove("on"));
@@ -1009,6 +1032,55 @@ function buildBar() {
   // header meta
   const m = DOC.meta;
   document.getElementById("sub-title").textContent = `${m.hardware_name || m.hardware || ""}  ·  ${m.model_name || m.model || ""}`;
+}
+function levelHelpHTML(lvl) {
+  const m = DOC.meta, pp = m.pp || 1;
+  const members = (m.tp || 1) * (m.ep || 1) * (m.adp || 1);
+  const status =
+    `<p><b>status line</b> (bottom left): <b>tasks</b> — scheduled intervals in ` +
+    `this track, one per compute/transfer/collective occupancy the DES produced ` +
+    `("downsampled" = the export kept a uniform sample of a larger run). ` +
+    `<b>particles</b> — transfers in flight at the playhead, drawn as dots riding ` +
+    `the edge lanes; at most ${PARTICLE_CAP} are drawn ("sampled" = a subset of ` +
+    `the true count).</p>`;
+  if (lvl.kind !== "chip") {
+    return `<h4>Pipeline stages — the replica at stage granularity</h4>` +
+      `<p>The model's layers are split across <b>${pp}</b> pipeline-parallel ` +
+      (pp > 1
+        ? `stages; each box is one stage, not one chip. Solid arrows hand ` +
+          `activations to the next stage; the dashed wrap edge is decode ` +
+          `looping back to stage 0 for the next token.`
+        : `stage (pp = 1), so the single box holds the whole replica.`) + `</p>` +
+      `<p><code>u{s}</code> — stage <i>s</i>'s execution unit: ` +
+      (members > 1 ? `its <b>${members}</b> chips (tp·ep·adp) pooled as one server`
+                   : `its one chip`) +
+      `. Compute and weight/KV memory reads glow here.</p>` +
+      `<p><code>s{s}.fabric</code> ×${members} — the stage's interconnect, one ` +
+      `port set per member chip: <code>.l{i}.out</code>/<code>.l{i}.in</code> ` +
+      `egress/ingress on a switched fabric, <code>.l{i}.cw</code>/<code>.ccw</code> ` +
+      `lanes on a ring. Collectives (allreduce, MoE all-to-all, CP ring) occupy ` +
+      `these.</p>` +
+      `<p>This level shows how work moves <b>between</b> stages. ` +
+      (DOC.levels.length > 1
+        ? `Switch level to look inside one chip.`
+        : `(No chip level here: this hardware preset has no fine-grained graph.)`) +
+      `</p>` + status;
+  }
+  return `<h4>${lvl.title} — inside one chip</h4>` +
+    `<p>The expanded hardware graph of a single chip: DRAM banks, SRAM, compute ` +
+    `cores and the NoC connecting them. Groups labelled ×N are N identical ` +
+    `instances — click to expand or collapse.</p>` +
+    `<p>The <b>op</b> selector picks one lowered operation (a layer's GEMM, ` +
+    `attention, a collective step…); the replay shows that op's tile tasks ` +
+    `streaming through the chip.</p>` + status;
+}
+function refreshLevelHelp() {
+  const box = document.getElementById("lvlhelp");
+  if (box.hidden) return;
+  box.innerHTML = levelHelpHTML(currentLevel());
+  const r = document.getElementById("btn-lvlhelp").getBoundingClientRect();
+  box.style.left = Math.round(r.left) + "px";
+  box.style.top = Math.round(r.bottom + 10) + "px";
 }
 function refreshOpCtl() {
   const lvl = currentLevel(), ctl = document.getElementById("op-ctl"), so = document.getElementById("sel-op");
@@ -1190,6 +1262,13 @@ function bindKeys() {
     else if (e.code === "ArrowLeft") { e.preventDefault(); step(-1); }
     else if (e.key === "h") document.getElementById("btn-heat").click();
     else if (e.key === "f") relayout(true);
+    else if (e.key === "Escape") {
+      const box = document.getElementById("lvlhelp");
+      if (!box.hidden) {
+        box.hidden = true;
+        document.getElementById("btn-lvlhelp").classList.remove("on");
+      }
+    }
   });
 }
 
