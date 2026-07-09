@@ -311,6 +311,9 @@ const DOC = loadDoc();
 // [model] per-level graph model + display cells + resolver
 // =====================================================================
 const baseName = n => n.replace(/\[\d+\]$/, "");
+// a graph node's human display label -- a synthesised member/unit node may carry
+// a short `meta.label` (e.g. "tp1·ep0"); everything else falls back to its name.
+const dispLabel = g => (g && g.meta && g.meta.label) || (g && g.name) || "";
 
 function buildLevel(lvl) {
   // flat name -> gnode (walking nesting)
@@ -339,6 +342,7 @@ function buildLevel(lvl) {
         const cell = { id: `${parentId}/${b}#c${uid++}`, kind: "composite", base: b,
           gnode: rep, members, collapsed: false };
         cell.children = makeCells(rep.inner.nodes, cell.id);
+        for (const ch of cell.children) ch._composite = cell;  // for collapse guard
         cells.push(cell);
       } else {
         // instance group: either N sibling nodes, or one node with count>1
@@ -397,6 +401,7 @@ function layout(model, W, H) {
   const lvl = model.lvl;
   const pad = 26;
   if (lvl.kind === "stage") layoutStages(model, W, H, pad);
+  else if (lvl.kind === "member") layoutMembers(model, W, H, pad);
   else layoutChip(model, W, H, pad);
 }
 
@@ -425,6 +430,54 @@ function layoutStages(model, W, H, pad) {
       if (fab) placeGroup(fab, ux, uy + ih*0.5 + 10, iw, ih*0.5 - 10);
     }
   });
+}
+
+// member level: one composite per stage (left->right, like the stage level),
+// but its inside is the stage's members laid out as separate nodes -- arranged
+// on a circle so a ring reads as a ring and a switched fabric reads as members
+// around a central hub. The pooled compute unit u{s} is a band across the top.
+function layoutMembers(model, W, H, pad) {
+  const cells = model.topCells;      // stage composites
+  const n = cells.length;
+  const gap = 34;
+  const bw = Math.max(180, (W - pad*2 - gap*(n-1)) / n);
+  const bh = Math.max(240, H - pad*2);
+  const y0 = pad;
+  cells.forEach((c, i) => {
+    const x = pad + i * (bw + gap);
+    setRect(c, x, y0, bw, bh);
+    if (!c.collapsed && c.children) layoutMemberInner(c, x, y0, bw, bh);
+  });
+}
+function layoutMemberInner(c, x, y, w, h) {
+  const ipad = 14, headH = 26;
+  const ix = x + ipad, iy = y + headH + ipad;
+  const iw = w - ipad*2, ih = h - headH - ipad*2;
+  const u = c.children.find(k => k.gnode.role === "compute");   // u{s} pooled
+  const hub = c.children.find(k => k.gnode.role === "switch");  // switched only
+  const members = c.children.filter(k => k.gnode.role === "link");
+  const N = members.length;
+  // pooled compute: a band across the top
+  const uH = clamp(ih * 0.16, 34, 66);
+  if (u) setRect(u, ix, iy, iw, uH);
+  // fabric area (the circle of members) fills the space below the compute band
+  const fx = ix, fy = iy + uH + 12, fw = iw, fh = ih - uH - 12;
+  const cx = fx + fw/2, cyc = fy + fh/2;
+  // radius envelope: each member box stays within env of the fabric centre on
+  // EACH axis (R*|cos|+ms/2 <= R+ms/2 == env), so members never leave the box.
+  const env = Math.max(10, Math.min(fw, fh) / 2 - 6);
+  const chord0 = 2 * env * Math.sin(Math.PI / Math.max(2, N));
+  const ms = clamp(Math.min(env * 0.55, chord0 * 0.78), 7, 60);
+  const R = Math.max(0, env - ms/2);
+  for (let k = 0; k < N; k++) {
+    const ang = -Math.PI/2 + 2*Math.PI * k / N;   // member 0 at top, clockwise
+    const mcx = cx + R * Math.cos(ang), mcy = cyc + R * Math.sin(ang);
+    setRect(members[k], mcx - ms/2, mcy - ms/2, ms, ms);
+  }
+  if (hub) {
+    const hs = clamp(Math.min(env * 0.5, 2*(R - ms/2 - 6)), 14, 96);
+    setRect(hub, cx - hs/2, cyc - hs/2, hs, hs);
+  }
 }
 
 function layoutChip(model, W, H, pad) {
@@ -602,6 +655,10 @@ function drawEdges(model, scan) {
     const ra = A ? refAnchor(model, { id: e.src }) : null;
     const rb = B ? refAnchor(model, { id: e.dst }) : null;
     if (!ra || !rb) continue;
+    // an edge into a member/hub nested in a collapsed stage composite has no
+    // visible endpoint -- skip it (the member fabric folds away with the box).
+    if ((ra.cell._composite && ra.cell._composite.collapsed) ||
+        (rb.cell._composite && rb.cell._composite.collapsed)) continue;
     const key = ra.cell.id + "|" + rb.cell.id;
     if (drawn.has(key)) continue; drawn.add(key);
     const g = edgeGeom(ra, rb);
@@ -706,7 +763,7 @@ function drawNode(c, rc, color, scan) {
   // label
   ctx.fillStyle = "rgba(225,232,245,0.92)"; ctx.font = "600 11px var(--font)";
   ctx.textAlign = "center"; ctx.textBaseline = "middle";
-  const lbl = c.kind === "group" ? c.base : c.gnode.name;
+  const lbl = c.kind === "group" ? c.base : dispLabel(c.gnode);
   ctx.fillText(fitText(lbl, rc.w - 12), rc.x + rc.w/2, rc.y + rc.h/2);
   ctx.textAlign = "left";
   // count badge
@@ -1043,6 +1100,31 @@ function levelHelpHTML(lvl) {
     `<b>particles</b> — transfers in flight at the playhead, drawn as dots riding ` +
     `the edge lanes; at most ${PARTICLE_CAP} are drawn ("sampled" = a subset of ` +
     `the true count).</p>`;
+  if (lvl.kind === "member") {
+    const ring = (lvl.graph.meta && lvl.graph.meta.topology) === "ring";
+    return `<h4>Stage members — inside one stage's fabric</h4>` +
+      `<p>The stage level pools each stage's <b>${members}</b> chips (tp·ep·adp) ` +
+      `into one <code>u{s}</code> box, so a collective reads only as a port ` +
+      `meter. This level lays those members out as <b>separate nodes</b>, so the ` +
+      `<i>structure</i> of the collectives becomes visible.</p>` +
+      `<p>Each small node is one <b>member</b> — a chip of the stage, labelled by ` +
+      `its <code>tp·ep·adp</code> coordinate. Compute is <b>pooled</b> in ` +
+      `<code>u{s}</code> (the stage DES has no per-member compute split), so the ` +
+      `members carry only their collective egress/ingress.</p>` +
+      (ring
+        ? `<p>The members sit on a <b>ring</b>: <code>.cw</code>/<code>.ccw</code> ` +
+          `edges hop member <i>i</i> → <i>i</i>±1, and an allreduce / all-to-all / ` +
+          `CP ring steps around it — watch the particles walk member to member.</p>`
+        : `<p>The members surround a central <b>switch</b> hub: a send leaves a ` +
+          `member's egress (<code>.l{i}.out</code>), crosses the hub, and lands on ` +
+          `the receiver's ingress (<code>.l{i}.in</code>). A skewed MoE all-to-all ` +
+          `<b>incasts</b> — every sender piles onto the hot owner (member 0), whose ` +
+          `ingress lights up and backs up while the cold members idle.</p>`) +
+      `<p>The <b>hot</b> member owns the most-popular experts; look for its ingress ` +
+      `saturating first. ` +
+      (DOC.levels.length > 2 ? `Switch level to look inside one chip.` : ``) +
+      `</p>` + status;
+  }
   if (lvl.kind !== "chip") {
     return `<h4>Pipeline stages — the replica at stage granularity</h4>` +
       `<p>The model's layers are split across <b>${pp}</b> pipeline-parallel ` +
@@ -1189,17 +1271,22 @@ function nodeInfoRows(g) {
   if (g.bandwidth) rows.push(["bandwidth", fmtSI(g.bandwidth, "B/s")]);
   if (g.derate != null && g.derate !== 1) rows.push(["derate", g.derate]);
   if (g.meta && g.meta.topology) rows.push(["topology", g.meta.topology]);
+  if (g.meta && g.meta.member != null) {            // member-level node
+    rows.push(["member", "#" + g.meta.member + (g.meta.hot ? " · hot owner" : "")]);
+    if (g.meta.label) rows.push(["coords", g.meta.label]);
+  }
   return rows;
 }
 function cellTitle(cell) {
   if (cell.kind === "group") return `${cell.base} ×${cell.insts.length}`;
-  return cell.name || cell.gnode.name;  // instance -> its own name (e.g. gddr6-bank[3])
+  return cell.name || dispLabel(cell.gnode);  // instance -> its own name (e.g. gddr6-bank[3])
 }
 function tipHTML(cell) {
   const g = cell.gnode, st = cellStats(cell);
   const name = cellTitle(cell);
   let h = `<h4>${name}</h4>`;
   h += `<div class="mono">` + nodeInfoRows(g).map(([k,v]) => `<span class="k">${k}</span> ${v}`).join("<br>") + `</div>`;
+  if (g.meta && g.meta.desc) h += `<div style="margin-top:6px;color:var(--ink-dim);line-height:1.4">${g.meta.desc}</div>`;
   h += `<div style="margin-top:6px" class="mono"><span class="k">active</span> ${st.a}  <span class="k">queued</span> ${st.p}  <span class="k">busy</span> ${(st.util*100).toFixed(0)}%</div>`;
   return h;
 }
@@ -1214,6 +1301,7 @@ function fillPanel(cell) {
   const name = cellTitle(cell);
   let h = `<h3>${name}</h3><div class="sub">${cell.kind}${g.role ? " · " + g.role : ""}</div>`;
   h += `<div class="kv">` + nodeInfoRows(g).map(([k,v]) => `<div class="k">${k}</div><div class="v">${v}</div>`).join("") + `</div>`;
+  if (g.meta && g.meta.desc) h += `<div style="color:var(--ink-dim);line-height:1.45;margin-bottom:12px">${g.meta.desc}</div>`;
   h += `<div class="k" style="font-size:11px;text-transform:uppercase;letter-spacing:.6px;margin-bottom:4px">live state</div>`;
   h += `<div class="kv"><div class="k">active</div><div class="v">${st.a}</div>` +
        `<div class="k">queued</div><div class="v">${st.p}</div>` +
