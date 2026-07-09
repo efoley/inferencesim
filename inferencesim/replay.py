@@ -77,7 +77,7 @@ from .des import DESEngine
 from .engine import CommContext
 from .graph import Edge, Graph, Node, NodeKind
 from .graphdes import _edge_res
-from .hardware import System
+from .hardware import System, Topology
 from .ops import Op, decode_step_ops, prefill_ops
 from .sched import ScheduleResult, Task
 from .workload import Deployment, ModelSpec, Scenario
@@ -154,7 +154,14 @@ def build_replay(
         replay_engine.run_phase(name, ops, system, deployment)
 
     comm = CommContext.for_deployment(system, deployment)
-    levels = [_stage_level(replay_engine, system, deployment, comm, warmup)]
+    fabric_bw = comm.tp_link.bandwidth if comm.tp_link else 0.0
+    phases, resources = _phase_tracks(replay_engine, warmup, fabric_bw)
+    levels = [_stage_level(system, deployment, comm, phases, resources)]
+    # member level: lay each stage's tp*ep*adp members out as separate nodes so
+    # collective structure (TP allreduce, MoE all-to-all incast, ADP/CP rings)
+    # becomes spatially visible.  Adds nothing with a single member.
+    if comm.a2a > 1:
+        levels.append(_member_level(system, deployment, comm, phases, resources))
     if chip_graph is not None:
         levels.append(_chip_level(replay_engine, phase_ops))
 
@@ -298,10 +305,12 @@ def _classify_stage(resource: str, label: str) -> int:
     return _KIND["compute"]
 
 
-def _stage_level(engine: DESEngine, system: System, dep: Deployment,
-                 comm: CommContext, warmup: int) -> dict:
-    graph = _stage_graph(system, dep, comm)
-    fabric_bw = comm.tp_link.bandwidth if comm.tp_link else 0.0
+def _phase_tracks(engine: DESEngine, warmup: int,
+                  fabric_bw: float) -> tuple[dict[str, dict], set[str]]:
+    """Extract and encode one stage-DES task track per phase, returning the
+    encoded tracks and the set of every resource they mention.  The stage and
+    member levels are two *views* of the same run (same tasks, different graph +
+    resource_map), so the tracks are built once here and shared by both."""
     resources: set[str] = set()
     phases: dict[str, dict] = {}
     for phase in ("prefill", "decode"):
@@ -314,6 +323,12 @@ def _stage_level(engine: DESEngine, system: System, dep: Deployment,
         for res, *_ in rows:
             resources.add(res)
         phases[phase] = _encode_track(rows)
+    return phases, resources
+
+
+def _stage_level(system: System, dep: Deployment, comm: CommContext,
+                 phases: dict[str, dict], resources: set[str]) -> dict:
+    graph = _stage_graph(system, dep, comm)
     return {
         "id": "stage",
         "title": "Pipeline stages",
@@ -350,6 +365,169 @@ def _stage_rows(tasks: list[Task], result: ScheduleResult,
             payload = (end - start) * fabric_bw
         rows.append([t.resource, start, end, kind, t.label, payload])
     return rows
+
+
+# =============================================================================
+# member level (synthesised; emitted only when a stage has > 1 member)
+# =============================================================================
+#
+# The stage level pools each stage's tp*ep*adp chips into one `u{s}` box, so a
+# collective reads only as an aggregate port meter.  The member level lays each
+# stage's members out as *separate* nodes -- so an all-to-all's incast piles
+# visibly onto the hot member's ingress, a ring's steps hop member-to-member,
+# etc.  It is the same DES run as the stage level (same task tracks), re-graphed.
+#
+# Member index -> (tp, ep, adp) coordinate.  The a2a group is the tp*ep*adp
+# array with **tp innermost, then ep, then adp** (engine.CommContext: "tp
+# innermost, then ep/adp"; the CP ring's members "span the tp*adp array with
+# stride tp" == tp innermost; MoE expert blocks are placed contiguously over the
+# flat array indexed by this member, member 0 the hottest -- workload.py).  So:
+#     tp_coord  = i % tp
+#     ep_coord  = (i // tp) % ep
+#     adp_coord =  i // (tp * ep)
+_DOT = "·"  # middle dot, matches the viewer's axis separators
+
+
+def _member_decomp(i: int, dep: Deployment) -> tuple[int, int, int]:
+    return (i % dep.tp, (i // dep.tp) % dep.ep, i // (dep.tp * dep.ep))
+
+
+def _member_label(i: int, dep: Deployment) -> str:
+    """Short, human-meaningful member label -- only axes with degree > 1 shown
+    (pure TP -> `tp3`; MoE EP -> `ep5`; tp*ep -> `tp1·ep0`)."""
+    tp_c, ep_c, adp_c = _member_decomp(i, dep)
+    parts: list[str] = []
+    if dep.tp > 1:
+        parts.append(f"tp{tp_c}")
+    if dep.ep > 1:
+        parts.append(f"ep{ep_c}")
+    if dep.adp > 1:
+        parts.append(f"adp{adp_c}")
+    return _DOT.join(parts) if parts else f"m{i}"
+
+
+def _member_meta(i: int, s: int, dep: Deployment) -> dict:
+    tp_c, ep_c, adp_c = _member_decomp(i, dep)
+    hot = i == 0 and dep.ep > 1  # member 0 owns the lowest (hottest) expert block
+    desc = (f"stage {s} member {i} ({_member_label(i, dep)}) -- one chip of the "
+            f"stage's {dep.tp * dep.ep * dep.adp}-chip fabric; compute is pooled "
+            f"in u{s}, this node carries its collective egress/ingress"
+            + (". Hottest expert-owner: incast lands here." if hot else "."))
+    return {"stage": s, "member": i, "tp": tp_c, "ep": ep_c, "adp": adp_c,
+            "label": _member_label(i, dep), "hot": hot, "desc": desc}
+
+
+def _member_graph(system: System, dep: Deployment, comm: CommContext) -> Graph:
+    """Synthesise the member-level graph: one composite per stage holding the
+    pooled compute unit `u{s}`, its `n = tp*ep*adp` member nodes laid out
+    individually, and the stage's fabric structure -- a central switch hub (edges
+    member<->hub) on a switched fabric, or a member-to-member ring (cw + ccw
+    edges) on a ring.  Hop edges wire consecutive stage composites when pp > 1.
+
+    The fabric edges are top-level (referencing the nested member/hub nodes) so
+    the viewer's `drawEdges` renders them and collective particles ride them; the
+    hop edges join the composites exactly as at the stage level."""
+    pp, tp = dep.pp, dep.tp
+    n_members = comm.a2a
+    use_ring = comm.a2a_topology is Topology.RING
+    chip = system.node.chip
+    tp_link = comm.tp_link
+    fabric_bw = tp_link.bandwidth if tp_link else None
+    fabric_lat = tp_link.latency_s if tp_link else 0.0
+    p2p = comm.p2p_link
+    hop_bw = p2p.bandwidth if p2p else fabric_bw
+
+    stages: list[Node] = []
+    edges: list[Edge] = []
+    for s in range(pp):
+        unit = Node(
+            name=f"u{s}", kind=NodeKind.COMPUTE, role="compute",
+            peak_flops={dt: f * tp for dt, f in chip.compute.peak_flops.items()},
+            dynamic_power_w=chip.compute.power_w * tp,
+            meta={"stage": s, "tp": tp, "label": f"u{s} (pooled)",
+                  "desc": f"stage {s} execution unit -- its {n_members} member "
+                  f"chips' compute pooled as one block (the stage DES has no "
+                  f"per-member compute split; kernels serialise on u{s})"},
+        )
+        members = [
+            Node(name=f"s{s}.m{i}", kind=NodeKind.SWITCH, role="link",
+                 bandwidth=fabric_bw, latency_s=fabric_lat,
+                 meta=_member_meta(i, s, dep))
+            for i in range(n_members)
+        ]
+        inner_nodes = [unit, *members]
+        if not use_ring:
+            hub = Node(
+                name=f"s{s}.hub", kind=NodeKind.SWITCH, role="switch",
+                bandwidth=fabric_bw, latency_s=fabric_lat,
+                meta={"stage": s, "topology": comm.a2a_topology.value,
+                      "label": "switch", "desc": f"stage {s} switched fabric "
+                      f"({comm.a2a_topology.value}); members egress and ingress "
+                      f"through it -- an all-to-all's messages funnel here"},
+            )
+            inner_nodes.append(hub)
+            for i in range(n_members):
+                edges.append(Edge(src=f"s{s}.m{i}", dst=f"s{s}.hub",
+                                  bandwidth=fabric_bw, name="egress"))
+                edges.append(Edge(src=f"s{s}.hub", dst=f"s{s}.m{i}",
+                                  bandwidth=fabric_bw, name="ingress"))
+        else:
+            for i in range(n_members):
+                nxt = (i + 1) % n_members
+                edges.append(Edge(src=f"s{s}.m{i}", dst=f"s{s}.m{nxt}",
+                                  bandwidth=fabric_bw, name="cw"))
+                edges.append(Edge(src=f"s{s}.m{nxt}", dst=f"s{s}.m{i}",
+                                  bandwidth=fabric_bw, name="ccw"))
+        inner = Graph(name=f"stage{s}", nodes=inner_nodes, edges=[],
+                      meta={"topology": comm.a2a_topology.value})
+        stages.append(Node(
+            name=f"stage{s}", kind=NodeKind.COMPOSITE, role="stage",
+            inner=inner, ports=(f"u{s}",),
+            meta={"stage": s, "members": n_members,
+                  "topology": comm.a2a_topology.value},
+        ))
+
+    if pp > 1:
+        for s in range(pp):
+            edges.append(Edge(src=f"stage{s}", dst=f"stage{(s + 1) % pp}",
+                              bandwidth=hop_bw, name="hop"))
+    return Graph(name="members", nodes=stages, edges=edges,
+                 meta={"kind": "member", "topology": comm.a2a_topology.value})
+
+
+def _member_resource_map(resources: set[str], dep: Deployment) -> dict:
+    """Resolve every stage-DES resource to a member-level graph element.
+    `u{s}` -> the pooled compute node; `s{s}.l{i}.{out,in,cw,ccw}` -> member i's
+    own node (egress and ingress of one member both resolve to that member, as at
+    the stage level); sync (`.bar`/`.prop`) -> member 0, matching the stage
+    level's fence policy of resolving to the first fabric member."""
+    out: dict[str, dict] = {}
+    for r in resources:
+        m = _U_RE.match(r)
+        if m:
+            out[r] = {"kind": "node", "id": f"u{m.group(1)}"}
+            continue
+        m = _LINK_RE.match(r)
+        if m:
+            out[r] = {"kind": "node", "id": f"s{m.group(1)}.m{int(m.group(2))}"}
+            continue
+        m = _STAGE_RE.match(r)  # sync: s{s}.bar.. / s{s}.prop..
+        if m:
+            out[r] = {"kind": "node", "id": f"s{m.group(1)}.m0"}
+    return out
+
+
+def _member_level(system: System, dep: Deployment, comm: CommContext,
+                  phases: dict[str, dict], resources: set[str]) -> dict:
+    graph = _member_graph(system, dep, comm)
+    return {
+        "id": "member",
+        "title": "Stage members",
+        "kind": "member",
+        "graph": graph.to_dict(),
+        "resource_map": _member_resource_map(resources, dep),
+        "phases": phases,
+    }
 
 
 # =============================================================================

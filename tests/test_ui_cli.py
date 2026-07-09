@@ -42,7 +42,8 @@ def test_ui_writes_parseable_file_for_lumped_preset(tmp_path):
     doc = _extract_replay(html)                        # JSON block parses
     assert doc["format"] == "inferencesim-replay-v1"
     assert doc["meta"]["graph_mode"] is False
-    assert [l["kind"] for l in doc["levels"]] == ["stage"]  # no chip level
+    # tp*pp=2 members per stage -> a member level, but no chip level (lumped)
+    assert [l["kind"] for l in doc["levels"]] == ["stage", "member"]
 
 
 def test_ui_writes_parseable_file_for_graph_preset(tmp_path):

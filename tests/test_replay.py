@@ -69,6 +69,19 @@ def cp_replay():
 
 
 @pytest.fixture(scope="module")
+def ring_replay():
+    """A RING interconnect (Tenstorrent node): the member level wires each
+    stage's members into a cw/ccw ring instead of through a central switch hub."""
+    hw = tt_quietbox_fine()
+    system = system_from_graph(hw)
+    dep = Deployment(tp=4, weight_dtype=DType.FP8, kv_dtype=DType.FP8)
+    scen = Scenario(batch=4, prompt_len=256, output_len=32)
+    engine = DESEngine(decode_rounds=6, chip_graph=chip_graph_of(hw))
+    simulate(system, LLAMA_3_1_70B, scen, dep, engine=engine)
+    return build_replay(engine, system, LLAMA_3_1_70B, scen, dep, hw)
+
+
+@pytest.fixture(scope="module")
 def mesh_replay():
     """The per-router 2-D mesh chip preset (12x17 router grid): a dense chip
     level whose generic layout must stay geometrically valid."""
@@ -135,7 +148,8 @@ def test_meta_carries_header_numbers(lumped_replay):
 
 
 @pytest.mark.parametrize("fixture", ["lumped_replay", "graph_replay",
-                                     "moe_skew_replay", "cp_replay", "mesh_replay"])
+                                     "moe_skew_replay", "cp_replay", "ring_replay",
+                                     "mesh_replay"])
 def test_every_task_resource_resolves_to_an_existing_element(fixture, request):
     doc = request.getfixturevalue(fixture)
     for level in doc["levels"]:
@@ -158,7 +172,8 @@ def test_every_task_resource_resolves_to_an_existing_element(fixture, request):
 
 
 @pytest.mark.parametrize("fixture", ["lumped_replay", "graph_replay",
-                                     "moe_skew_replay", "cp_replay", "mesh_replay"])
+                                     "moe_skew_replay", "cp_replay", "ring_replay",
+                                     "mesh_replay"])
 def test_task_times_within_makespan(fixture, request):
     doc = request.getfixturevalue(fixture)
     for level in doc["levels"]:
@@ -236,6 +251,99 @@ def test_stage_level_synthesised_for_a_lumped_run(lumped_replay):
 
 def test_stage_level_present_in_graph_mode_too(graph_replay):
     assert len(_levels_by_kind(graph_replay, "stage")) == 1
+
+
+# ---- member level: per-member fabric, emitted iff > 1 member ----------------
+
+
+def _member_level(doc):
+    return _levels_by_kind(doc, "member")[0]
+
+
+def test_member_level_emitted_when_stage_has_multiple_members(lumped_replay):
+    """tp*ep*adp > 1 -> a member level lays each stage's members out as separate
+    nodes (a pooled compute unit + one node per member)."""
+    members = _levels_by_kind(lumped_replay, "member")
+    assert len(members) == 1
+    lvl = members[0]
+    assert lvl["kind"] == "member" and lvl["title"] == "Stage members"
+    assert lvl["graph"]["format"] == "inferencesim-graph-v1"
+    composites = [n for n in lvl["graph"]["nodes"] if n["kind"] == "composite"]
+    assert {n["name"] for n in composites} == {"stage0", "stage1"}
+    for c in composites:
+        inner = {n["name"]: n for n in c["inner"]["nodes"]}
+        assert any(n["role"] == "compute" for n in inner.values())  # pooled u{s}
+        member_nodes = [n for n in inner.values() if n["role"] == "link"]
+        assert len(member_nodes) == 2  # tp=2 members, individually laid out
+
+
+def test_member_level_ordered_between_stage_and_chip(graph_replay):
+    """The member level sits between the stage and chip levels."""
+    kinds = [lvl["kind"] for lvl in graph_replay["levels"]]
+    assert kinds == ["stage", "member", "chip"]
+
+
+def test_member_level_absent_for_single_member(mesh_replay):
+    """tp=ep=adp=1 -> a single member adds nothing, so no member level."""
+    assert _levels_by_kind(mesh_replay, "member") == []
+
+
+def test_member_links_map_to_their_own_member_node(moe_skew_replay):
+    """Every `s{s}.l{i}.{out,in,cw,ccw}` resolves to member i's OWN node (a
+    distinct graph node, not an instance of a shared fabric) and `u{s}` to the
+    pooled compute node.  This is what makes per-member incast spatially legible."""
+    lvl = _member_level(moe_skew_replay)
+    nodes = _node_index(lvl["graph"])
+    rmap = lvl["resource_map"]
+    link_re = re.compile(r"^s(\d+)\.l(\d+)\.(out|in|cw|ccw)$")
+    seen_link = seen_unit = 0
+    for _phase, _op, track in _tracks(lvl):
+        for row in track["rows"]:
+            res = track["res"][row[0]]
+            m = link_re.match(res)
+            if m:
+                seen_link += 1
+                assert rmap[res] == {"kind": "node",
+                                     "id": f"s{m.group(1)}.m{m.group(2)}"}
+                assert rmap[res]["id"] in nodes
+            elif re.match(r"^u\d+$", res):
+                seen_unit += 1
+                assert rmap[res] == {"kind": "node", "id": res}
+    assert seen_link > 0 and seen_unit > 0
+
+
+def test_member_nodes_carry_coordinate_decomposition(moe_skew_replay):
+    """Each member node stores its tp/ep/adp decomposition + a short label in
+    meta; member 0 (the lowest, most-popular expert block) is flagged hot."""
+    lvl = _member_level(moe_skew_replay)
+    nodes = _node_index(lvl["graph"])
+    m0, m3 = nodes["s0.m0"], nodes["s0.m3"]
+    assert (m0["meta"]["member"], m0["meta"]["ep"]) == (0, 0) and m0["meta"]["hot"]
+    assert m3["meta"]["ep"] == 3 and m3["meta"]["label"] == "ep3"
+    assert not m3["meta"]["hot"]
+    assert "pool" in nodes["u0"]["meta"]["desc"].lower()  # honest: compute pooled
+
+
+def test_member_fabric_is_switched_hub_on_a_switched_fabric(moe_skew_replay):
+    """A switched (all-to-all) fabric -> a central hub with member<->hub edges."""
+    g = _member_level(moe_skew_replay)["graph"]
+    assert g["meta"]["topology"] == "all-to-all"
+    inner_names = {n["name"] for c in g["nodes"] if c.get("inner")
+                   for n in c["inner"]["nodes"]}
+    assert "s0.hub" in inner_names
+    assert {"egress", "ingress"} <= {e["name"] for e in g["edges"]}
+
+
+def test_member_fabric_is_ring_on_a_ring_node(ring_replay):
+    """A RING interconnect -> members wired cw/ccw member-to-member, no hub."""
+    g = _member_level(ring_replay)["graph"]
+    assert g["meta"]["topology"] == "ring"
+    inner_names = {n["name"] for c in g["nodes"] if c.get("inner")
+                   for n in c["inner"]["nodes"]}
+    assert not any(n.endswith(".hub") for n in inner_names)
+    member_nodes = [n for n in inner_names if re.match(r"^s\d+\.m\d+$", n)]
+    assert len(member_nodes) == 4  # tp=4 members
+    assert {"cw", "ccw"} <= {e["name"] for e in g["edges"]}
 
 
 # ---- chip levels iff graph mode ---------------------------------------------
