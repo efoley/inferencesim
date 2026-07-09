@@ -20,6 +20,7 @@
     --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }  /* .ctl's display:flex must not defeat the hidden attribute */
   html, body {
     margin: 0; height: 100%; background: var(--bg); color: var(--ink);
     font-family: var(--font); font-size: 13px; overflow: hidden;
