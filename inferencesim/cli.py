@@ -10,12 +10,15 @@
 from __future__ import annotations
 
 import argparse
+import importlib.resources
 import json
 import sys
+import tempfile
+import webbrowser
 from dataclasses import replace
 from pathlib import Path
 
-from .bridge import system_from_graph, system_to_graph
+from .bridge import chip_graph_of, system_from_graph, system_to_graph
 from .calibration import calibrate_report
 from .des import DESEngine
 from .efficiency import PROFILES, Efficiency, profile_for
@@ -24,6 +27,7 @@ from .graph import Graph
 from .hardware import DType, System
 from .presets import HARDWARE, MODELS
 from .presets_fine import GRAPH_PRESETS
+from .replay import build_replay
 from .report import format_report
 from .sched import chrome_trace
 from .serve import (
@@ -104,16 +108,6 @@ def _resolve_hw_graph(args: argparse.Namespace) -> Graph | None:
     if args.hardware in GRAPH_PRESETS:
         return GRAPH_PRESETS[args.hardware]()
     return None
-
-
-def _chip_graph_of(g: Graph) -> Graph:
-    """The chip-level model to walk in graph mode: the first role='chip'
-    composite's inner graph, or the whole graph if there is no such composite
-    (a bare chip graph)."""
-    for _path, node in g.walk():
-        if node.role == "chip" and node.inner is not None:
-            return node.inner
-    return g
 
 
 def _resolve_system(args: argparse.Namespace) -> System | None:
@@ -204,7 +198,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     efficiency = _efficiency_from_args(args, getattr(args, "hardware", None) or "")
     if args.engine == "des":
         hw_graph = _resolve_hw_graph(args)
-        chip_graph = _chip_graph_of(hw_graph) if hw_graph is not None else None
+        chip_graph = chip_graph_of(hw_graph) if hw_graph is not None else None
         if chip_graph is not None:
             print(f"graph mode: costing chip ops on the expanded "
                   f"'{chip_graph.name}' graph (tile-fill {args.tile_fill})",
@@ -238,6 +232,69 @@ def _cmd_run(args: argparse.Namespace) -> int:
             json.dumps({"traceEvents": events, "displayTimeUnit": "ms"}))
         print(f"wrote Chrome trace ({len(events)} events) to {args.trace}",
               file=sys.stderr)
+    return 0
+
+
+def _render_viewer(replay: dict) -> str:
+    """Inject the replay JSON into the packaged viewer template."""
+    template = (importlib.resources.files("inferencesim")
+                .joinpath("viewer.html").read_text(encoding="utf-8"))
+    if "/*__REPLAY_JSON__*/" not in template:
+        raise RuntimeError("viewer.html is missing the /*__REPLAY_JSON__*/ marker")
+    payload = json.dumps(replay, separators=(",", ":"))
+    # defensive: never let a data string terminate the <script> block early.
+    payload = payload.replace("</", "<\\/")
+    return template.replace("/*__REPLAY_JSON__*/", payload)
+
+
+def _cmd_ui(args: argparse.Namespace) -> int:
+    if args.model not in MODELS:
+        print(f"unknown model '{args.model}' (try: inferencesim list)", file=sys.stderr)
+        return 2
+    if not args.graph and not args.hardware:
+        print("pass --hardware KEY or --graph FILE", file=sys.stderr)
+        return 2
+    system = _resolve_system(args)
+    if system is None:
+        print(f"unknown hardware '{args.hardware}' (try: inferencesim list)",
+              file=sys.stderr)
+        return 2
+    model = _apply_moe_skew(MODELS[args.model], args.moe_skew)
+    dep = Deployment(
+        tp=args.tp, pp=args.pp, ep=args.ep, adp=args.adp,
+        weight_dtype=DType(args.weight_dtype),
+        kv_dtype=DType(args.kv_dtype),
+        act_dtype=DType(args.act_dtype),
+        cp_prefill=args.cp_prefill,
+    )
+    scen = Scenario(batch=args.batch, prompt_len=args.prompt, output_len=args.output)
+    efficiency = _efficiency_from_args(args, getattr(args, "hardware", None) or "")
+
+    hw_graph = _resolve_hw_graph(args)
+    chip_graph = chip_graph_of(hw_graph) if hw_graph is not None else None
+    if chip_graph is not None:
+        print(f"graph mode: chip ops walk the expanded '{chip_graph.name}' graph "
+              f"(tile-fill {args.tile_fill})", file=sys.stderr)
+    engine = DESEngine(decode_rounds=args.decode_rounds, chip_graph=chip_graph,
+                       tile_fill=args.tile_fill, efficiency=efficiency)
+    # a full run populates the engine and lets us surface a header sanity number
+    simulate(system, model, scen, dep, engine=engine)
+    replay = build_replay(engine, system, model, scen, dep, hw_graph)
+    html = _render_viewer(replay)
+
+    if args.out:
+        out_path = Path(args.out)
+    else:
+        fd = tempfile.NamedTemporaryFile(
+            prefix="inferencesim-", suffix=".html", delete=False)
+        fd.close()
+        out_path = Path(fd.name)
+    out_path.write_text(html, encoding="utf-8")
+    n_levels = len(replay["levels"])
+    print(f"wrote viewer ({len(html) // 1024} KiB, {n_levels} level(s)) to {out_path}",
+          file=sys.stderr)
+    if not args.no_open:
+        webbrowser.open(out_path.resolve().as_uri())
     return 0
 
 
@@ -422,6 +479,43 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--pue", type=float, default=1.25)
     _add_efficiency_args(run)
     run.set_defaults(fn=_cmd_run)
+
+    ui = sub.add_parser("ui", help="build a single-file HTML replay viewer of "
+                                   "the discrete-event run and open it")
+    ui.add_argument("--hardware", help="hardware preset or graph preset key")
+    ui.add_argument("--graph", help="path to a hardware graph JSON file")
+    ui.add_argument("--model", required=True, help="model preset key")
+    ui.add_argument("--tp", type=int, default=1, help="tensor-parallel degree")
+    ui.add_argument("--pp", type=int, default=1, help="pipeline-parallel stages")
+    ui.add_argument("--ep", type=int, default=1,
+                    help="expert-parallel groups (MoE models only)")
+    ui.add_argument("--adp", type=int, default=1,
+                    help="attention-data-parallel groups (dense models only)")
+    ui.add_argument("--no-cp-prefill", dest="cp_prefill", action="store_false",
+                    help="disable context-parallel prefill (see `run --no-cp-prefill`)")
+    ui.set_defaults(cp_prefill=True)
+    ui.add_argument("--moe-skew", type=float, default=None,
+                    help="MoE expert-load imbalance (Zipf exponent; 0 = uniform, "
+                         "larger = hotter experts). Under the DES the dispatch/"
+                         "combine all-to-all incasts onto the hot owner's ingress "
+                         "port -- visible in the viewer as ingress-port occupancy")
+    ui.add_argument("--batch", type=int, default=32,
+                    help="concurrent sequences per replica")
+    ui.add_argument("--prompt", type=int, default=2048, help="prompt tokens per request")
+    ui.add_argument("--output", type=int, default=512, help="output tokens per request")
+    ui.add_argument("--weight-dtype", default="fp8", choices=[d.value for d in DType])
+    ui.add_argument("--kv-dtype", default="bf16", choices=[d.value for d in DType])
+    ui.add_argument("--act-dtype", default="bf16", choices=[d.value for d in DType])
+    ui.add_argument("--tile-fill", type=float, default=0.5,
+                    help="graph mode: fraction of per-core SRAM a tile may use")
+    ui.add_argument("--decode-rounds", type=int, default=None,
+                    help="pin the DES decode measurement to a fixed round count")
+    ui.add_argument("-o", "--out", metavar="FILE",
+                    help="write the HTML here (default: a temp file)")
+    ui.add_argument("--no-open", action="store_true",
+                    help="do not open a browser (just write the file)")
+    _add_efficiency_args(ui)
+    ui.set_defaults(fn=_cmd_ui)
 
     cal = sub.add_parser("calibrate",
                          help="score the simulator against measured anchors "

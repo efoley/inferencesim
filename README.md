@@ -367,6 +367,51 @@ default on); MoE context-parallel prefill remains future work. See
   busy fraction → watts and joules per output token.
 - **Cost**: amortized capex + electricity (PUE-adjusted) → $/M tokens.
 
+### Viewer
+
+`inferencesim ui` renders a **discrete-event run as a live telemetry scene** you
+can single-step to *see* tensors move through the machine — where the data flows
+and where it piles up. Aggregate statistics stay on the CLI; this is for
+building intuition about the schedule.
+
+```bash
+# lumped preset -> the pipeline-stage level only
+inferencesim ui --hardware gb300-nvl72 --model llama-3.1-70b \
+    --tp 2 --pp 2 --batch 16 --prompt 512 --output 64 --weight-dtype fp8
+# a fine graph preset -> adds a per-op chip level (banks -> NoC -> cores)
+inferencesim ui --hardware tt-quietbox-fine --model llama-3.1-70b \
+    --tp 2 --pp 2 --batch 8 --prompt 512 --output 64 --kv-dtype fp8
+```
+
+It writes **one self-contained HTML file** (default a temp file; `-o` to name it,
+`--no-open` to skip the browser) — **no build step, no external dependencies, no
+CDN**: a single hand-written canvas scene with the run's data embedded as JSON.
+Open it and you get:
+
+- a **hierarchical scene** — pipeline stages as translucent composite boxes
+  (click to fold), and, in graph mode, the expanded chip auto-grouped into
+  `gddr6-bank ×8` / `tensix-fpu ×140` glyphs (click a ×N glyph to expand its
+  instance grid);
+- **play / pause, single-step (← →), a speed control and a scrubber** with a mini
+  activity strip; at time *t* active compute glows its unit/core, transfers
+  stream as **glowing particles** along the links (size ∝ bytes, colour by kind:
+  read / writeback / collective / hop), imminent work stacks up as a queue badge,
+  and a toggleable **heat tint** builds cumulative utilisation;
+- **hover** for an element's attributes + live active/queued/busy state, **click**
+  to pin that in a side panel; a level dropdown, phase toggle and (chip level) op
+  selector in the top bar.
+
+<!-- screenshot: `inferencesim ui --hardware tt-quietbox-fine ...`, chip level,
+     decode/ffn, an instance group expanded mid-replay. -->
+
+The data the viewer plays is a **versioned replay document**
+(`inferencesim/replay.py`, `"format": "inferencesim-replay-v1"`) built by
+`build_replay(...)` — a stable contract, independent of this viewer, that a
+future native (ImGui / emscripten) front-end would consume unchanged. Each level
+ships a standard hardware `Graph` plus a `resource_map` from DES resource names
+to graph elements and compact per-phase task tracks; decode is capped to a small
+steady-state window so the file stays loadable (documented in `meta`).
+
 ## Accuracy disclaimers
 
 - Preset spec numbers (FLOPs, bandwidths, prices, power splits) are
@@ -408,7 +453,11 @@ default on); MoE context-parallel prefill remains future work. See
   request-level serving loop, `inferencesim serve`; extending it to chunked
   prefill and pp>1 is next — see `DES_todo.md` §4.)
 - **Graph editor UI** over the JSON graph format (nodes with constraints,
-  edges with latencies, nesting for abstraction levels).
+  edges with latencies, nesting for abstraction levels). (**A read-only replay
+  *viewer* landed**: `inferencesim ui` renders a discrete-event run as a
+  single-file, dependency-free canvas scene you can single-step — see the Viewer
+  subsection. The versioned `inferencesim-replay-v1` document it plays is the
+  contract; *editing* the graph in-browser is what stays open here.)
 - Multi-rack topologies (rail-optimized Ethernet/IB); EPLB redundant-expert
   *mitigation* of MoE hot-expert load imbalance. (**Hot-expert imbalance itself
   landed**: `--moe-skew` skews expert popularity, pacing `moe_routed` by the hot
