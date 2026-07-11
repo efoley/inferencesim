@@ -12,8 +12,10 @@ from dataclasses import replace
 import pytest
 
 from inferencesim.bridge import chip_graph_of, system_from_graph
+from inferencesim.collectives import is_sync_resource
 from inferencesim.des import DESEngine
 from inferencesim.hardware import DType
+from inferencesim.ops import prefill_ops
 from inferencesim.presets import GB300_NVL72, GPT_OSS_120B, LLAMA_3_1_70B
 from inferencesim.presets_fine import blackhole_p150_mesh, tt_quietbox_fine
 from inferencesim.replay import FORMAT, TASK_KINDS, build_replay
@@ -50,6 +52,21 @@ def moe_skew_replay():
     owner's ingress port, so the stage level carries `s{s}.l{i}.in` resources
     the dense fixtures never exercise."""
     model = replace(GPT_OSS_120B, moe=replace(GPT_OSS_120B.moe, skew=0.6))
+    dep = Deployment(tp=1, ep=8, weight_dtype=DType.FP8, kv_dtype=DType.FP8)
+    scen = Scenario(batch=4, prompt_len=256, output_len=32)
+    engine = DESEngine(decode_rounds=6)
+    simulate(GB300_NVL72, model, scen, dep, engine=engine)
+    return build_replay(engine, GB300_NVL72, model, scen, dep, None)
+
+
+@pytest.fixture(scope="module")
+def moe_skew_capped_replay():
+    """A DEP8 skewed-MoE run heavy enough to trip the per-track downsample cap
+    (`_TRACK_CAP`): every layer's dispatch/combine all-to-all contributes an odd
+    number of samplable rows, so a naive stride sampler aliases exactly the
+    incast rows away -- the artifact this whole busy-map contract exists to fix.
+    Its per-resource `busy` must stay authoritative regardless."""
+    model = replace(GPT_OSS_120B, moe=replace(GPT_OSS_120B.moe, skew=1.2))
     dep = Deployment(tp=1, ep=8, weight_dtype=DType.FP8, kv_dtype=DType.FP8)
     scen = Scenario(batch=4, prompt_len=256, output_len=32)
     engine = DESEngine(decode_rounds=6)
@@ -433,3 +450,81 @@ def test_downsample_cap_flag_is_honest(graph_replay):
                 assert len(track["rows"]) <= track["n"]
             else:
                 assert len(track["rows"]) == track["n"]
+
+
+# ---- authoritative per-resource busy map ------------------------------------
+
+
+def _ingress_busy_by_member(track):
+    """Sum a stage/member track's `busy` per member's ingress (`.l{i}.in`)."""
+    per = {}
+    for name, seconds in track["busy"].items():
+        m = re.match(r"^s\d+\.l(\d+)\.in$", name)
+        if m:
+            per[int(m.group(1))] = per.get(int(m.group(1)), 0.0) + seconds
+    return per
+
+
+def test_every_track_carries_a_busy_map_resolving_to_graph_elements(lumped_replay):
+    """`busy` is present on every track and every key resolves to a graph
+    element -- the viewer reads its heat/% straight from it, so a dangling key
+    would tint (or mislabel) nothing."""
+    checked = 0
+    for level in lumped_replay["levels"]:
+        rmap = level["resource_map"]
+        for _phase, _op, track in _tracks(level):
+            assert isinstance(track.get("busy"), dict), "track missing busy map"
+            for name in track["busy"]:
+                assert name in rmap, f"busy key {name} unmapped in {level['id']}"
+            checked += 1
+    assert checked > 0
+
+
+def test_track_busy_is_authoritative_even_when_capped(moe_skew_capped_replay):
+    """The stage prefill track genuinely trips the downsample cap, yet its
+    per-resource `busy` equals the engine's `ScheduleResult.busy` (sync-filtered)
+    -- summed over the *full* task set, not the sampled rows.  This is the crux
+    of the fix: summing the capped rows would drop the incast (member-0 ingress)
+    entirely, inverting the heat map."""
+    doc = moe_skew_capped_replay
+    stage = _stage_level(doc)
+    track = stage["phases"]["prefill"]
+    assert track["capped"], "fixture no longer trips the cap; pick a heavier case"
+    assert len(track["rows"]) < track["n"]  # rows really are a sampled subset
+
+    # prefill's schedule is independent of the decode window, so a plain engine
+    # reproduces exactly the run build_replay measured internally.
+    model = replace(GPT_OSS_120B, moe=replace(GPT_OSS_120B.moe, skew=1.2))
+    dep = Deployment(tp=1, ep=8, weight_dtype=DType.FP8, kv_dtype=DType.FP8)
+    scen = Scenario(batch=4, prompt_len=256, output_len=32)
+    engine = DESEngine()
+    engine.run_phase("prefill", prefill_ops(model, scen.prompt_len, dep),
+                     GB300_NVL72, dep)
+    _tasks, result = engine.last_runs["prefill"]
+    expected = {r: b for r, b in result.busy.items()
+                if b > 0.0 and not is_sync_resource(r)}
+
+    assert set(track["busy"]) == set(expected)
+    for name, seconds in expected.items():
+        assert track["busy"][name] == pytest.approx(seconds, rel=1e-9)
+
+    # and the incast rows the sampler drops really are missing from the rows but
+    # present (dominant) in busy: member 0's ingress is the hottest ingress port.
+    ingress = _ingress_busy_by_member(track)
+    assert ingress and max(ingress, key=ingress.get) == 0
+
+
+def test_member0_owns_the_incast_in_both_phases(moe_skew_capped_replay):
+    """The skewed all-to-all incasts onto the hot expert-owner (member 0), so in
+    *both* prefill and decode member 0 must carry the largest ingress busy in the
+    authoritative map -- pinning the direction the stride artifact hid (it showed
+    member 0 as the coldest member in prefill)."""
+    stage = _stage_level(moe_skew_capped_replay)
+    for phase in ("prefill", "decode"):
+        ingress = _ingress_busy_by_member(stage["phases"][phase])
+        assert ingress, f"{phase}: no ingress-port busy recorded"
+        hottest = max(ingress, key=ingress.get)
+        assert hottest == 0, (f"{phase}: member {hottest} hotter than member 0 "
+                              f"({ingress})")
+        others = max(b for m, b in ingress.items() if m != 0)
+        assert ingress[0] > others  # strictly hottest, not tied

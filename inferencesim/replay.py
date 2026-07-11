@@ -47,8 +47,15 @@ A **track** is the compact, columnar encoding of one scheduled task list
   "rows":   [ [res_i, start, end, kind_i, label_i, bytes], ... ],
   "n": int,          # task count BEFORE any downsample cap
   "capped": bool,    # true if `rows` is a sampled subset of `n`
+  "busy": { resource_name: seconds },  # authoritative per-resource busy
 }
 ```
+
+`busy` is the per-resource occupancy (seconds, window-relative, sync fences
+excluded) summed over the *full* task set **before** any capping, so heat/busy
+meters stay honest even when `rows` is a sampled subset: a `capped` track's
+stride can alias whole resource classes out of `rows` (the skewed-MoE incast),
+but never out of `busy`.  Divide by `makespan` for a utilisation fraction.
 
 `kind_i` indexes `TASK_KINDS`.  Read/writeback rows carry per-tile `bytes`
 (op DRAM bytes / n_tiles) so a particle can scale with payload; sync rows
@@ -73,6 +80,7 @@ import re
 from dataclasses import replace
 
 from .bridge import chip_graph_of
+from .collectives import is_sync_resource
 from .des import DESEngine
 from .engine import CommContext
 from .graph import Edge, Graph, Node, NodeKind
@@ -322,7 +330,7 @@ def _phase_tracks(engine: DESEngine, warmup: int,
         )
         for res, *_ in rows:
             resources.add(res)
-        phases[phase] = _encode_track(rows)
+        phases[phase] = _encode_track(rows, _rows_busy(rows))
     return phases, resources
 
 
@@ -554,7 +562,11 @@ def _chip_level(engine: DESEngine, phase_ops: dict[str, list[Op]]) -> dict:
             rows = _chip_rows(sched.tasks, sched.result, read_per, write_per)
             for res, *_ in rows:
                 resources.add(res)
-            tracks[op_name] = _encode_track(rows)
+            # chip resources are processor-shared, so busy is union-of-intervals,
+            # not a row-duration sum -- carry the scheduler's authoritative figure.
+            busy = {r: b for r, b in sched.result.busy.items()
+                    if b > 0.0 and not is_sync_resource(r)}
+            tracks[op_name] = _encode_track(rows, busy)
             if op_name not in ops_seen:
                 ops_seen.append(op_name)
         phases[phase] = tracks
@@ -613,10 +625,34 @@ def _classify_chip(label: str) -> int:
 # =============================================================================
 
 
-def _encode_track(rows: list[list]) -> dict:
+def _rows_busy(rows: list[list]) -> dict[str, float]:
+    """Authoritative per-resource busy (seconds) over the *full* row set, sync
+    fences excluded (`is_sync_resource`).  Stage/member resources schedule FIFO
+    on a single server, so a row's ``end - start`` is its task's whole duration
+    and the per-resource sum equals `ScheduleResult.busy` exactly -- but summed
+    here rather than read from the result because the decode rows are a re-zeroed
+    steady-state *window* of a longer schedule, so the whole-run `result.busy`
+    would not match the windowed track makespan.  (Processor-shared chip
+    resources are *not* summed this way -- their busy is union-of-intervals, so
+    `_chip_level` carries `ScheduleResult.busy` directly.)"""
+    busy: dict[str, float] = {}
+    for resource, start, end, _kind, _label, _payload in rows:
+        if is_sync_resource(resource):
+            continue
+        busy[resource] = busy.get(resource, 0.0) + (end - start)
+    return busy
+
+
+def _encode_track(rows: list[list], busy: dict[str, float]) -> dict:
     """Intern resource names and labels and emit array rows.  If the row count
     exceeds `_TRACK_CAP`, the samplable kinds (read / writeback / collective /
-    sync) are strided down while compute and hop rows are kept in full."""
+    sync) are strided down while compute and hop rows are kept in full.
+
+    `busy` is the authoritative per-resource busy map (seconds, sync excluded),
+    computed by the caller over the *full* task set before any capping; the
+    viewer reads its heat/busy meters from it rather than re-summing the (possibly
+    sampled) rows, whose stride can alias whole resource classes out of a capped
+    track (the DEP8 skewed-MoE incast bug)."""
     n = len(rows)
     if n > _TRACK_CAP:
         rows, capped = _downsample(rows, _TRACK_CAP)
@@ -641,6 +677,7 @@ def _encode_track(rows: list[list]) -> dict:
         "rows": out_rows,
         "n": n,
         "capped": capped,
+        "busy": {r: b for r, b in busy.items() if b > 0.0},
     }
 
 

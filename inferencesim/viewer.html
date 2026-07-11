@@ -302,6 +302,10 @@ const DOC = loadDoc();
         console.assert(r[1] <= r[2] + 1e-9 && r[2] <= tr.makespan + 1e-9, "row time out of range");
         console.assert(r[3] >= 0 && r[3] < 6, "kind out of range", r[3]);
       }
+      // the authoritative busy map drives heat/% -- every key must resolve to a
+      // graph element (it can name resources whose rows were sampled away).
+      for (const name in (tr.busy || {}))
+        console.assert(name in lvl.resource_map, "busy resource not mapped", name);
     }
   }
   console.info(`[inferencesim] self-check ok — ${DOC.levels.length} level(s), ${checkedTracks} track(s), ${checkedRows} task rows validated`);
@@ -766,6 +770,11 @@ const heatKind = g => (g ? (g.role || "") + "|" + (g.kind || "") : "?");
 const heatParent = c => (c._composite ? c._composite.id : "__root__");
 function trackTotalBusy(track) {
   if (track._totalBusy) return track._totalBusy;
+  // authoritative per-resource busy map (seconds) carried by replay.py, summed
+  // over the full pre-cap task set -- honest even when `rows` is a sampled subset
+  // whose stride can alias whole resource classes away. Legacy/demo docs predate
+  // the field; their rows are complete, so summing them is exact.
+  if (track.busy) return track._totalBusy = track.busy;
   const tb = {};
   for (const r of track.rows) { const n = track.res[r[0]]; tb[n] = (tb[n] || 0) + (r[2] - r[1]); }
   return track._totalBusy = tb;
@@ -776,8 +785,13 @@ function computeHeat(track, scan) {
   if (!HEAT.on) return;
   // t~=0 (not yet playing / scrubbed to the very start): summarise the whole run.
   HEAT.whole = CLOCK.t <= (track.makespan || 0) * 1e-4;
-  const elapsed = HEAT.whole ? (track.makespan || 1e-9) : (CLOCK.t || 1e-9);
-  const busySrc = HEAT.whole ? trackTotalBusy(track) : scan.busy;
+  // A capped track's rows are a stride-sampled subset that can drop whole
+  // resource classes (the skewed-MoE incast), so summing them to the playhead
+  // would lie; its heat/% always reads the authoritative whole-run busy map.
+  // Only a fully-present (uncapped) track animates cumulative-to-playhead heat.
+  const authoritative = HEAT.whole || track.capped;
+  const elapsed = authoritative ? (track.makespan || 1e-9) : (CLOCK.t || 1e-9);
+  const busySrc = authoritative ? trackTotalBusy(track) : scan.busy;
   const rmap = MODEL.lvl.resource_map;
   // 1) per-resource absolute fraction -> max into the owning cell (+ instance).
   for (const name in busySrc) {
@@ -1194,8 +1208,11 @@ function levelHelpHTML(lvl) {
     `parent and kind (a stage's members, DRAM banks vs cores) — so the hottest ` +
     `saturates and the rest scale below it, keeping a 5× gap legible where an ` +
     `absolute scale would crush it; the dim mono <b>%</b> on each node is the ` +
-    `honest absolute figure. Before you press play it summarises the <b>whole ` +
-    `run</b>; once playing it accumulates cumulatively up to the playhead.</p>`;
+    `honest absolute figure, read from the export's authoritative per-resource ` +
+    `busy map. Before you press play it summarises the <b>whole run</b>; once ` +
+    `playing an un-downsampled track accumulates cumulatively up to the playhead, ` +
+    `while a <b>downsampled</b> track keeps showing its whole-run figure (its ` +
+    `sampled rows can't be summed to the playhead honestly).</p>`;
   if (lvl.kind === "member") {
     const ring = (lvl.graph.meta && lvl.graph.meta.topology) === "ring";
     return `<h4>Stage members — inside one stage's fabric</h4>` +
