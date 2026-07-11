@@ -745,27 +745,109 @@ function drawComposite(c, rc, color, scan) {
   ctx.restore();
   if (c.collapsed) {
     const { a } = activityOf(scan, c);
-    glowNode(rc, color, clamp(a/4, 0, 1), c.gnode.name);
+    const h = heatFor(c);
+    glowNode(rc, color, clamp(a/4, 0, 1), c.gnode.name, h ? h.rel : 0);
+    if (h && h.frac > 0 && heatFits(rc)) drawHeatPct(rc, h.frac);
   }
 }
 
-function heatTint(cell, scan) {
-  if (!showHeat) return 0;
-  let busy = 0;
-  for (const name in scan.busy) if (cellMatches(name, cell)) busy = Math.max(busy, scan.busy[name]);
-  return clamp(busy / (CLOCK.t || 1e-9), 0, 1);
+// ---- heat: cumulative "% of time busy", precomputed once per frame ----------
+// The absolute fraction per cell (busy/elapsed, max over its backing resources)
+// is computed once; the *tint* is then normalised WITHIN sibling groups -- cells
+// that share a parent container and node kind/class (the 8 members of a stage,
+// the pooled compute on its own, DRAM banks vs cores) -- so the hottest sibling
+// saturates and small relative differences stay legible instead of crushing into
+// a shared near-black. Before the playhead moves (t~=0) it falls back to the
+// whole run so heat reads as "where's the bottleneck overall" rather than blank.
+// HEAT.frac drives the honest absolute % label; HEAT.rel / HEAT.inst.rel drive
+// the brightness.
+const HEAT = { on: false, whole: false, frac: new Map(), rel: new Map(), inst: new Map() };
+const heatKind = g => (g ? (g.role || "") + "|" + (g.kind || "") : "?");
+const heatParent = c => (c._composite ? c._composite.id : "__root__");
+function trackTotalBusy(track) {
+  if (track._totalBusy) return track._totalBusy;
+  const tb = {};
+  for (const r of track.rows) { const n = track.res[r[0]]; tb[n] = (tb[n] || 0) + (r[2] - r[1]); }
+  return track._totalBusy = tb;
+}
+function computeHeat(track, scan) {
+  HEAT.frac.clear(); HEAT.rel.clear(); HEAT.inst.clear();
+  HEAT.on = !!(showHeat && track && MODEL);
+  if (!HEAT.on) return;
+  // t~=0 (not yet playing / scrubbed to the very start): summarise the whole run.
+  HEAT.whole = CLOCK.t <= (track.makespan || 0) * 1e-4;
+  const elapsed = HEAT.whole ? (track.makespan || 1e-9) : (CLOCK.t || 1e-9);
+  const busySrc = HEAT.whole ? trackTotalBusy(track) : scan.busy;
+  const rmap = MODEL.lvl.resource_map;
+  // 1) per-resource absolute fraction -> max into the owning cell (+ instance).
+  for (const name in busySrc) {
+    const frac = clamp(busySrc[name] / elapsed, 0, 1);
+    if (frac <= 0) continue;
+    const ref = rmap[name]; if (!ref) continue;
+    const hit = MODEL.cellFor(ref); if (!hit) continue;
+    const c = hit.cell, cur = HEAT.frac.get(c.id);
+    if (cur === undefined || frac > cur) HEAT.frac.set(c.id, frac);
+    if (c.kind === "group" && hit.inst != null) {
+      let rec = HEAT.inst.get(c.id);
+      if (!rec) { rec = { frac: new Array(c.insts.length).fill(0), rel: new Array(c.insts.length).fill(0) }; HEAT.inst.set(c.id, rec); }
+      if (frac > rec.frac[hit.inst]) rec.frac[hit.inst] = frac;
+    }
+  }
+  // 2) sibling-group maxima: cells sharing a parent container + node kind/class.
+  const gmax = new Map();
+  for (const c of MODEL.allCells) {
+    const f = HEAT.frac.get(c.id); if (f === undefined) continue;
+    const key = heatParent(c) + "::" + heatKind(c.gnode);
+    if (f > (gmax.get(key) || 0)) gmax.set(key, f);
+  }
+  // 3) relative brightness = frac / sibling-max (idle groups stay untinted).
+  for (const c of MODEL.allCells) {
+    const f = HEAT.frac.get(c.id); if (f === undefined) continue;
+    const mx = gmax.get(heatParent(c) + "::" + heatKind(c.gnode)) || 0;
+    HEAT.rel.set(c.id, mx > 1e-9 ? clamp(f / mx, 0, 1) : 0);
+  }
+  // expanded-group instances are their own sibling set (one group box).
+  for (const rec of HEAT.inst.values()) {
+    let mx = 0; for (const v of rec.frac) if (v > mx) mx = v;
+    if (mx > 1e-9) for (let i = 0; i < rec.rel.length; i++) rec.rel[i] = clamp(rec.frac[i] / mx, 0, 1);
+  }
+}
+// relative brightness (0..1) + absolute fraction for a drawable cell, or null.
+function heatFor(cell) {
+  if (!HEAT.on) return null;
+  const frac = HEAT.frac.get(cell.id);
+  if (frac === undefined) return null;
+  return { rel: HEAT.rel.get(cell.id) || 0, frac };
+}
+function fmtHeatPct(f) {
+  const p = f * 100;
+  return (p >= 99.95 ? "100" : p < 10 ? p.toFixed(1) : p.toFixed(0)) + "%";
+}
+// dim mono absolute-% label under a node's name -- the honest number behind the
+// (sibling-relative) glow. Skipped on cells too small to hold it; there tint
+// alone carries the signal (tiny instance grids never reach this).
+const heatFits = rc => rc.w >= 30 && rc.h >= 26;
+function drawHeatPct(rc, frac) {
+  ctx.save();
+  ctx.font = "600 9px var(--mono)";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "rgba(255,214,160,0.72)";
+  ctx.fillText(fmtHeatPct(frac), rc.x + rc.w / 2, rc.y + rc.h / 2 + 8);
+  ctx.restore();
 }
 
 function drawNode(c, rc, color, scan) {
   const { a, p } = activityOf(scan, c);
-  const heat = heatTint(c, scan);
-  glowNode(rc, color, clamp(a / capacityOf(c), 0, 1), null, heat);
-  // label
+  const h = heatFor(c);
+  glowNode(rc, color, clamp(a / capacityOf(c), 0, 1), null, h ? h.rel : 0);
+  // label -- nudged up to make room for the absolute-% heat label when shown
+  const showPct = h && h.frac > 0 && heatFits(rc);
   ctx.fillStyle = "rgba(225,232,245,0.92)"; ctx.font = "600 11px var(--font)";
   ctx.textAlign = "center"; ctx.textBaseline = "middle";
   const lbl = c.kind === "group" ? c.base : dispLabel(c.gnode);
-  ctx.fillText(fitText(lbl, rc.w - 12), rc.x + rc.w/2, rc.y + rc.h/2);
+  ctx.fillText(fitText(lbl, rc.w - 12), rc.x + rc.w/2, rc.y + rc.h/2 - (showPct ? 7 : 0));
   ctx.textAlign = "left";
+  if (showPct) drawHeatPct(rc, h.frac);
   // count badge
   if (c.kind === "group" && c.collapsed) badge(rc, "×" + c.insts.length, color);
   // pending queue stack
@@ -789,10 +871,12 @@ function drawExpandedGroup(c, rc, color, scan) {
     perInst[hit.inst] = (perInst[hit.inst] || 0) + scan.active[name];
   }
   const cap = capacityOf(c) / Math.max(1, c.insts.length);
+  const hrec = HEAT.on ? HEAT.inst.get(c.id) : null;  // per-instance sibling-relative tint
   for (let i = 0; i < c.insts.length; i++) {
     const gr = gridCellRect(c, i);  // same geometry hit-testing uses
     const act = clamp((perInst[i] || 0) / Math.max(cap, 1), 0, 1);
-    glowNode({ x: gr.x, y: gr.y, w: gr.w - 3, h: gr.h - 3 }, color, act, null, 0, 4);
+    glowNode({ x: gr.x, y: gr.y, w: gr.w - 3, h: gr.h - 3 }, color, act, null,
+             hrec ? hrec.rel[i] : 0, 4);
   }
 }
 
@@ -1030,6 +1114,7 @@ function frame(ts) {
   if (tr) {
     const look = makespan() * 0.02;
     const scan = scanTrack(tr, CLOCK.t, look);
+    computeHeat(tr, scan);   // once per frame; heatFor()/HEAT.inst feed the draws
     drawEdges(MODEL, scan);
     drawCells(MODEL, scan, MODEL.topCells, 0);
     pinfo = drawParticles(MODEL, scan.particles);
@@ -1066,7 +1151,10 @@ function buildBar() {
     document.querySelectorAll("#phase-seg .btn").forEach(x => x.classList.remove("on"));
     b.classList.add("on"); STATE.phase = b.dataset.phase; onTrackChange();
   });
-  document.getElementById("btn-heat").onclick = e => { showHeat = !showHeat; e.target.classList.toggle("on", showHeat); };
+  document.getElementById("btn-heat").onclick = e => {
+    showHeat = !showHeat; e.target.classList.toggle("on", showHeat);
+    const lh = document.getElementById("legend-heat"); if (lh) lh.hidden = !showHeat;
+  };
   document.getElementById("btn-fit").onclick = () => relayout(true);
   const sp = document.getElementById("speed");
   const applySpeed = () => { CLOCK.rate = Math.pow(10, +sp.value); document.getElementById("speed-lbl").textContent = fmtTime(CLOCK.rate) + "/s"; };
@@ -1085,6 +1173,7 @@ function buildBar() {
     `<div class="row" style="margin-top:5px"><svg width="26" height="10"><path d="M1 7 Q13 1 22 5" stroke="rgba(120,150,220,.7)" fill="none"/><path d="M25 5 L19 3 L20 7 Z" fill="rgba(120,150,220,.7)"/></svg>link (width ~ bandwidth)</div>` +
     `<div class="row"><svg width="26" height="10"><path d="M1 6 Q13 1 25 5" stroke="rgba(150,130,220,.8)" stroke-dasharray="4 3" fill="none"/></svg>ring wrap (next round)</div>` +
     `<div class="row"><svg width="26" height="12"><rect x="9" y="8" width="8" height="3" fill="rgba(140,150,190,.9)"/><rect x="9" y="4" width="8" height="3" fill="rgba(140,150,190,.65)"/><rect x="9" y="0" width="8" height="3" fill="rgba(140,150,190,.4)"/></svg>tasks queued (waiting)</div>` +
+    `<div class="row" id="legend-heat" hidden><span class="dot" style="color:${COL.compute}"></span>heat: % of time busy (brightness relative to siblings)</div>` +
     `<div class="row" style="color:var(--ink-faint)">timeline strip: active tasks by kind</div>`;
   // header meta
   const m = DOC.meta;
@@ -1099,7 +1188,14 @@ function levelHelpHTML(lvl) {
     `("downsampled" = the export kept a uniform sample of a larger run). ` +
     `<b>particles</b> — transfers in flight at the playhead, drawn as dots riding ` +
     `the edge lanes; at most ${PARTICLE_CAP} are drawn ("sampled" = a subset of ` +
-    `the true count).</p>`;
+    `the true count).</p>` +
+    `<p><b>heat</b> (toggle · <code>h</code>): tints each node by its <b>% of time ` +
+    `busy</b>. Brightness is <i>relative to its siblings</i> — nodes sharing a ` +
+    `parent and kind (a stage's members, DRAM banks vs cores) — so the hottest ` +
+    `saturates and the rest scale below it, keeping a 5× gap legible where an ` +
+    `absolute scale would crush it; the dim mono <b>%</b> on each node is the ` +
+    `honest absolute figure. Before you press play it summarises the <b>whole ` +
+    `run</b>; once playing it accumulates cumulatively up to the playhead.</p>`;
   if (lvl.kind === "member") {
     const ring = (lvl.graph.meta && lvl.graph.meta.topology) === "ring";
     return `<h4>Stage members — inside one stage's fabric</h4>` +
