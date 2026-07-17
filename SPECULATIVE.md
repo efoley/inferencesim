@@ -39,6 +39,15 @@ are balanced for batched decode rather than wasted on FLOP they can't feed.
 On-chip NoC/SRAM are sized above DRAM so the memory stack stays the min-cut
 (asserted in `test_presets_spec.py`).
 
+**Capacity -- what fits.** A swarm's usable memory is the sum over its tiles, so
+`lpddr6-swarm-64` is 64 × 48 GB = **3.07 TB** (and `lpddr-swarm-64` is 64 × 32 GB
+= 2.05 TB). Leaving ~1/3 for KV + activations, that holds up to ~**2 T dense
+params at fp8** (~4 T at fp4) -- though a dense multi-T model would stream TB per
+token and crawl; the practical ceiling is throughput, not fit. MoE scales far
+better, since only the active slice streams. Concretely on `lpddr6-swarm-64`
+(fp8): llama-70b uses 12 GB/tile, gpt-oss-120B 2 GB/tile (with EP), and the full
+deepseek-v3 671B just 13 GB of a tile's 48 GB -- all with room to spare.
+
 ## LPDDR swarms vs the HBM incumbents
 
 llama-3.1-70b, batch 64, prompt 2048, output 256:
@@ -46,10 +55,10 @@ llama-3.1-70b, batch 64, prompt 2048, output 256:
 | machine | chips | TPOT | output tok/s | decode ceiling | J/tok | \$/M out |
 |---|---|---|---|---|---|---|
 | `gb300-nvl72` (HBM) | 72 | 5.9 ms | 43.5 k | 96.9 k | 1.43 | \$0.70 |
-| `dgx-h100` (HBM) | 8 | 9.9 ms | 2.58 k | 6.45 k | 2.04 | \$1.01 |
+| `dgx-h100` (HBM) | 8 | 9.9 ms | 2.58 k | 6.45 k | 2.04 | \$1.00 |
 | `tt-quietbox` (GDDR6) | 4 | 118 ms | 361 | 540 | 2.77 | \$0.38 |
-| **`lpddr-swarm-64`** | 64 | 38.6 ms | 1.43 k | 3.32 k | 3.25 | \$0.94 |
-| **`lpddr6-swarm-64`** | 64 | 24.4 ms | 2.14 k | 5.25 k | 2.62 | \$0.76 |
+| **`lpddr-swarm-64`** | 64 | 40.6 ms | 1.39 k | 3.15 k | 3.30 | \$0.96 |
+| **`lpddr6-swarm-64`** | 64 | 26.4 ms | 2.06 k | 4.86 k | 2.68 | \$0.79 |
 
 ```bash
 inferencesim run --hardware lpddr6-swarm-64 --model llama-3.1-70b \
@@ -65,10 +74,37 @@ touches the NVL72's absolute throughput -- 72 HBM chips on NVLink is a different
 weight class -- but that is \$3.5M and 62 kW. The swarm's pitch is *tokens per
 dollar of memory*, and there it is live.
 
-The load-bearing assumption is the fabric: TP=32 keeps `comm` at 11-15% of TPOT
-only because the on-board fabric is fat (200-256 GB/s/dir) and low-latency
-(0.2 µs). On a slow fabric a swarm of wimpy chips drowns in allreduce -- which
-is exactly why the box-to-box story below is deliberately different.
+The load-bearing assumption is the fabric's **bandwidth**: TP=32 keeps `comm` at
+~15% of TPOT only because the on-board fabric is fat (200-256 GB/s/dir,
+NVLink/QuietBox-class). On a thin fabric a swarm of wimpy chips drowns in
+allreduce -- which is exactly why the box-to-box story below is deliberately
+different. The *latency* matters far less than the bandwidth (see the next
+section), so we model a deliberately un-heroic 0.4 µs -- below NVLink's ~1 µs
+end-to-end, but not assuming away the switch hop.
+
+### Sensitivity to link latency
+
+How much does the fabric latency actually buy? Sweeping it at **fixed
+200 GB/s/dir** (swarm-64, TP=32, llama-70b) isolates the latency term:
+
+| link latency | TPOT | comm% | out tok/s | vs 0.4 µs |
+|---|---|---|---|---|
+| 0.1 µs | 37.6 ms | 8% | 1.45 k | 0.93× |
+| 0.2 µs | 38.6 ms | 11% | 1.43 k | 0.95× |
+| **0.4 µs** (assumed) | 40.6 ms | 15% | 1.39 k | 1.00× |
+| 1.0 µs (NVLink-class) | 46.5 ms | 26% | 1.28 k | 1.15× |
+| 2.0 µs | 56.5 ms | 39% | 1.14 k | 1.39× |
+| 3.0 µs | 66.4 ms | 48% | 1.03 k | 1.64× |
+| 5.0 µs (Ethernet-class) | 86.2 ms | 60% | 0.86 k | 2.12× |
+
+For reference this repo models NVLink at 1 µs end-to-end (its physical SerDes is
+a few hundred ns; the µs is the NVSwitch hop plus protocol). The read: **within
+any credible on-board range, latency is a modest tax, not the ballgame** --
+even substituting NVLink's own 1 µs for the assumed 0.4 µs costs only +15% TPOT.
+Decode's per-layer allreduce messages are tiny, so latency is a *sensitive* but
+not *binding* term until the microseconds pile up. It only becomes a
+throughput-killer at the 3-5 µs of commodity Ethernet -- reinforcing "keep TP
+in-box." The fragile assumption is the 200 GB/s bandwidth, not the 0.4 µs.
 
 ## Commodity Ethernet between boxes: scale out with DP, never TP/PP
 
@@ -79,9 +115,9 @@ concrete (same llama-70b workload):
 
 | pod config | replicas | output tok/s | \$/M out | note |
 |---|---|---|---|---|
-| PP=4 across Ethernet | 1 | 1.73 k | \$3.28 | pipeline stages on 50 GB/s -- **anti-pattern** |
-| TP=32 in-box, DP=8 | 8 | 5.71 k | \$1.00 | linear 4× over one box, same \$/tok |
-| TP=16 in-box, DP=16 | 16 | 7.95 k | \$0.72 | smaller TP groups → less collective tax |
+| PP=4 across Ethernet | 2 | 1.67 k | \$3.39 | pipeline stages on 50 GB/s -- **anti-pattern** |
+| TP=32 in-box, DP=8 | 8 | 5.55 k | \$1.02 | linear 4× over one box, same \$/tok |
+| TP=16 in-box, DP=16 | 16 | 7.88 k | \$0.73 | smaller TP groups → less collective tax |
 
 ```bash
 inferencesim run --hardware lpddr-swarm-pod --model llama-3.1-70b \
@@ -103,10 +139,13 @@ The `cxl-*` machines serve compute from a shared pool of cheap CXL-attached
 DDR5 (256 GB/tile, 512 GB/s over 8× CXL 3.0 x16). Capacity and bandwidth scale
 independently; the pool is enormous and cheap.
 
-| machine | model | fits? | mem/chip | output tok/s | \$/M out |
-|---|---|---|---|---|---|
-| `cxl-moe-pod` (32 tiles, 8 TB pool) | deepseek-v3 671B | ✅ 28/256 GB | plenty | 595 | \$4.58 |
-| `lpddr-swarm-64` (64 tiles, 2 TB) | deepseek-v3 671B | ✅ 13/32 GB | tight | 513 | \$2.61 |
+Same workload for both rows -- deepseek-v3 671B, batch 128, prompt 4096,
+output 512:
+
+| machine | fits? | mem/tile | output tok/s | \$/M out |
+|---|---|---|---|---|
+| `cxl-moe-pod` (32 tiles, 8 TB pool) | ✅ 28/256 GB | plenty | 595 | \$4.59 |
+| `lpddr-swarm-64` (64 tiles, 2 TB) | ✅ 21/32 GB | tight | **606** | **\$2.21** |
 
 ```bash
 inferencesim run --hardware cxl-moe-pod --model deepseek-v3 \
@@ -115,12 +154,14 @@ inferencesim run --hardware cxl-moe-pod --model deepseek-v3 \
 ```
 
 **The honest result.** For *serving* -- which is bandwidth-bound -- CXL
-disaggregation trades away exactly what decode needs. A 671B MoE already fits
-across 64 distributed LPDDR tiles (5 GB of weights each), and those 64 tiles
+disaggregation trades away exactly what decode needs. The 671B MoE already fits
+across 64 distributed LPDDR tiles (21 GB of weights+KV each), and those 64 tiles
 carry **17.5 TB/s** of aggregate bandwidth versus the CXL pod's ~16 TB/s at
-higher latency and higher cost/token. Distributing memory across many compute
-tiles gives you capacity *and* bandwidth that scale together; pooling it behind
-CXL links gives you capacity while the links cap the bandwidth.
+higher latency -- so at equal workload the plain LPDDR swarm actually *edges out*
+the CXL pod on throughput (606 vs 595 tok/s) at **half** the cost/token.
+Distributing memory across many compute tiles gives you capacity *and* bandwidth
+that scale together; pooling it behind CXL links gives you capacity while the
+links cap the bandwidth.
 
 Where CXL genuinely wins is the regime this study does *not* reward on
 throughput: capacity you cannot buy by adding compute -- a very large KV/context

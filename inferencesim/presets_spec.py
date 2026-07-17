@@ -153,17 +153,23 @@ CXL_COMPUTE_TILE = Chip(
 # Interconnects
 # =============================================================================
 #
-# The load-bearing bet of the swarms is a *low-latency* on-board fabric: because
-# the tiles are small and physically close (one board / backplane), a fat
-# short-reach link is affordable, so tensor-parallel allreduces -- which would
-# throttle a swarm of wimpy chips on a slow fabric -- stay cheap.  We model it
-# as a switched (ALL_TO_ALL) backplane at 200 GB/s/dir and 0.2 us: aggressive
-# but within reach of short-reach die-to-die / on-board SerDes (UCIe / UALink
-# class), and deliberately the part a real build must earn.
+# The load-bearing bet of the swarms is the *bandwidth* of an on-board fabric:
+# because the tiles are small and physically close (one board / backplane), a
+# fat short-reach link is affordable, so tensor-parallel allreduces -- which
+# would throttle a swarm of wimpy chips on a thin fabric -- stay cheap.  We
+# model it as a switched (ALL_TO_ALL) backplane at 200 GB/s/dir and 0.4 us:
+# NVLink/QuietBox-class bandwidth (NVLink5 ~900 GB/s, QuietBox ring ~200 GB/s),
+# below NVLink's ~1 us end-to-end latency but no longer assuming away the switch
+# hop.  The bandwidth is the demanding assumption -- the part a real build must
+# earn -- not the latency: at fixed 200 GB/s a decode-TP=32 run only loses ~21%
+# TPOT going from 0.4 us all the way to NVLink's 1 us, and stays workable to
+# ~2 us (see SPECULATIVE.md "Sensitivity to link latency").  Latency only turns
+# into a throughput-killer at the 3-5 us of commodity Ethernet, which is exactly
+# why box-to-box (below) stays DP-only.
 _SWARM_FABRIC = Link("low-latency backplane (200G/dir)", bandwidth=200 * GIGA,
-                     latency_s=0.2 * US, power_w=3.0)
+                     latency_s=0.4 * US, power_w=3.0)
 _SWARM_FABRIC6 = Link("low-latency backplane (256G/dir)", bandwidth=256 * GIGA,
-                      latency_s=0.2 * US, power_w=3.5)
+                      latency_s=0.4 * US, power_w=3.5)
 
 # Box-to-box is COMMODITY ETHERNET on purpose: 400 GbE (400 Gbit/s = 50 GB/s
 # per direction) RoCE, ~5 us switch+NIC latency.  An order of magnitude slower
