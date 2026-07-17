@@ -6,15 +6,18 @@ commodity parts instead of HBM?*  The thesis under all of them is memory-cost
 arbitrage.  A decode step is bandwidth-bound: it streams the weights (and the
 KV cache) from DRAM once per token, so tokens/s tracks aggregate DRAM
 bandwidth, not FLOP/s.  HBM buys that bandwidth at a punishing $/(GB/s) and
-pJ/bit.  LPDDR buys ~1/5 the bandwidth per package at perhaps ~1/10 the $/GB
-and a fraction of the energy -- so if you can *aggregate* many small LPDDR
-packages' bandwidth through a good enough interconnect, you reach HBM-class
-aggregate bandwidth on commodity silicon.
+pJ/bit.  A 256-bit LPDDR5X-8533 interface buys ~273 GB/s at perhaps ~1/10 the
+$/GB and a fraction of the energy -- so if you can *aggregate* many such small
+LPDDR memory subsystems through a good enough interconnect, you reach HBM-class
+aggregate bandwidth on commodity silicon.  (LPDDR is soldered BGA, not a
+DIMM/stick; a 256-bit interface is physically several LPDDR packages in
+parallel, since one device presents only ~16-32 bits per channel.)
 
 Two design families here:
 
   * **LPDDR swarms** (`lpddr-swarm-*`): many small serving ASICs, each with a
-    single on-package LPDDR5X/6 stack, wired by a fat *low-latency* on-board
+    single on-package LPDDR5X/6 memory subsystem, wired by a fat *low-latency*
+    on-board
     fabric so tensor-parallel collectives are cheap.  Box-to-box uses
     *commodity Ethernet* (400 GbE RoCE) -- deliberately weak, to force the
     "keep TP inside the box, scale out with PP/DP" discipline.
@@ -57,8 +60,10 @@ _LPDDR6_BW = 460 * GIGA
 # =============================================================================
 
 # ---- Small LPDDR5X serving tile ---------------------------------------------
-# A hypothetical minimal inference ASIC: modest matrix engines fed by a single
-# on-package LPDDR5X stack.  Compute is sized at ~470 FLOP/byte (fp8) -- in the
+# A hypothetical minimal inference ASIC: modest matrix engines fed by one
+# 256-bit LPDDR5X-8533 memory subsystem (273 GB/s, the GB10 figure; physically
+# several soldered LPDDR packages in parallel, not a DIMM).  Compute is sized at
+# ~470 FLOP/byte (fp8) -- in the
 # same memory-leaning ballpark as a serving GPU (H100 ~590, GB10 ~915) rather
 # than a compute-heavy Tenstorrent part -- so the tile is balanced for
 # batched decode, not wasted on FLOP it can't feed.  On-chip NoC and SRAM are

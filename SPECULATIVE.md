@@ -15,12 +15,15 @@ is a best-effort approximation grounded in the JEDEC/CXL spec points cited in
 
 A decode step streams the weights (and the KV cache) from DRAM once per token,
 so tokens/s tracks **aggregate DRAM bandwidth**, not FLOP/s. HBM buys that
-bandwidth at a punishing \$/(GB/s) and pJ/bit. LPDDR5X delivers ~273 GB/s per
-package (the proven GB10/DGX-Spark figure over 256-bit LPDDR5X-8533) at perhaps
-~1/10 the \$/GB and a fraction of the energy. The bet: if a **low-latency**
-fabric lets you aggregate many small LPDDR packages' bandwidth cheaply, you
-reach HBM-class *aggregate* bandwidth on commodity silicon -- the interconnect
-is the part you have to earn.
+bandwidth at a punishing \$/(GB/s) and pJ/bit. A single 256-bit LPDDR5X-8533
+interface delivers ~273 GB/s (8533 Mbps/pin × 256 pins) -- the proven
+GB10/DGX-Spark figure -- at perhaps ~1/10 the \$/GB and a fraction of the
+energy. (LPDDR is soldered BGA, not a DIMM/stick; a 256-bit interface is
+physically several LPDDR packages wired in parallel, since one device presents
+only ~16-32 bits per channel.) The bet: if a **low-latency** fabric lets you
+aggregate many such small LPDDR memory subsystems cheaply, you reach HBM-class
+*aggregate* bandwidth on commodity silicon -- the interconnect is the part you
+have to earn.
 
 ## Building blocks (no HBM, by design)
 
