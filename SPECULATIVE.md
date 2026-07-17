@@ -15,9 +15,9 @@ is a best-effort approximation grounded in the JEDEC/CXL spec points cited in
 
 A decode step streams the weights (and the KV cache) from DRAM once per token,
 so tokens/s tracks **aggregate DRAM bandwidth**, not FLOP/s. HBM buys that
-bandwidth at a punishing $/(GB/s) and pJ/bit. LPDDR5X delivers ~273 GB/s per
+bandwidth at a punishing \$/(GB/s) and pJ/bit. LPDDR5X delivers ~273 GB/s per
 package (the proven GB10/DGX-Spark figure over 256-bit LPDDR5X-8533) at perhaps
-~1/10 the $/GB and a fraction of the energy. The bet: if a **low-latency**
+~1/10 the \$/GB and a fraction of the energy. The bet: if a **low-latency**
 fabric lets you aggregate many small LPDDR packages' bandwidth cheaply, you
 reach HBM-class *aggregate* bandwidth on commodity silicon -- the interconnect
 is the part you have to earn.
@@ -40,13 +40,13 @@ On-chip NoC/SRAM are sized above DRAM so the memory stack stays the min-cut
 
 llama-3.1-70b, batch 64, prompt 2048, output 256:
 
-| machine | chips | TPOT | output tok/s | decode ceiling | J/tok | $/M out |
+| machine | chips | TPOT | output tok/s | decode ceiling | J/tok | \$/M out |
 |---|---|---|---|---|---|---|
-| `gb300-nvl72` (HBM) | 72 | 5.9 ms | 43.5 k | 96.9 k | 1.43 | $0.70 |
-| `dgx-h100` (HBM) | 8 | 9.9 ms | 2.58 k | 6.45 k | 2.04 | $1.01 |
-| `tt-quietbox` (GDDR6) | 4 | 118 ms | 361 | 540 | 2.77 | $0.38 |
-| **`lpddr-swarm-64`** | 64 | 38.6 ms | 1.43 k | 3.32 k | 3.25 | $0.94 |
-| **`lpddr6-swarm-64`** | 64 | 24.4 ms | 2.14 k | 5.25 k | 2.62 | $0.76 |
+| `gb300-nvl72` (HBM) | 72 | 5.9 ms | 43.5 k | 96.9 k | 1.43 | \$0.70 |
+| `dgx-h100` (HBM) | 8 | 9.9 ms | 2.58 k | 6.45 k | 2.04 | \$1.01 |
+| `tt-quietbox` (GDDR6) | 4 | 118 ms | 361 | 540 | 2.77 | \$0.38 |
+| **`lpddr-swarm-64`** | 64 | 38.6 ms | 1.43 k | 3.32 k | 3.25 | \$0.94 |
+| **`lpddr6-swarm-64`** | 64 | 24.4 ms | 2.14 k | 5.25 k | 2.62 | \$0.76 |
 
 ```bash
 inferencesim run --hardware lpddr6-swarm-64 --model llama-3.1-70b \
@@ -54,12 +54,12 @@ inferencesim run --hardware lpddr6-swarm-64 --model llama-3.1-70b \
     --weight-dtype fp8 --kv-dtype fp8 --efficiency auto
 ```
 
-**Reading it.** A single 64-tile LPDDR6 box (~$175k, ~5.6 kW) lands between a
+**Reading it.** A single 64-tile LPDDR6 box (~\$175k, ~5.6 kW) lands between a
 DGX H100 and a full NVL72 rack on per-token latency and throughput, at cost/token
 competitive with a DGX H100 -- on memory that never touches an HBM fab. The
 LPDDR5X box is a generation behind (273 vs 460 GB/s/tile) and shows it. Neither
 touches the NVL72's absolute throughput -- 72 HBM chips on NVLink is a different
-weight class -- but that is $3.5M and 62 kW. The swarm's pitch is *tokens per
+weight class -- but that is \$3.5M and 62 kW. The swarm's pitch is *tokens per
 dollar of memory*, and there it is live.
 
 The load-bearing assumption is the fabric: TP=32 keeps `comm` at 11-15% of TPOT
@@ -74,11 +74,11 @@ The pod (`lpddr-swarm-pod`, 4 boxes × 64 tiles) joins boxes with **commodity
 higher-latency than the on-board fabric. The simulator makes the discipline
 concrete (same llama-70b workload):
 
-| pod config | replicas | output tok/s | $/M out | note |
+| pod config | replicas | output tok/s | \$/M out | note |
 |---|---|---|---|---|
-| PP=4 across Ethernet | 1 | 1.73 k | $3.28 | pipeline stages on 50 GB/s -- **anti-pattern** |
-| TP=32 in-box, DP=8 | 8 | 5.71 k | $1.00 | linear 4× over one box, same $/tok |
-| TP=16 in-box, DP=16 | 16 | 7.95 k | $0.72 | smaller TP groups → less collective tax |
+| PP=4 across Ethernet | 1 | 1.73 k | \$3.28 | pipeline stages on 50 GB/s -- **anti-pattern** |
+| TP=32 in-box, DP=8 | 8 | 5.71 k | \$1.00 | linear 4× over one box, same \$/tok |
+| TP=16 in-box, DP=16 | 16 | 7.95 k | \$0.72 | smaller TP groups → less collective tax |
 
 ```bash
 inferencesim run --hardware lpddr-swarm-pod --model llama-3.1-70b \
@@ -91,7 +91,7 @@ ask it to carry independent data-parallel replicas* -- DP replicas don't
 communicate during steady-state decode, so the slow link is idle where it
 matters. Push a bandwidth-heavy tensor- or pipeline-parallel group across it and
 throughput collapses (the PP=4 row). The right knob is TP inside the box, DP
-across boxes; smaller in-box TP groups even improve $/tok by cutting the
+across boxes; smaller in-box TP groups even improve \$/tok by cutting the
 collective tax. The Ethernet is for scale, the on-board fabric is for sharding.
 
 ## Disaggregated CXL memory: a capacity tier, not a bandwidth tier
@@ -100,10 +100,10 @@ The `cxl-*` machines serve compute from a shared pool of cheap CXL-attached
 DDR5 (256 GB/tile, 512 GB/s over 8× CXL 3.0 x16). Capacity and bandwidth scale
 independently; the pool is enormous and cheap.
 
-| machine | model | fits? | mem/chip | output tok/s | $/M out |
+| machine | model | fits? | mem/chip | output tok/s | \$/M out |
 |---|---|---|---|---|---|
-| `cxl-moe-pod` (32 tiles, 8 TB pool) | deepseek-v3 671B | ✅ 28/256 GB | plenty | 595 | $4.58 |
-| `lpddr-swarm-64` (64 tiles, 2 TB) | deepseek-v3 671B | ✅ 13/32 GB | tight | 513 | $2.61 |
+| `cxl-moe-pod` (32 tiles, 8 TB pool) | deepseek-v3 671B | ✅ 28/256 GB | plenty | 595 | \$4.58 |
+| `lpddr-swarm-64` (64 tiles, 2 TB) | deepseek-v3 671B | ✅ 13/32 GB | tight | 513 | \$2.61 |
 
 ```bash
 inferencesim run --hardware cxl-moe-pod --model deepseek-v3 \
@@ -136,7 +136,7 @@ bound, not the ceiling of what disaggregation can do.
 ## Takeaways
 
 1. **LPDDR swarms are real.** A no-HBM 64-tile LPDDR6 box serves 70B between a
-   DGX H100 and an NVL72 on latency, at DGX-competitive $/tok -- the whole win
+   DGX H100 and an NVL72 on latency, at DGX-competitive \$/tok -- the whole win
    is aggregate bandwidth bought cheaply, *contingent on a low-latency on-board
    fabric* to keep TP collectives from eating it.
 2. **Commodity Ethernet scales boxes fine -- for DP only.** Keep sharding
