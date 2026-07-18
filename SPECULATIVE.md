@@ -177,6 +177,63 @@ would let CXL keep its capacity edge without paying full CXL bandwidth on every
 byte. Treat the `cxl-*` rows as the conservative, everything-from-the-pool
 bound, not the ceiling of what disaggregation can do.
 
+## A larger model: GLM-5.2 (742B) -- what fits, and how much context
+
+The 70B and 671B runs above are mid-weight. GLM-5.2 is the stress test: a
+**742B-total / 40B-active** MLA-MoE (256 experts, top-8; MLA with a 512-wide KV
+latent) with a ~1M-token window. It is a good probe for two things the swarms
+are built for -- *capacity* and *context* -- because MLA makes its KV cache tiny
+(576 floats/token/layer -> **~43.9 KB/token at fp8** across all 78 layers, MLA's
+~57× shrink over full MHA), so weights, not KV, dominate the memory budget.
+
+Same column set as the headline table -- batch 64, prompt 4096, output 256, fp8:
+
+| machine | fits? | TPOT | out tok/s | decode ceiling | J/tok | \$/M out | max ctx @ b64 |
+|---|---|---|---|---|---|---|---|
+| `gb300-nvl72` (HBM, TP8 EP8) | ✅ | 5.3 ms | 4.62 k | 12.2 k | 11.97 | \$6.51 | 763 k |
+| `dgx-h100` (HBM) | ❌ 93 GB wt/chip > 80 | — | — | — | — | — |
+| `tt-quietbox` (GDDR6) | ❌ 186 GB wt/chip > 32 | — | — | — | — | — |
+| **`lpddr6-swarm-64`** | ✅ | 54.4 ms | 0.45 k | 1.18 k | 13.62 | \$3.65 | 96 k |
+| **`lpddr-swarm-64`** | ✅ | 90.6 ms | 0.29 k | 0.71 k | 17.21 | \$4.69 | 51 k |
+| **`lpddr-swarm-pod`** (DP4) | ✅ | 90.6 ms | 1.16 k | 2.83 k | 17.21 | \$4.97 | 51 k |
+| `cxl-moe-pod` | ✅ | 90.9 ms | 0.30 k | 0.70 k | 27.92 | \$9.08 | 321 k |
+
+```bash
+inferencesim run --hardware lpddr6-swarm-64 --model glm-5.2 \
+    --tp 8 --ep 8 --batch 64 --prompt 4096 --output 256 \
+    --weight-dtype fp8 --kv-dtype fp8 --efficiency auto
+```
+
+**What fits.** A 742B model needs ~742 GB just for fp8 weights -- more than a
+**DGX H100 holds in its entire 8×80 = 640 GB**, and 6× a QuietBox. Below a full
+NVL72 rack, no single HBM box in this study can even load GLM-5.2. The no-HBM
+swarms and the CXL pod all fit it comfortably on commodity memory: sharded TP=8
+EP=8 across 64 tiles, weights land at just **13.5 GB of a tile's 32-48 GB**.
+That is the capacity argument in one row -- the swarm's cheap aggregate memory
+buys *admission* to a model class the small HBM machines are locked out of.
+
+**How much context.** Because MLA's KV is ~43.9 KB/token, context is nowhere
+near the binding constraint -- the leftover memory after weights holds enormous
+histories. At batch 64 the fits are: `lpddr6-swarm-64` **~96 k tokens/sequence**,
+`lpddr-swarm-64` ~51 k, `cxl-moe-pod` ~321 k, `gb300-nvl72` ~763 k. Turned
+around into full 1M-token windows: `lpddr6-swarm-64` serves **~6 concurrent
+1M-token contexts** (or 64 at 96 k each), `cxl-moe-pod` ~21, the NVL72 ~49. The
+CXL pool's whole point shows here -- 8 TB of cheap pooled DDR5 gives it the
+deepest context tier per dollar of any machine, even though (as above) it trails
+on decode throughput.
+
+**The honest trade.** Fitting is not winning: a 40B-active MoE streams ~40 GB
+of experts per token, so the swarms decode GLM-5.2 at 0.3-0.45 k tok/s -- an
+order of magnitude behind the NVL72's raw speed. But they do it at **lower
+\$/token** (\$3.65 on `lpddr6-swarm-64` vs \$6.51 on the under-batched NVL72
+slice) on hardware that costs 5% of the rack, and the pod recovers absolute
+throughput by data-parallel scale-out (1.16 k tok/s). If your constraint is
+"serve a 742B model with long context at all, cheaply" rather than "serve it
+fastest," the no-HBM swarm is a real answer. (The NVL72 row is deliberately
+under-fed at batch 64 -- a sparse MoE wants a far larger batch to saturate HBM;
+its \$/token improves sharply there. And GLM-5.2's DeepSeek Sparse Attention is
+modelled as dense MLA, so long-context decode attention here is conservative.)
+
 ## Takeaways
 
 1. **LPDDR swarms are real.** A no-HBM 64-tile LPDDR6 box serves 70B between a
@@ -190,3 +247,10 @@ bound, not the ceiling of what disaggregation can do.
    memory model it loses to distributed LPDDR on serving throughput and cost;
    its edge is independent capacity scaling, which a two-tier model (future
    work) would be needed to reward.
+4. **Cheap aggregate memory buys admission, not just speed.** A 742B model
+   (GLM-5.2) won't load on a DGX H100 or a QuietBox at all, yet fits comfortably
+   across the no-HBM swarms and the CXL pool -- and MLA's tiny KV lets even a
+   swarm hold multiple concurrent 1M-token contexts. The swarms decode it slower
+   than an NVL72 but cheaper per token, on hardware costing a few percent of the
+   rack: the right answer when the constraint is "serve this huge model with long
+   context at all, affordably" rather than "serve it fastest."
