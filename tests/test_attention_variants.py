@@ -166,6 +166,17 @@ def test_deepseek_v3_param_counts():
     assert abs(DEEPSEEK_V3.active_params - 37e9) / 37e9 < 0.05
 
 
+def test_glm_5_2_param_counts_and_mla_kv():
+    from inferencesim.presets import GLM_5_2
+    # published: ~743B total, ~39B active (MTP layer omitted here)
+    assert abs(GLM_5_2.total_params - 743e9) / 743e9 < 0.03
+    assert abs(GLM_5_2.active_params - 39e9) / 39e9 < 0.05
+    # MLA KV latent: 512 + 64 = 576 floats/token/layer over 78 layers
+    latent = GLM_5_2.mla.kv_lora_rank + GLM_5_2.mla.qk_rope_head_dim
+    assert latent == 576
+    assert GLM_5_2.kv_bytes_per_token(DType.FP8) == latent * GLM_5_2.n_layers * 1.0
+
+
 # ---- 5. gpt-oss corrected preset --------------------------------------------
 
 

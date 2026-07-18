@@ -28,6 +28,12 @@ inferencesim run --hardware tt-quietbox --model llama-3.1-70b \
 # sweep batch sizes
 inferencesim run --hardware tt-quietbox --model gpt-oss-120b \
     --tp 4 --batch 1,8,32 --weight-dtype fp8
+
+# speculative no-HBM machines: a swarm of small LPDDR6 tiles on a
+# low-latency backplane (see SPECULATIVE.md)
+inferencesim run --hardware lpddr6-swarm-64 --model llama-3.1-70b \
+    --tp 32 --batch 64 --prompt 2048 --output 256 \
+    --weight-dtype fp8 --kv-dtype fp8 --efficiency auto
 ```
 
 Or from Python:

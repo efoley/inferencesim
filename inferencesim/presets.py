@@ -249,6 +249,14 @@ HARDWARE: dict[str, System] = {
     "tt-quietbox-2": TT_QUIETBOX_2,
 }
 
+# Speculative, low-cost (no-HBM / CXL-disaggregated) research machines live in
+# a sibling module; merge them into the catalogue so `list`, `run`, `serve` and
+# the graph tools see them like any other preset.  presets_spec imports only
+# from .hardware/.units, so this bottom-of-file import introduces no cycle.
+from .presets_spec import SPEC_HARDWARE  # noqa: E402
+
+HARDWARE.update(SPEC_HARDWARE)
+
 # =============================================================================
 # Models
 # =============================================================================
@@ -310,10 +318,42 @@ DEEPSEEK_V3 = ModelSpec(
                   v_head_dim=128, q_lora_rank=1536),
 )
 
+# GLM-5.2 (zai-org): a 743B-total / 39B-active MLA-MoE with DeepSeek Sparse
+# Attention (the `glm_moe_dsa` architecture).  Assembled from the GLM-5 paper's
+# architecture table and the vLLM/SGLang recipe pages (HuggingFace config.json
+# was unreachable from this environment -- org egress policy blocks it), then
+# validated to 742B total / 40B active against the published 743B/39B:
+#   n_layers 78 (3 dense + 75 MoE) + 1 MTP layer [MTP omitted here, as for V3];
+#   hidden 6144; 64 attention heads, no GQA; MLA with q_lora_rank 2048,
+#   kv_lora_rank 512, qk_nope 128 / qk_rope 64 (qk head dim 192), v_head_dim 256
+#   -> KV cache 576 floats/token/layer (~43.9 KB/token/fp8 over 78 layers, MLA's
+#   ~57x shrink vs full MHA); MoE n_routed_experts 256, top_k 8, n_shared 1,
+#   moe_intermediate_size 2048, first_k_dense_replace 3; vocab_size 154880;
+#   max_position_embeddings ~1M.
+# Approximations: DeepSeek Sparse Attention (lightning indexer, top-2048 keys)
+# is NOT modelled -- attention runs as dense MLA, which OVER-counts long-context
+# decode attention (DSA caps it), so the sim is conservative there; KV storage
+# and context-fit are unaffected (DSA still retains full KV to index).  The
+# 3 dense-prefix layers' intermediate width (d_ff) is an estimate (12288, not in
+# the reachable sources); it moves total params by <1%.  d_head/n_kv_heads are
+# MLA placeholders.
+# Sources: GLM-5 paper (arXiv 2602.15763); https://recipes.vllm.ai/zai-org/GLM-5.2;
+# https://huggingface.co/docs/transformers/en/model_doc/glm_moe_dsa
+GLM_5_2 = ModelSpec(
+    name="glm-5.2",
+    n_layers=78, d_model=6144, n_heads=64, n_kv_heads=64, d_head=128,
+    d_ff=12288, vocab_size=154880,
+    moe=MoEConfig(n_experts=256, top_k=8, d_ff_expert=2048, d_ff_shared=2048,
+                  n_dense_layers=3),
+    mla=MLAConfig(kv_lora_rank=512, qk_rope_head_dim=64, qk_nope_head_dim=128,
+                  v_head_dim=256, q_lora_rank=2048),
+)
+
 MODELS: dict[str, ModelSpec] = {
     "llama-3.1-8b": LLAMA_3_1_8B,
     "llama-3.1-70b": LLAMA_3_1_70B,
     "qwen3-32b": QWEN3_32B,
     "gpt-oss-120b": GPT_OSS_120B,
     "deepseek-v3": DEEPSEEK_V3,
+    "glm-5.2": GLM_5_2,
 }
